@@ -29,7 +29,7 @@ Use ARROWS or WASD keys for control.
     I            : toggle interior light
 
     TAB          : change sensor position
-    ` or N       : next sensor
+     or N       : next sensor
     [1-9]        : change to sensor [1-9]
     G            : toggle radar visualization
     C            : change weather (Shift+C reverse)
@@ -54,13 +54,15 @@ Use ARROWS or WASD keys for control.
 """
 
 class ManualControl:
-    def __init__(self, vehicle):
+    def __init__(self, vehicle, traffic_manager):
         self.vehicle = vehicle
         self.autopilot = False
         self.manual_transmission = False
         self.constant_velocity_mode = False
+        self.traffic_manager = traffic_manager
+        self.current_gear = 1  # start from first gear
 
-    def handle_key_press(self, key):
+    def handle_key_press(self, key, mod):
         if key == pygame.K_w:
             self.vehicle.apply_control(carla.VehicleControl(throttle=1.0))
         elif key == pygame.K_s:
@@ -81,26 +83,66 @@ class ManualControl:
             self.shift_gear(-1)
         elif key == pygame.K_PERIOD:
             self.shift_gear(1)
-        elif key == pygame.K_LCTRL and pygame.K_w:
+        elif (key == pygame.K_w) and (mod & pygame.KMOD_CTRL):
             self.toggle_constant_velocity_mode()
 
     def toggle_autopilot(self):
         self.autopilot = not self.autopilot
-        self.vehicle.set_autopilot(self.autopilot)
+        self.vehicle.set_autopilot(self.autopilot, self.traffic_manager.get_port())
+
+        if self.autopilot:
+            print("Autopilot ON (using Traffic Manager with safety settings)")
+
+            # Traffic Manager Safety Settings
+            self.traffic_manager.ignore_lights_percentage(self.vehicle, 0)  # obey all lights
+            self.traffic_manager.ignore_signs_percentage(self.vehicle, 0)   # obey all signs
+            self.traffic_manager.ignore_vehicles_percentage(self.vehicle, 0)  # respect all vehicles
+            self.traffic_manager.ignore_walkers_percentage(self.vehicle, 0)   # respect all pedestrians
+
+            # Allow lane changes, but don't force them
+            self.traffic_manager.auto_lane_change(self.vehicle, True)  # allow lane changes, controlled
+
+            # Set vehicle following distance and speed settings
+            self.traffic_manager.distance_to_leading_vehicle(self.vehicle, 6.0)  # keep 6m gap
+
+            # Set the vehicle's speed behavior (driving slower than the speed limit)
+            self.traffic_manager.vehicle_percentage_speed_difference(self.vehicle, 30)  # 30% slower
+
+            # Global settings to ensure consistency across the simulation
+            self.traffic_manager.set_global_distance_to_leading_vehicle(6.0)  
+            self.traffic_manager.set_synchronous_mode(True)  # ensure sync in simulation
+            self.traffic_manager.set_random_device_seed(0)  # deterministic behavior
+
+        else:
+            print("Autopilot OFF")
 
     def toggle_manual_transmission(self):
         self.manual_transmission = not self.manual_transmission
-        # Add manual transmission logic here if needed
+        print(f"Manual Transmission {'ON' if self.manual_transmission else 'OFF'}")
 
     def shift_gear(self, direction):
-        pass
+        if self.manual_transmission:
+            current_control = self.vehicle.get_control()
+            if direction == 1:
+                self.current_gear += 1
+            elif direction == -1:
+                self.current_gear = max(0, self.current_gear - 1)
+
+            current_control.manual_gear_shift = True
+            current_control.gear = self.current_gear
+            self.vehicle.apply_control(current_control)
+            print(f"Shifted to gear {self.current_gear}")
+        else:
+            print("Enable manual transmission (press M) to shift gears manually.")
 
     def toggle_constant_velocity_mode(self):
         self.constant_velocity_mode = not self.constant_velocity_mode
         if self.constant_velocity_mode:
-            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=0, brake=0))
+            self.vehicle.enable_constant_velocity(carla.Vector3D(16.66, 0, 0))  # 60 km/h ≈ 16.66 m/s
+            print("Constant velocity mode ON (60 km/h)")
         else:
-            self.vehicle.apply_control(carla.VehicleControl())
+            self.vehicle.disable_constant_velocity()
+            print("Constant velocity mode OFF")
 
 class DisplayManager:
     def __init__(self, grid_size):
@@ -182,13 +224,16 @@ client = carla.Client('localhost', 2000)
 client.set_timeout(10.0)
 world = client.get_world()
 
+traffic_manager = client.get_trafficmanager(8000)
+traffic_manager.set_synchronous_mode(True)  # Optional: only if your simulation is synchronous
+
 blueprint_library = world.get_blueprint_library()
 vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
 spawn_point = random.choice(world.get_map().get_spawn_points())
 vehicle = world.spawn_actor(vehicle_bp, spawn_point)
 
 # Manual Control Setup
-manual_control = ManualControl(vehicle)
+manual_control = ManualControl(vehicle, traffic_manager)
 
 # Sensor Setup
 display_manager = DisplayManager(grid_size=(3, 2))
@@ -214,12 +259,12 @@ clock = pygame.time.Clock()
 try:
     running = True
     while running:
-        # Handle pygame events to prevent freezing
+        # Handle pygame events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                manual_control.handle_key_press(event.key)
+                manual_control.handle_key_press(event.key, event.mod)
 
         world.tick()
         display_manager.render()
