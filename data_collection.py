@@ -7,6 +7,7 @@ import pygame
 import carla
 import csv
 import time
+import math
 
 # Display Manager Class
 class DisplayManager:
@@ -85,6 +86,40 @@ class SensorManager:
         else:
             self.data = image
 
+# Simple AutoPilot Controller
+def simple_vehicle_control(vehicle, waypoint, target_speed=20.0):
+    """Simple proportional controller to follow a waypoint."""
+    vehicle_transform = vehicle.get_transform()
+    vehicle_location = vehicle_transform.location
+    vehicle_yaw = math.radians(vehicle_transform.rotation.yaw)
+
+    waypoint_location = waypoint.transform.location
+
+    dx = waypoint_location.x - vehicle_location.x
+    dy = waypoint_location.y - vehicle_location.y
+
+    heading_to_wp = math.atan2(dy, dx)
+    yaw_error = heading_to_wp - vehicle_yaw
+
+    # Normalize yaw error
+    while yaw_error > math.pi:
+        yaw_error -= 2 * math.pi
+    while yaw_error < -math.pi:
+        yaw_error += 2 * math.pi
+
+    control = carla.VehicleControl()
+    control.throttle = 0.5
+    control.steer = np.clip(yaw_error, -1.0, 1.0)
+    
+    # Optional: control braking if necessary (not mandatory here)
+    velocity = vehicle.get_velocity()
+    speed = 3.6 * np.linalg.norm(np.array([velocity.x, velocity.y, velocity.z]))  # km/h
+    if speed > target_speed:
+        control.throttle = 0.2
+        control.brake = 0.1
+
+    vehicle.apply_control(control)
+
 # Connect to CARLA
 client = carla.Client('localhost', 2000)
 client.set_timeout(10.0)
@@ -102,9 +137,13 @@ camera_rgb = SensorManager(world, display_manager, 'RGB', carla.Transform(carla.
 camera_depth = SensorManager(world, display_manager, 'Depth', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(1, 0))
 camera_semantic = SensorManager(world, display_manager, 'Semantic', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(0, 1))
 lidar_sensor = SensorManager(world, display_manager, 'LIDAR', carla.Transform(carla.Location(x=0, z=2.5)), vehicle, display_pos=(1, 1))
-
 imu_sensor = SensorManager(world, display_manager, 'IMU', carla.Transform(carla.Location()), vehicle, display_pos=(2, 0))
 gnss_sensor = SensorManager(world, display_manager, 'GNSS', carla.Transform(carla.Location()), vehicle, display_pos=(2, 1))
+
+# Waypoints Setup
+map = world.get_map()
+waypoints = map.generate_waypoints(distance=10.0)  # every 10 meters
+target_waypoint = random.choice(waypoints)
 
 # CSV Data Saving
 csv_file = open('carla_sensor_data.csv', mode='w', newline='')
@@ -119,13 +158,15 @@ clock = pygame.time.Clock()
 try:
     running = True
     while running:
-        # Handle pygame events to prevent freezing
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
         world.tick()
         display_manager.render()
+
+        # Automatic Control
+        simple_vehicle_control(vehicle, target_waypoint)
 
         # Get vehicle speed
         velocity = vehicle.get_velocity()
