@@ -28,25 +28,22 @@ Use ARROWS or WASD keys for control.
     Z/X          : toggle right/left blinker
     I            : toggle interior light
 
-    TAB          : change sensor position
-     or N       : next sensor
+    TAB/N        : change sensor position
     [1-9]        : change to sensor [1-9]
     G            : toggle radar visualization
     C            : change weather (Shift+C reverse)
     Backspace    : change vehicle
 
-    O            : open/close all doors of vehicle
-    T            : toggle vehicle's telemetry
+    O            : open/close all doors
+    T            : toggle vehicle telemetry
 
-    V            : Select next map layer (Shift+V reverse)
-    B            : Load current selected map layer (Shift+B to unload)
+    V            : select next map layer (Shift+V reverse)
+    B            : load selected map layer (Shift+B to unload)
 
     R            : toggle recording images to disk
-
-    CTRL + R     : toggle recording of simulation (replacing any previous)
-    CTRL + P     : start replaying last recorded simulation
-    CTRL + +     : increments the start time of the replay by 1 second (+SHIFT = 10 seconds)
-    CTRL + -     : decrements the start time of the replay by 1 second (+SHIFT = 10 seconds)
+    CTRL + R     : start/stop recording simulation
+    CTRL + P     : replay last recording
+    CTRL + +/-   : adjust replay start time
 
     F1           : toggle HUD
     H/?          : toggle help
@@ -60,7 +57,7 @@ class ManualControl:
         self.manual_transmission = False
         self.constant_velocity_mode = False
         self.traffic_manager = traffic_manager
-        self.current_gear = 1  # start from first gear
+        self.current_gear = 1
 
     def handle_key_press(self, key, mod):
         if key == pygame.K_w:
@@ -87,58 +84,53 @@ class ManualControl:
             self.toggle_constant_velocity_mode()
 
     def toggle_autopilot(self):
+        # If manual transmission is active, turn it off
+        if self.manual_transmission:
+            self.toggle_manual_transmission()
+
         self.autopilot = not self.autopilot
         self.vehicle.set_autopilot(self.autopilot, self.traffic_manager.get_port())
-
         if self.autopilot:
-            print("Autopilot ON (using Traffic Manager with safety settings)")
-
-            # Traffic Manager Safety Settings
-            self.traffic_manager.ignore_lights_percentage(self.vehicle, 0)  # obey all lights
-            self.traffic_manager.ignore_signs_percentage(self.vehicle, 0)   # obey all signs
-            self.traffic_manager.ignore_vehicles_percentage(self.vehicle, 0)  # respect all vehicles
-            self.traffic_manager.ignore_walkers_percentage(self.vehicle, 0)   # respect all pedestrians
-
-            # Allow lane changes, but don't force them
-            self.traffic_manager.auto_lane_change(self.vehicle, True)  # allow lane changes, controlled
-
-            # Set vehicle following distance and speed settings
-            self.traffic_manager.distance_to_leading_vehicle(self.vehicle, 6.0)  # keep 6m gap
-
-            # Set the vehicle's speed behavior (driving slower than the speed limit)
-            self.traffic_manager.vehicle_percentage_speed_difference(self.vehicle, 30)  # 30% slower
-
-            # Global settings to ensure consistency across the simulation
-            self.traffic_manager.set_global_distance_to_leading_vehicle(6.0)  
-            self.traffic_manager.set_synchronous_mode(True)  # ensure sync in simulation
-            self.traffic_manager.set_random_device_seed(0)  # deterministic behavior
-
+            print("Autopilot ON")
+            self.traffic_manager.ignore_lights_percentage(self.vehicle, 0)
+            self.traffic_manager.ignore_signs_percentage(self.vehicle, 0)
+            self.traffic_manager.ignore_vehicles_percentage(self.vehicle, 0)
+            self.traffic_manager.ignore_walkers_percentage(self.vehicle, 0)
+            self.traffic_manager.auto_lane_change(self.vehicle, True)
+            self.traffic_manager.distance_to_leading_vehicle(self.vehicle, 6.0)
+            self.traffic_manager.vehicle_percentage_speed_difference(self.vehicle, 30)
+            self.traffic_manager.set_global_distance_to_leading_vehicle(6.0)
+            self.traffic_manager.set_synchronous_mode(True)
+            self.traffic_manager.set_random_device_seed(0)
         else:
             print("Autopilot OFF")
 
     def toggle_manual_transmission(self):
+        # If autopilot is active, turn it off
+        if self.autopilot:
+            self.toggle_autopilot()
+
         self.manual_transmission = not self.manual_transmission
         print(f"Manual Transmission {'ON' if self.manual_transmission else 'OFF'}")
 
     def shift_gear(self, direction):
         if self.manual_transmission:
-            current_control = self.vehicle.get_control()
+            control = self.vehicle.get_control()
             if direction == 1:
                 self.current_gear += 1
             elif direction == -1:
                 self.current_gear = max(0, self.current_gear - 1)
-
-            current_control.manual_gear_shift = True
-            current_control.gear = self.current_gear
-            self.vehicle.apply_control(current_control)
+            control.manual_gear_shift = True
+            control.gear = self.current_gear
+            self.vehicle.apply_control(control)
             print(f"Shifted to gear {self.current_gear}")
         else:
-            print("Enable manual transmission (press M) to shift gears manually.")
+            print("Manual transmission is not enabled. Press 'M' to enable.")
 
     def toggle_constant_velocity_mode(self):
         self.constant_velocity_mode = not self.constant_velocity_mode
         if self.constant_velocity_mode:
-            self.vehicle.enable_constant_velocity(carla.Vector3D(16.66, 0, 0))  # 60 km/h ≈ 16.66 m/s
+            self.vehicle.enable_constant_velocity(carla.Vector3D(16.66, 0, 0))
             print("Constant velocity mode ON (60 km/h)")
         else:
             self.vehicle.disable_constant_velocity()
@@ -225,7 +217,7 @@ client.set_timeout(10.0)
 world = client.get_world()
 
 traffic_manager = client.get_trafficmanager(8000)
-traffic_manager.set_synchronous_mode(True)  # Optional: only if your simulation is synchronous
+traffic_manager.set_synchronous_mode(True)
 
 blueprint_library = world.get_blueprint_library()
 vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
@@ -242,7 +234,6 @@ camera_rgb = SensorManager(world, display_manager, 'RGB', carla.Transform(carla.
 camera_depth = SensorManager(world, display_manager, 'Depth', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(1, 0))
 camera_semantic = SensorManager(world, display_manager, 'Semantic', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(0, 1))
 lidar_sensor = SensorManager(world, display_manager, 'LIDAR', carla.Transform(carla.Location(x=0, z=2.5)), vehicle, display_pos=(1, 1))
-
 imu_sensor = SensorManager(world, display_manager, 'IMU', carla.Transform(carla.Location()), vehicle, display_pos=(2, 0))
 gnss_sensor = SensorManager(world, display_manager, 'GNSS', carla.Transform(carla.Location()), vehicle, display_pos=(2, 1))
 
@@ -259,7 +250,6 @@ clock = pygame.time.Clock()
 try:
     running = True
     while running:
-        # Handle pygame events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -271,7 +261,7 @@ try:
 
         # Get vehicle speed
         velocity = vehicle.get_velocity()
-        speed = 3.6 * np.linalg.norm(np.array([velocity.x, velocity.y, velocity.z]))  # m/s to km/h
+        speed = 3.6 * np.linalg.norm([velocity.x, velocity.y, velocity.z])
 
         # Get vehicle position
         transform = vehicle.get_transform()
@@ -303,16 +293,17 @@ try:
             imu_acc.z if imu_acc else None,
             imu_gyro.x if imu_gyro else None,
             imu_gyro.y if imu_gyro else None,
-            imu_gyro.z if imu_gyro else None,
+            imu_gyro.z if imu_gyro else None
         ])
 
-        clock.tick(30)
+        clock.tick(30)  # 30 FPS
 
 except KeyboardInterrupt:
-    print('Simulation interrupted by user.')
+    print("Process interrupted. Cleaning up...")
 finally:
+    print('Destroying actors...')
+    for actor in world.get_actors().filter('*vehicle*'):
+        actor.destroy()
     csv_file.close()
-    vehicle.destroy()
-    for sensor in world.get_actors().filter('*sensor*'):
-        sensor.destroy()
     pygame.quit()
+    print('Done.')
