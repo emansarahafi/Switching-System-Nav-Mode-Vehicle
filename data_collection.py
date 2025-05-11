@@ -7,9 +7,101 @@ import pygame
 import carla
 import csv
 import time
-import math
 
-# Display Manager Class
+"""
+Welcome to CARLA manual control.
+
+Use ARROWS or WASD keys for control.
+
+    W            : throttle
+    S            : brake
+    A/D          : steer left/right
+    Q            : toggle reverse
+    Space        : hand-brake
+    P            : toggle autopilot
+    M            : toggle manual transmission
+    ,/.          : gear up/down
+    CTRL + W     : toggle constant velocity mode at 60 km/h
+
+    L            : toggle next light type
+    SHIFT + L    : toggle high beam
+    Z/X          : toggle right/left blinker
+    I            : toggle interior light
+
+    TAB          : change sensor position
+    ` or N       : next sensor
+    [1-9]        : change to sensor [1-9]
+    G            : toggle radar visualization
+    C            : change weather (Shift+C reverse)
+    Backspace    : change vehicle
+
+    O            : open/close all doors of vehicle
+    T            : toggle vehicle's telemetry
+
+    V            : Select next map layer (Shift+V reverse)
+    B            : Load current selected map layer (Shift+B to unload)
+
+    R            : toggle recording images to disk
+
+    CTRL + R     : toggle recording of simulation (replacing any previous)
+    CTRL + P     : start replaying last recorded simulation
+    CTRL + +     : increments the start time of the replay by 1 second (+SHIFT = 10 seconds)
+    CTRL + -     : decrements the start time of the replay by 1 second (+SHIFT = 10 seconds)
+
+    F1           : toggle HUD
+    H/?          : toggle help
+    ESC          : quit
+"""
+
+class ManualControl:
+    def __init__(self, vehicle):
+        self.vehicle = vehicle
+        self.autopilot = False
+        self.manual_transmission = False
+        self.constant_velocity_mode = False
+
+    def handle_key_press(self, key):
+        if key == pygame.K_w:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0))
+        elif key == pygame.K_s:
+            self.vehicle.apply_control(carla.VehicleControl(brake=1.0))
+        elif key == pygame.K_a:
+            self.vehicle.apply_control(carla.VehicleControl(steer=-1.0))
+        elif key == pygame.K_d:
+            self.vehicle.apply_control(carla.VehicleControl(steer=1.0))
+        elif key == pygame.K_q:
+            self.vehicle.apply_control(carla.VehicleControl(reverse=True))
+        elif key == pygame.K_SPACE:
+            self.vehicle.apply_control(carla.VehicleControl(hand_brake=True))
+        elif key == pygame.K_p:
+            self.toggle_autopilot()
+        elif key == pygame.K_m:
+            self.toggle_manual_transmission()
+        elif key == pygame.K_COMMA:
+            self.shift_gear(-1)
+        elif key == pygame.K_PERIOD:
+            self.shift_gear(1)
+        elif key == pygame.K_LCTRL and pygame.K_w:
+            self.toggle_constant_velocity_mode()
+
+    def toggle_autopilot(self):
+        self.autopilot = not self.autopilot
+        self.vehicle.set_autopilot(self.autopilot)
+
+    def toggle_manual_transmission(self):
+        self.manual_transmission = not self.manual_transmission
+        # Add manual transmission logic here if needed
+
+    def shift_gear(self, direction):
+        pass
+
+    def toggle_constant_velocity_mode(self):
+        self.constant_velocity_mode = not self.constant_velocity_mode
+        if self.constant_velocity_mode:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=0, brake=0))
+        else:
+            self.vehicle.apply_control(carla.VehicleControl())
+
 class DisplayManager:
     def __init__(self, grid_size):
         pygame.init()
@@ -27,7 +119,6 @@ class DisplayManager:
                 self.display.blit(sensor.surface, (position[0]*320, position[1]*240))
         pygame.display.flip()
 
-# Sensor Manager Class
 class SensorManager:
     def __init__(self, world, display_manager, sensor_type, transform, attached_vehicle, attributes=None, display_pos=(0,0)):
         blueprint_library = world.get_blueprint_library()
@@ -86,40 +177,6 @@ class SensorManager:
         else:
             self.data = image
 
-# Simple AutoPilot Controller
-def simple_vehicle_control(vehicle, waypoint, target_speed=20.0):
-    """Simple proportional controller to follow a waypoint."""
-    vehicle_transform = vehicle.get_transform()
-    vehicle_location = vehicle_transform.location
-    vehicle_yaw = math.radians(vehicle_transform.rotation.yaw)
-
-    waypoint_location = waypoint.transform.location
-
-    dx = waypoint_location.x - vehicle_location.x
-    dy = waypoint_location.y - vehicle_location.y
-
-    heading_to_wp = math.atan2(dy, dx)
-    yaw_error = heading_to_wp - vehicle_yaw
-
-    # Normalize yaw error
-    while yaw_error > math.pi:
-        yaw_error -= 2 * math.pi
-    while yaw_error < -math.pi:
-        yaw_error += 2 * math.pi
-
-    control = carla.VehicleControl()
-    control.throttle = 0.5
-    control.steer = np.clip(yaw_error, -1.0, 1.0)
-    
-    # Optional: control braking if necessary (not mandatory here)
-    velocity = vehicle.get_velocity()
-    speed = 3.6 * np.linalg.norm(np.array([velocity.x, velocity.y, velocity.z]))  # km/h
-    if speed > target_speed:
-        control.throttle = 0.2
-        control.brake = 0.1
-
-    vehicle.apply_control(control)
-
 # Connect to CARLA
 client = carla.Client('localhost', 2000)
 client.set_timeout(10.0)
@@ -130,6 +187,9 @@ vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
 spawn_point = random.choice(world.get_map().get_spawn_points())
 vehicle = world.spawn_actor(vehicle_bp, spawn_point)
 
+# Manual Control Setup
+manual_control = ManualControl(vehicle)
+
 # Sensor Setup
 display_manager = DisplayManager(grid_size=(3, 2))
 
@@ -137,13 +197,9 @@ camera_rgb = SensorManager(world, display_manager, 'RGB', carla.Transform(carla.
 camera_depth = SensorManager(world, display_manager, 'Depth', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(1, 0))
 camera_semantic = SensorManager(world, display_manager, 'Semantic', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(0, 1))
 lidar_sensor = SensorManager(world, display_manager, 'LIDAR', carla.Transform(carla.Location(x=0, z=2.5)), vehicle, display_pos=(1, 1))
+
 imu_sensor = SensorManager(world, display_manager, 'IMU', carla.Transform(carla.Location()), vehicle, display_pos=(2, 0))
 gnss_sensor = SensorManager(world, display_manager, 'GNSS', carla.Transform(carla.Location()), vehicle, display_pos=(2, 1))
-
-# Waypoints Setup
-map = world.get_map()
-waypoints = map.generate_waypoints(distance=10.0)  # every 10 meters
-target_waypoint = random.choice(waypoints)
 
 # CSV Data Saving
 csv_file = open('carla_sensor_data.csv', mode='w', newline='')
@@ -158,15 +214,15 @@ clock = pygame.time.Clock()
 try:
     running = True
     while running:
+        # Handle pygame events to prevent freezing
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.KEYDOWN:
+                manual_control.handle_key_press(event.key)
 
         world.tick()
         display_manager.render()
-
-        # Automatic Control
-        simple_vehicle_control(vehicle, target_waypoint)
 
         # Get vehicle speed
         velocity = vehicle.get_velocity()
