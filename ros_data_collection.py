@@ -203,7 +203,7 @@ def setup_sensors(world, vehicle, display_manager=None):
         sensors.append(
             SensorManager(world, display_manager, 'RGB', transform, vehicle, 
                         display_pos=None, topic_suffix=f"_{suffix}")
-        )
+    )
     
     # Depth and Semantic (front only)
     sensors.append(
