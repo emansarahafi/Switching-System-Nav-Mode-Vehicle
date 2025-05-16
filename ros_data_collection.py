@@ -14,52 +14,11 @@ from tf.transformations import quaternion_from_euler
 
 # ROS imports
 import rospy
-from sensor_msgs.msg import NavSatFix, Imu, Image
+from sensor_msgs.msg import NavSatFix, Imu, Image, PointCloud2
 from geometry_msgs.msg import TwistStamped, PoseStamped
 from std_msgs.msg import Header
 from cv_bridge import CvBridge
-
-"""
-Welcome to CARLA manual control.
-
-Use ARROWS or WASD keys for control.
-
-    W            : throttle
-    S            : brake
-    A/D          : steer left/right
-    Q            : toggle reverse
-    Space        : hand-brake
-    P            : toggle autopilot
-    M            : toggle manual transmission
-    ,/.          : gear up/down
-    CTRL + W     : toggle constant velocity mode at 60 km/h
-
-    L            : toggle next light type
-    SHIFT + L    : toggle high beam
-    Z/X          : toggle right/left blinker
-    I            : toggle interior light
-
-    TAB/N        : change sensor position
-    [1-9]        : change to sensor [1-9]
-    G            : toggle radar visualization
-    C            : change weather (Shift+C reverse)
-    Backspace    : change vehicle
-
-    O            : open/close all doors
-    T            : toggle vehicle telemetry
-
-    V            : select next map layer (Shift+V reverse)
-    B            : load selected map layer (Shift+B to unload)
-
-    R            : toggle recording images to disk
-    CTRL + R     : start/stop recording simulation
-    CTRL + P     : replay last recording
-    CTRL + +/-   : adjust replay start time
-
-    F1           : toggle HUD
-    H/?          : toggle help
-    ESC          : quit
-"""
+from carla import Transform, Location, Rotation
 
 class ManualControl:
     def __init__(self, vehicle, traffic_manager):
@@ -163,31 +122,32 @@ class DisplayManager:
         pygame.display.flip()
 
 class SensorManager:
-    def __init__(self, world, display_manager, sensor_type, transform, attached_vehicle, attributes=None, display_pos=(0,0)):
+    def __init__(self, world, display_manager, sensor_type, transform, attached_vehicle, attributes=None, display_pos=None, topic_suffix=""):
         blueprint_library = world.get_blueprint_library()
         self.sensor_type = sensor_type
+        self.topic_suffix = topic_suffix
 
         if sensor_type == 'RGB':
             bp = blueprint_library.find('sensor.camera.rgb')
-            bp.set_attribute('image_size_x', '320')
-            bp.set_attribute('image_size_y', '240')
+            bp.set_attribute('image_size_x', '640')
+            bp.set_attribute('image_size_y', '480')
             bp.set_attribute('fov', '90')
         elif sensor_type == 'Depth':
             bp = blueprint_library.find('sensor.camera.depth')
-            bp.set_attribute('image_size_x', '320')
-            bp.set_attribute('image_size_y', '240')
+            bp.set_attribute('image_size_x', '640')
+            bp.set_attribute('image_size_y', '480')
             bp.set_attribute('fov', '90')
         elif sensor_type == 'Semantic':
             bp = blueprint_library.find('sensor.camera.semantic_segmentation')
-            bp.set_attribute('image_size_x', '320')
-            bp.set_attribute('image_size_y', '240')
+            bp.set_attribute('image_size_x', '640')
+            bp.set_attribute('image_size_y', '480')
             bp.set_attribute('fov', '90')
         elif sensor_type == 'LIDAR':
             bp = blueprint_library.find('sensor.lidar.ray_cast')
             bp.set_attribute('range', '50')
-            bp.set_attribute('rotation_frequency', '10')
+            bp.set_attribute('rotation_frequency', '20')
             bp.set_attribute('channels', '64')
-            bp.set_attribute('points_per_second', '56000')
+            bp.set_attribute('points_per_second', '100000')
         elif sensor_type == 'IMU':
             bp = blueprint_library.find('sensor.other.imu')
         elif sensor_type == 'GNSS':
@@ -195,6 +155,11 @@ class SensorManager:
             bp.set_attribute('noise_alt_stddev', '0.0')
             bp.set_attribute('noise_lat_stddev', '0.0')
             bp.set_attribute('noise_lon_stddev', '0.0')
+        elif sensor_type == 'Radar':
+            bp = blueprint_library.find('sensor.other.radar')
+            bp.set_attribute('horizontal_fov', '30')
+            bp.set_attribute('vertical_fov', '30')
+            bp.set_attribute('range', '50')
         else:
             raise ValueError(f"Unknown sensor type: {sensor_type}")
 
@@ -207,7 +172,8 @@ class SensorManager:
         self.data = None
 
         self.sensor.listen(lambda data: self._parse_image(data))
-        display_manager.attach_sensor(self, display_pos)
+        if display_manager and display_pos:
+            display_manager.attach_sensor(self, display_pos)
 
     def _parse_image(self, image):
         if self.sensor_type in ['RGB', 'Depth', 'Semantic']:
@@ -220,182 +186,209 @@ class SensorManager:
         else:
             self.data = image
 
+def setup_sensors(world, vehicle, display_manager=None):
+    """Configure and return all sensors with multi-directional coverage"""
+    sensors = []
+    
+    # Camera configurations (front, rear, left, right)
+    camera_positions = [
+        ('front', Transform(Location(x=1.5, z=2.4), Rotation())),
+        ('rear', Transform(Location(x=-1.5, z=2.4), Rotation(yaw=180))),
+        ('left', Transform(Location(y=-1.0, z=2.4), Rotation(yaw=-90))),
+        ('right', Transform(Location(y=1.0, z=2.4), Rotation(yaw=90)))
+    ]
+    
+    # Add cameras
+    for suffix, transform in camera_positions:
+        sensors.append(
+            SensorManager(world, display_manager, 'RGB', transform, vehicle, 
+                        display_pos=None, topic_suffix=f"_{suffix}")
+        )
+    
+    # Depth and Semantic (front only)
+    sensors.append(
+        SensorManager(world, display_manager, 'Depth', 
+                    Transform(Location(x=1.5, z=2.4)), 
+                    vehicle, display_pos=(1, 0))
+    )
+    sensors.append(
+        SensorManager(world, display_manager, 'Semantic', 
+                    Transform(Location(x=1.5, z=2.4)), 
+                    vehicle, display_pos=(0, 1))
+    )
+    
+    # LIDAR (360-degree coverage)
+    sensors.append(
+        SensorManager(world, display_manager, 'LIDAR',
+                    Transform(Location(z=2.5)), 
+                    vehicle, display_pos=(1, 1))
+    )
+    
+    # IMU and GNSS
+    sensors.append(
+        SensorManager(world, None, 'IMU', 
+                    Transform(), vehicle)
+    )
+    sensors.append(
+        SensorManager(world, None, 'GNSS',
+                    Transform(), vehicle)
+    )
+    
+    return sensors
+
+def create_publishers():
+    """Create ROS publishers for all sensors"""
+    pubs = {
+        'gnss': rospy.Publisher('/carla/gnss', NavSatFix, queue_size=10),
+        'imu': rospy.Publisher('/carla/imu', Imu, queue_size=10),
+        'speed': rospy.Publisher('/carla/speed', TwistStamped, queue_size=10),
+        'pose': rospy.Publisher('/carla/pose', PoseStamped, queue_size=10),
+        'lidar': rospy.Publisher('/carla/lidar', PointCloud2, queue_size=10),
+        'depth': rospy.Publisher('/carla/depth', Image, queue_size=10),
+        'semantic': rospy.Publisher('/carla/semantic', Image, queue_size=10)
+    }
+    
+    # Add camera publishers
+    for direction in ['front', 'rear', 'left', 'right']:
+        pubs[f'rgb_{direction}'] = rospy.Publisher(
+            f'/carla/rgb_{direction}', Image, queue_size=10)
+    
+    return pubs
+
+def publish_sensor_data(pubs, sensors, vehicle, bridge):
+    """Publish all sensor data to ROS"""
+    current_time = rospy.Time.now()
+    
+    # Vehicle data
+    velocity = vehicle.get_velocity()
+    transform = vehicle.get_transform()
+    location = transform.location
+    rotation = transform.rotation
+    
+    # Publish vehicle state
+    twist_msg = TwistStamped()
+    twist_msg.header = Header(stamp=current_time, frame_id="carla")
+    twist_msg.twist.linear.x = velocity.x
+    twist_msg.twist.linear.y = velocity.y
+    twist_msg.twist.linear.z = velocity.z
+    pubs['speed'].publish(twist_msg)
+    
+    pose_msg = PoseStamped()
+    pose_msg.header = Header(stamp=current_time, frame_id="carla")
+    pose_msg.pose.position.x = location.x
+    pose_msg.pose.position.y = location.y
+    pose_msg.pose.position.z = location.z
+    q = quaternion_from_euler(
+        np.radians(rotation.roll),
+        np.radians(rotation.pitch),
+        np.radians(rotation.yaw)
+    )
+    pose_msg.pose.orientation.x = q[0]
+    pose_msg.pose.orientation.y = q[1]
+    pose_msg.pose.orientation.z = q[2]
+    pose_msg.pose.orientation.w = q[3]
+    pubs['pose'].publish(pose_msg)
+    
+    # Publish sensor data
+    for sensor in sensors:
+        if sensor.data is None:
+            continue
+            
+        if sensor.sensor_type == 'RGB':
+            img_msg = bridge.cv2_to_imgmsg(sensor.data, encoding="bgr8")
+            img_msg.header = Header(stamp=current_time, frame_id="carla")
+            pubs[f'rgb_{sensor.topic_suffix[1:]}'].publish(img_msg)
+        elif sensor.sensor_type == 'Depth':
+            img_msg = bridge.cv2_to_imgmsg(cv2.cvtColor(sensor.data, cv2.COLOR_BGR2GRAY), encoding="mono8")
+            img_msg.header = Header(stamp=current_time, frame_id="carla")
+            pubs['depth'].publish(img_msg)
+        elif sensor.sensor_type == 'Semantic':
+            img_msg = bridge.cv2_to_imgmsg(sensor.data, encoding="bgr8")
+            img_msg.header = Header(stamp=current_time, frame_id="carla")
+            pubs['semantic'].publish(img_msg)
+        elif sensor.sensor_type == 'IMU' and hasattr(sensor.data, 'accelerometer'):
+            imu_msg = Imu()
+            imu_msg.header = Header(stamp=current_time, frame_id="carla")
+            imu_msg.linear_acceleration.x = sensor.data.accelerometer.x
+            imu_msg.linear_acceleration.y = sensor.data.accelerometer.y
+            imu_msg.linear_acceleration.z = sensor.data.accelerometer.z
+            imu_msg.angular_velocity.x = sensor.data.gyroscope.x
+            imu_msg.angular_velocity.y = sensor.data.gyroscope.y
+            imu_msg.angular_velocity.z = sensor.data.gyroscope.z
+            pubs['imu'].publish(imu_msg)
+        elif sensor.sensor_type == 'GNSS' and hasattr(sensor.data, 'latitude'):
+            gnss_msg = NavSatFix()
+            gnss_msg.header = Header(stamp=current_time, frame_id="carla")
+            gnss_msg.latitude = sensor.data.latitude
+            gnss_msg.longitude = sensor.data.longitude
+            gnss_msg.altitude = sensor.data.altitude
+            pubs['gnss'].publish(gnss_msg)
+
 def main():
-    # === ROS Initialization ===
     rospy.init_node('carla_ros_bridge', anonymous=True)
     bridge = CvBridge()
-
-    # Publishers
-    gnss_pub = rospy.Publisher('/carla/gnss', NavSatFix, queue_size=10)
-    imu_pub = rospy.Publisher('/carla/imu', Imu, queue_size=10)
-    speed_pub = rospy.Publisher('/carla/speed', TwistStamped, queue_size=10)
-    pose_pub = rospy.Publisher('/carla/pose', PoseStamped, queue_size=10)
-    rgb_pub = rospy.Publisher('/carla/rgb', Image, queue_size=10)
-    depth_pub = rospy.Publisher('/carla/depth', Image, queue_size=10)
-    semantic_pub = rospy.Publisher('/carla/semantic', Image, queue_size=10)
-
-    # Connect to CARLA
+    
     try:
-        client = carla.Client('localhost', 2000)
+        # Connect to CARLA
+        client = carla.Client('192.168.31.244', 2000)
         client.set_timeout(10.0)
         world = client.get_world()
-
-        traffic_manager = client.get_trafficmanager(8000)
-        traffic_manager.set_synchronous_mode(True)
-
+        
+        # Setup synchronous mode
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05  # 20 FPS
+        world.apply_settings(settings)
+        
+        # Spawn vehicle
         blueprint_library = world.get_blueprint_library()
         vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
         spawn_point = random.choice(world.get_map().get_spawn_points())
         vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-
-        # Manual Control Setup
+        
+        # Setup traffic manager
+        traffic_manager = client.get_trafficmanager(8000)
+        traffic_manager.set_synchronous_mode(True)
+        
+        # Setup manual control
         manual_control = ManualControl(vehicle, traffic_manager)
-
-        # Sensor Setup
+        
+        # Setup display and sensors
         display_manager = DisplayManager(grid_size=(3, 2))
-
-        camera_rgb = SensorManager(world, display_manager, 'RGB', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(0, 0))
-        camera_depth = SensorManager(world, display_manager, 'Depth', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(1, 0))
-        camera_semantic = SensorManager(world, display_manager, 'Semantic', carla.Transform(carla.Location(x=1.5, z=2.4)), vehicle, display_pos=(0, 1))
-        lidar_sensor = SensorManager(world, display_manager, 'LIDAR', carla.Transform(carla.Location(x=0, z=2.5)), vehicle, display_pos=(1, 1))
-        imu_sensor = SensorManager(world, display_manager, 'IMU', carla.Transform(carla.Location()), vehicle, display_pos=(2, 0))
-        gnss_sensor = SensorManager(world, display_manager, 'GNSS', carla.Transform(carla.Location()), vehicle, display_pos=(2, 1))
-
-        # CSV Data Saving
-        csv_file = open('carla_sensor_data.csv', mode='w', newline='')
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(['timestamp', 'speed_kmph', 'vehicle_x', 'vehicle_y', 'vehicle_z',
-                            'gnss_latitude', 'gnss_longitude', 'gnss_altitude',
-                            'imu_acc_x', 'imu_acc_y', 'imu_acc_z',
-                            'imu_gyro_x', 'imu_gyro_y', 'imu_gyro_z'])
-
-        rate = rospy.Rate(30)  # 30Hz
-        running = True
-
-        while running and not rospy.is_shutdown():
+        sensors = setup_sensors(world, vehicle, display_manager)
+        pubs = create_publishers()
+        
+        # Main loop
+        rate = rospy.Rate(20)  # Match CARLA's 20 FPS
+        while not rospy.is_shutdown():
+            # Handle Pygame events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    running = False
+                    return
                 elif event.type == pygame.KEYDOWN:
                     manual_control.handle_key_press(event.key, event.mod)
-
-            world.tick()
-            display_manager.render()
-
-            velocity = vehicle.get_velocity()
-            speed = 3.6 * np.linalg.norm([velocity.x, velocity.y, velocity.z])
-
-            transform = vehicle.get_transform()
-            location = transform.location
-            rotation = transform.rotation
-
-            # GNSS data
-            if gnss_sensor.data:
-                gnss_lat = gnss_sensor.data.latitude
-                gnss_lon = gnss_sensor.data.longitude
-                gnss_alt = gnss_sensor.data.altitude
-            else:
-                gnss_lat = gnss_lon = gnss_alt = None
-
-            # IMU data
-            if imu_sensor.data:
-                imu_acc = imu_sensor.data.accelerometer
-                imu_gyro = imu_sensor.data.gyroscope
-            else:
-                imu_acc = imu_gyro = None
-
-            # Write to CSV
-            csv_writer.writerow([
-                time.time(),
-                speed,
-                location.x, location.y, location.z,
-                gnss_lat, gnss_lon, gnss_alt,
-                imu_acc.x if imu_acc else None,
-                imu_acc.y if imu_acc else None,
-                imu_acc.z if imu_acc else None,
-                imu_gyro.x if imu_gyro else None,
-                imu_gyro.y if imu_gyro else None,
-                imu_gyro.z if imu_gyro else None
-            ])
-
-            # === ROS Publishing ===
-            current_time = rospy.Time.now()
-
-            # Publish GNSS
-            if gnss_lat is not None:
-                gnss_msg = NavSatFix()
-                gnss_msg.header = Header(stamp=current_time, frame_id="carla")
-                gnss_msg.latitude = gnss_lat
-                gnss_msg.longitude = gnss_lon
-                gnss_msg.altitude = gnss_alt
-                gnss_pub.publish(gnss_msg)
-
-            # Publish IMU
-            if imu_acc is not None and imu_gyro is not None:
-                imu_msg = Imu()
-                imu_msg.header = Header(stamp=current_time, frame_id="carla")
-                imu_msg.linear_acceleration.x = imu_acc.x
-                imu_msg.linear_acceleration.y = imu_acc.y
-                imu_msg.linear_acceleration.z = imu_acc.z
-                imu_msg.angular_velocity.x = imu_gyro.x
-                imu_msg.angular_velocity.y = imu_gyro.y
-                imu_msg.angular_velocity.z = imu_gyro.z
-                imu_pub.publish(imu_msg)
-
-            # Publish Speed (TwistStamped)
-            twist_msg = TwistStamped()
-            twist_msg.header = Header(stamp=current_time, frame_id="carla")
-            twist_msg.twist.linear.x = velocity.x
-            twist_msg.twist.linear.y = velocity.y
-            twist_msg.twist.linear.z = velocity.z
-            speed_pub.publish(twist_msg)
-
-            # Publish Pose (PoseStamped)
-            pose_msg = PoseStamped()
-            pose_msg.header = Header(stamp=current_time, frame_id="carla")
-            pose_msg.pose.position.x = location.x
-            pose_msg.pose.position.y = location.y
-            pose_msg.pose.position.z = location.z
             
-            # Convert Euler angles to quaternion
-            q = quaternion_from_euler(
-                np.radians(rotation.roll),
-                np.radians(rotation.pitch),
-                np.radians(rotation.yaw)
-            )
-            pose_msg.pose.orientation.x = q[0]
-            pose_msg.pose.orientation.y = q[1]
-            pose_msg.pose.orientation.z = q[2]
-            pose_msg.pose.orientation.w = q[3]
-            pose_pub.publish(pose_msg)
-
-            # Publish Camera Data (RGB, Depth, Semantic)
-            if camera_rgb.data is not None:
-                rgb_msg = bridge.cv2_to_imgmsg(camera_rgb.data, encoding="bgr8")
-                rgb_msg.header = Header(stamp=current_time, frame_id="carla")
-                rgb_pub.publish(rgb_msg)
-
-            if camera_depth.data is not None:
-                depth_msg = bridge.cv2_to_imgmsg(cv2.cvtColor(camera_depth.data, cv2.COLOR_BGR2GRAY), encoding="mono8")
-                depth_msg.header = Header(stamp=current_time, frame_id="carla")
-                depth_pub.publish(depth_msg)
-
-            if camera_semantic.data is not None:
-                semantic_msg = bridge.cv2_to_imgmsg(camera_semantic.data, encoding="bgr8")
-                semantic_msg.header = Header(stamp=current_time, frame_id="carla")
-                semantic_pub.publish(semantic_msg)
-
+            # Tick CARLA world
+            world.tick()
+            
+            # Update display
+            display_manager.render()
+            
+            # Publish all sensor data
+            publish_sensor_data(pubs, sensors, vehicle, bridge)
+            
             rate.sleep()
 
     except KeyboardInterrupt:
-        print("Process interrupted. Cleaning up...")
-    except Exception as e:
-        print(f"Error: {e}")
+        print("Shutting down...")
     finally:
+        # Cleanup
         print('Destroying actors...')
-        for actor in world.get_actors().filter('*vehicle*'):
-            actor.destroy()
-        csv_file.close()
+        for sensor in sensors:
+            if sensor.sensor.is_alive:
+                sensor.sensor.destroy()
+        if 'vehicle' in locals() and vehicle.is_alive:
+            vehicle.destroy()
         pygame.quit()
         print('Done.')
 
