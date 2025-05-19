@@ -11,6 +11,7 @@ import csv
 import time
 import cv2
 from tf.transformations import quaternion_from_euler
+from datetime import datetime
 
 # ROS imports
 import rospy
@@ -107,7 +108,7 @@ class ManualControl:
 class DisplayManager:
     def __init__(self, grid_size):
         pygame.init()
-        self.display = pygame.display.set_mode((grid_size[0]*320, grid_size[1]*240))
+        self.display = pygame.display.set_mode((grid_size[0]*640, grid_size[1]*480))
         pygame.display.set_caption("Sensor Data")
         self.grid_size = grid_size
         self.sensors = []
@@ -118,7 +119,7 @@ class DisplayManager:
     def render(self):
         for sensor, position in self.sensors:
             if sensor.surface is not None:
-                self.display.blit(sensor.surface, (position[0]*320, position[1]*240))
+                self.display.blit(sensor.surface, (position[0]*640, position[1]*480))
         pygame.display.flip()
 
 class SensorManager:
@@ -126,6 +127,7 @@ class SensorManager:
         blueprint_library = world.get_blueprint_library()
         self.sensor_type = sensor_type
         self.topic_suffix = topic_suffix
+        self.frame_count = 0
 
         if sensor_type == 'RGB':
             bp = blueprint_library.find('sensor.camera.rgb')
@@ -155,11 +157,6 @@ class SensorManager:
             bp.set_attribute('noise_alt_stddev', '0.0')
             bp.set_attribute('noise_lat_stddev', '0.0')
             bp.set_attribute('noise_lon_stddev', '0.0')
-        elif sensor_type == 'Radar':
-            bp = blueprint_library.find('sensor.other.radar')
-            bp.set_attribute('horizontal_fov', '30')
-            bp.set_attribute('vertical_fov', '30')
-            bp.set_attribute('range', '50')
         else:
             raise ValueError(f"Unknown sensor type: {sensor_type}")
 
@@ -181,50 +178,65 @@ class SensorManager:
             array = np.reshape(array, (image.height, image.width, 4))
             array = array[:, :, :3]
             array = array[:, :, ::-1]
+            
+            # Save image to disk
+            if self.sensor_type == 'RGB':
+                img_dir = f"carla_data_logs/images/{self.topic_suffix[1:]}"
+                os.makedirs(img_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                cv2.imwrite(f"{img_dir}/{timestamp}.png", array)
+            
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
             self.data = array
         else:
             self.data = image
 
 def setup_sensors(world, vehicle, display_manager=None):
-    """Configure and return all sensors with multi-directional coverage"""
+    """Configure sensors with all cameras at ±1.5m on x or y axis"""
     sensors = []
     
-    # Camera configurations (front, rear, left, right)
+    # Camera positions with x or y at ±1.5m (z=2.4 for all)
     camera_positions = [
-        ('front', Transform(Location(x=1.5, z=2.4), Rotation())),
-        ('rear', Transform(Location(x=-1.5, z=2.4), Rotation(yaw=180))),
-        ('left', Transform(Location(y=-1.0, z=2.4), Rotation(yaw=-90))),
-        ('right', Transform(Location(y=1.0, z=2.4), Rotation(yaw=90)))
+        ('front', Transform(Location(x=1.5, z=2.4), Rotation())),       # Front
+        ('rear', Transform(Location(x=-1.5, z=2.4), Rotation(yaw=180))), # Rear 
+        ('left', Transform(Location(y=-1.5, z=2.4), Rotation(yaw=-90))), # Left
+        ('right', Transform(Location(y=1.5, z=2.4), Rotation(yaw=90)))   # Right
     ]
     
-    # Add cameras
+    # Create all cameras
     for suffix, transform in camera_positions:
         sensors.append(
-            SensorManager(world, display_manager, 'RGB', transform, vehicle, 
-                        display_pos=None, topic_suffix=f"_{suffix}")
-    )
+            SensorManager(world, 
+                        display_manager if suffix == 'front' else None,
+                        'RGB', 
+                        transform, 
+                        vehicle,
+                        {'image_size_x': '640', 'image_size_y': '480', 'fov': '90'},
+                        display_pos=(0, 0) if suffix == 'front' else None,
+                        topic_suffix=f"_{suffix}")
+        )
     
-    # Depth and Semantic (front only)
+    # Front-facing sensors (depth and semantic)
+    front_transform = Transform(Location(x=1.5, z=2.4))
     sensors.append(
         SensorManager(world, display_manager, 'Depth', 
-                    Transform(Location(x=1.5, z=2.4)), 
+                    front_transform, 
                     vehicle, display_pos=(1, 0))
     )
     sensors.append(
         SensorManager(world, display_manager, 'Semantic', 
-                    Transform(Location(x=1.5, z=2.4)), 
+                    front_transform, 
                     vehicle, display_pos=(0, 1))
     )
     
-    # LIDAR (360-degree coverage)
+    # LIDAR (center position)
     sensors.append(
-        SensorManager(world, display_manager, 'LIDAR',
+        SensorManager(world, None, 'LIDAR',
                     Transform(Location(z=2.5)), 
-                    vehicle, display_pos=(1, 1))
+                    vehicle)
     )
     
-    # IMU and GNSS
+    # IMU and GNSS (center position)
     sensors.append(
         SensorManager(world, None, 'IMU', 
                     Transform(), vehicle)
@@ -255,15 +267,72 @@ def create_publishers():
     
     return pubs
 
-def publish_sensor_data(pubs, sensors, vehicle, bridge):
-    """Publish all sensor data to ROS"""
+def setup_data_logger():
+    """Setup CSV file and directories for logging all sensor data"""
+    log_dir = "carla_data_logs"
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(f"{log_dir}/images", exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{log_dir}/sensor_data_{timestamp}.csv"
+    
+    csv_file = open(filename, 'w')
+    writer = csv.writer(csv_file)
+    
+    # Write header
+    writer.writerow([
+        'timestamp', 'latitude', 'longitude', 'altitude',
+        'accel_x', 'accel_y', 'accel_z',
+        'gyro_x', 'gyro_y', 'gyro_z',
+        'vel_x', 'vel_y', 'vel_z',
+        'pos_x', 'pos_y', 'pos_z',
+        'roll', 'pitch', 'yaw',
+        'front_img', 'rear_img', 'left_img', 'right_img'
+    ])
+    
+    return csv_file, writer
+
+def publish_sensor_data(pubs, sensors, vehicle, bridge, csv_writer=None):
+    """Publish all sensor data to ROS and log to CSV"""
     current_time = rospy.Time.now()
+    timestamp = current_time.to_sec()
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     
     # Vehicle data
     velocity = vehicle.get_velocity()
     transform = vehicle.get_transform()
     location = transform.location
     rotation = transform.rotation
+    
+    # Image filenames
+    img_filenames = {
+        'front': f"front/{timestamp_str}.png",
+        'rear': f"rear/{timestamp_str}.png",
+        'left': f"left/{timestamp_str}.png",
+        'right': f"right/{timestamp_str}.png"
+    }
+    
+    # Log to CSV if writer provided
+    if csv_writer:
+        csv_writer.writerow([
+            timestamp,
+            None,  # Will be filled by GNSS data
+            None,
+            None,
+            None,  # Will be filled by IMU data
+            None,
+            None,
+            None,
+            None,
+            None,
+            velocity.x, velocity.y, velocity.z,
+            location.x, location.y, location.z,
+            rotation.roll, rotation.pitch, rotation.yaw,
+            img_filenames['front'],
+            img_filenames['rear'],
+            img_filenames['left'],
+            img_filenames['right']
+        ])
     
     # Publish vehicle state
     twist_msg = TwistStamped()
@@ -328,23 +397,49 @@ def main():
     rospy.init_node('carla_ros_bridge', anonymous=True)
     bridge = CvBridge()
     
+    # Initialize variables that will be used in finally block
+    sensors = []
+    vehicle = None
+    display_manager = None
+    csv_file = None
+    
     try:
-        # Connect to CARLA
-        client = carla.Client('192.168.31.244', 2000)
-        client.set_timeout(10.0)
-        world = client.get_world()
+        # Setup data logging
+        csv_file, csv_writer = setup_data_logger()
+        rospy.loginfo(f"Logging sensor data to {csv_file.name}")
+        
+        # Connect to CARLA with error handling
+        try:
+            client = carla.Client('192.168.344', 2000)
+            client.set_timeout(10.0)
+            world = client.get_world()
+            rospy.loginfo("Successfully connected to CARLA server")
+        except RuntimeError as e:
+            rospy.logerr(f"Failed to connect to CARLA: {e}")
+            rospy.logerr("Please make sure CARLA is running and accessible at 192.168.1.22:2000")
+            return
         
         # Setup synchronous mode
-        settings = world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 0.05  # 20 FPS
-        world.apply_settings(settings)
+        try:
+            settings = world.get_settings()
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = 0.05  # 20 FPS
+            world.apply_settings(settings)
+            rospy.loginfo("CARLA synchronous mode set to 20 FPS")
+        except RuntimeError as e:
+            rospy.logerr(f"Failed to apply CARLA settings: {e}")
+            return
         
         # Spawn vehicle
-        blueprint_library = world.get_blueprint_library()
-        vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
-        spawn_point = random.choice(world.get_map().get_spawn_points())
-        vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+        try:
+            blueprint_library = world.get_blueprint_library()
+            vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
+            spawn_point = random.choice(world.get_map().get_spawn_points())
+            vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+            rospy.loginfo(f"Spawned vehicle: {vehicle.type_id}")
+        except RuntimeError as e:
+            rospy.logerr(f"Failed to spawn vehicle: {e}")
+            return
         
         # Setup traffic manager
         traffic_manager = client.get_trafficmanager(8000)
@@ -354,9 +449,14 @@ def main():
         manual_control = ManualControl(vehicle, traffic_manager)
         
         # Setup display and sensors
-        display_manager = DisplayManager(grid_size=(3, 2))
-        sensors = setup_sensors(world, vehicle, display_manager)
-        pubs = create_publishers()
+        try:
+            display_manager = DisplayManager(grid_size=(2, 2))  # 2x2 grid
+            sensors = setup_sensors(world, vehicle, display_manager)
+            pubs = create_publishers()
+            rospy.loginfo("Sensors and display initialized")
+        except Exception as e:
+            rospy.logerr(f"Failed to initialize sensors: {e}")
+            return
         
         # Main loop
         rate = rospy.Rate(20)  # Match CARLA's 20 FPS
@@ -369,28 +469,41 @@ def main():
                     manual_control.handle_key_press(event.key, event.mod)
             
             # Tick CARLA world
-            world.tick()
+            try:
+                world.tick()
+            except RuntimeError as e:
+                rospy.logerr(f"CARLA world tick failed: {e}")
+                break
             
             # Update display
             display_manager.render()
             
-            # Publish all sensor data
-            publish_sensor_data(pubs, sensors, vehicle, bridge)
+            # Publish all sensor data and log to CSV
+            publish_sensor_data(pubs, sensors, vehicle, bridge, csv_writer)
             
             rate.sleep()
 
     except KeyboardInterrupt:
-        print("Shutting down...")
+        rospy.loginfo("Shutting down due to keyboard interrupt")
+    except Exception as e:
+        rospy.logerr(f"Unexpected error: {e}")
     finally:
         # Cleanup
-        print('Destroying actors...')
-        for sensor in sensors:
-            if sensor.sensor.is_alive:
-                sensor.sensor.destroy()
-        if 'vehicle' in locals() and vehicle.is_alive:
-            vehicle.destroy()
-        pygame.quit()
-        print('Done.')
+        rospy.loginfo('Destroying actors...')
+        try:
+            for sensor in sensors:
+                if hasattr(sensor, 'sensor') and sensor.sensor.is_alive:
+                    sensor.sensor.destroy()
+            if vehicle is not None and vehicle.is_alive:
+                vehicle.destroy()
+            if display_manager is not None:
+                pygame.quit()
+            if csv_file is not None:
+                csv_file.close()
+                rospy.loginfo(f"Data logged to {csv_file.name}")
+        except Exception as e:
+            rospy.logerr(f"Error during cleanup: {e}")
+        rospy.loginfo('Done.')
 
 if __name__ == '__main__':
     main()
