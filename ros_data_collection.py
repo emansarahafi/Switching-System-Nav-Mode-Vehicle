@@ -410,7 +410,7 @@ def main():
         
         # Connect to CARLA with error handling
         try:
-            client = carla.Client('192.168.344', 2000)
+            client = carla.Client('192.168.31.244', 2000)
             client.set_timeout(10.0)
             world = client.get_world()
             rospy.loginfo("Successfully connected to CARLA server")
