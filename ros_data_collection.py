@@ -1,174 +1,345 @@
+import glob
 import os
+import sys
 import random
 import numpy as np
 import pygame
 import carla
 import csv
 import time
-import threading
-import traceback
-from collections import deque
-from datetime import datetime
 import rospy
-from std_msgs.msg import Float32MultiArray, String
+from sensor_msgs.msg import Image, NavSatFix, Imu
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose, Twist, Vector3
+from std_msgs.msg import String, Float32
+from cv_bridge import CvBridge
+import math
+from pygame.locals import *
+
+# Initialize Pygame and font module first
+pygame.init()
+pygame.font.init()
+
+# Initialize ROS node
+rospy.init_node('carla_data_collector')
+bridge = CvBridge()
 
 class ManualControl:
-    def __init__(self, vehicle, traffic_manager):
+    def __init__(self, vehicle, world, client):
         self.vehicle = vehicle
+        self.world = world
+        self.client = client
         self.autopilot = False
-        self.manual_transmission = False
         self.constant_velocity_mode = False
-        self.traffic_manager = traffic_manager
-        self.current_gear = 1
-        self.control_history = deque(maxlen=30)
-        self.driver_presence = True
-        self.eye_gaze = (0, 0)
-        self.head_pose = (0, 0, 0)
-        self.save_images = False
-        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.create_data_directories()
-
-    def create_data_directories(self):
-        base_dir = f"data/{self.session_id}/images"
-        for cam_type in ['rgb', 'depth', 'semantic']:
-            for side in ['front', 'rear', 'left', 'right']:
-                os.makedirs(f"{base_dir}/{cam_type}/{side}", exist_ok=True)
-
-    def handle_key_press(self, key, mod):
-        if self.autopilot and key not in {pygame.K_p, pygame.K_ESCAPE}:
-            print("Autopilot active - manual inputs disabled")
-            return
-
-        control = self.vehicle.get_control()
+        self.recording_images = False
+        self.recording_simulation = False
+        self.replay_start = 0
+        self.show_hud = True
+        self.show_help = False
         
-        if key == pygame.K_w:
-            control.throttle = min(control.throttle + 0.1, 1.0)
-        elif key == pygame.K_s:
-            control.brake = min(control.brake + 0.1, 1.0)
-        elif key == pygame.K_a:
-            control.steer = max(control.steer - 0.1, -1.0)
-        elif key == pygame.K_d:
-            control.steer = min(control.steer + 0.1, 1.0)
-        elif key == pygame.K_q:
-            control.reverse = not control.reverse
-        elif key == pygame.K_SPACE:
-            control.hand_brake = not control.hand_brake
-        elif key == pygame.K_p:
-            self.toggle_autopilot()
-        elif key == pygame.K_m:
-            self.toggle_manual_transmission()
-        elif key == pygame.K_COMMA:
-            self.shift_gear(-1)
-        elif key == pygame.K_PERIOD:
-            self.shift_gear(1)
-        elif (key == pygame.K_w) and (mod & pygame.KMOD_CTRL):
-            self.toggle_constant_velocity_mode()
-        elif key == pygame.K_r:
-            pass
+        # Navigation mode tracking
+        self.current_nav_mode = "lane_keeping"  # Default mode
+        self.nav_modes = ["lane_keeping", "turning_left", "turning_right", 
+                         "stopping", "changing_lanes", "reversing"]
         
-        self.vehicle.apply_control(control)
-        self.control_history.append(control)
+        # Weather presets
+        self.weather_presets = [
+            carla.WeatherParameters.ClearNoon,
+            carla.WeatherParameters.CloudyNoon,
+            carla.WeatherParameters.WetNoon,
+            carla.WeatherParameters.WetCloudyNoon,
+            carla.WeatherParameters.MidRainyNoon,
+            carla.WeatherParameters.HardRainNoon,
+            carla.WeatherParameters.SoftRainNoon,
+            carla.WeatherParameters.ClearSunset,
+            carla.WeatherParameters.CloudySunset,
+            carla.WeatherParameters.WetSunset,
+            carla.WeatherParameters.WetCloudySunset,
+            carla.WeatherParameters.MidRainSunset,
+            carla.WeatherParameters.HardRainSunset,
+            carla.WeatherParameters.SoftRainSunset
+        ]
+        self.current_weather_index = 0
         
-        self.eye_gaze = (random.uniform(-0.1, 0.1), random.uniform(-0.1, 0.1))
-        self.head_pose = (random.uniform(-5, 5), random.uniform(-10, 10), random.uniform(-2, 2))
+        # Map layers
+        self.map_layers = [
+            carla.MapLayer.NONE,
+            carla.MapLayer.Buildings,
+            carla.MapLayer.Decals,
+            carla.MapLayer.Foliage,
+            carla.MapLayer.Ground,
+            carla.MapLayer.ParkedVehicles,
+            carla.MapLayer.Particles,
+            carla.MapLayer.Props,
+            carla.MapLayer.StreetLights,
+            carla.MapLayer.Walls,
+            carla.MapLayer.All
+        ]
+        self.current_layer_index = 0
+        self.current_layer = self.map_layers[self.current_layer_index]
+        
+        # Initialize weather
+        self.world.set_weather(self.weather_presets[self.current_weather_index])
+        
+        # Create data directories for each camera side
+        self.data_dir = 'data'
+        self.image_dir = os.path.join(self.data_dir, 'images')
+        self.log_dir = os.path.join(self.data_dir, 'logs')
+        
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+        
+        # Create subdirectories for each camera view
+        self.camera_dirs = {
+            'front': os.path.join(self.image_dir, 'front'),
+            'back': os.path.join(self.image_dir, 'back'),
+            'left': os.path.join(self.image_dir, 'left'),
+            'right': os.path.join(self.image_dir, 'right')
+        }
+        
+        for dir_path in self.camera_dirs.values():
+            os.makedirs(dir_path, exist_ok=True)
+        
+        # Font for HUD
+        self.font = pygame.font.SysFont('Arial', 12)
+        
+        # ROS Publishers
+        self.nav_mode_pub = rospy.Publisher('/carla/navigation_mode', String, queue_size=10)
+        self.control_pub = rospy.Publisher('/carla/vehicle_control', String, queue_size=10)
+
+    def handle_key_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            # Navigation mode selection
+            if event.key == pygame.K_1:
+                self.current_nav_mode = "lane_keeping"
+            elif event.key == pygame.K_2:
+                self.current_nav_mode = "turning_left"
+            elif event.key == pygame.K_3:
+                self.current_nav_mode = "turning_right"
+            elif event.key == pygame.K_4:
+                self.current_nav_mode = "stopping"
+            elif event.key == pygame.K_5:
+                self.current_nav_mode = "changing_lanes"
+            elif event.key == pygame.K_6:
+                self.current_nav_mode = "reversing"
+            
+            # Basic vehicle controls
+            elif event.key == pygame.K_w:
+                self.vehicle.apply_control(carla.VehicleControl(throttle=1.0))
+                self.publish_control("throttle")
+            elif event.key == pygame.K_s:
+                self.vehicle.apply_control(carla.VehicleControl(brake=1.0))
+                self.publish_control("brake")
+            elif event.key == pygame.K_a:
+                self.vehicle.apply_control(carla.VehicleControl(steer=-1.0))
+                self.publish_control("steer_left")
+            elif event.key == pygame.K_d:
+                self.vehicle.apply_control(carla.VehicleControl(steer=1.0))
+                self.publish_control("steer_right")
+            elif event.key == pygame.K_q:
+                self.vehicle.apply_control(carla.VehicleControl(reverse=True))
+                self.publish_control("reverse")
+            elif event.key == pygame.K_SPACE:
+                self.vehicle.apply_control(carla.VehicleControl(hand_brake=True))
+                self.publish_control("hand_brake")
+            elif event.key == pygame.K_p:
+                self.toggle_autopilot()
+            elif event.key == pygame.K_w and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                self.toggle_constant_velocity_mode()
+            
+            # Weather control
+            elif event.key == pygame.K_c:
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    self.change_weather(-1)  # Previous weather
+                else:
+                    self.change_weather(1)   # Next weather
+            
+            # Map layer control
+            elif event.key == pygame.K_v:
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    self.change_map_layer(-1)  # Previous layer
+                else:
+                    self.change_map_layer(1)   # Next layer
+            elif event.key == pygame.K_b:
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    self.world.unload_map_layer(self.current_layer)  # Unload layer
+                else:
+                    self.world.load_map_layer(self.current_layer)    # Load layer
+            
+            # Recording control
+            elif event.key == pygame.K_r:
+                self.recording_images = not self.recording_images
+            elif event.key == pygame.K_r and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                self.toggle_recording_simulation()
+            elif event.key == pygame.K_p and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                self.start_replay()
+            
+            # Replay time adjustment
+            elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
+                if pygame.key.get_mods() & pygame.KMOD_CTRL:
+                    increment = 10 if pygame.key.get_mods() & pygame.KMOD_SHIFT else 1
+                    self.replay_start += increment
+            elif event.key == pygame.K_MINUS:
+                if pygame.key.get_mods() & pygame.KMOD_CTRL:
+                    decrement = 10 if pygame.key.get_mods() & pygame.KMOD_SHIFT else 1
+                    self.replay_start = max(0, self.replay_start - decrement)
+            
+            # Display control
+            elif event.key == pygame.K_F1:
+                self.show_hud = not self.show_hud
+            elif event.key == pygame.K_h or event.key == pygame.K_SLASH:
+                self.show_help = not self.show_help
+            
+            # Map selection
+            elif event.key == pygame.K_3:
+                self.change_map('Town03')
+            elif event.key == pygame.K_0:
+                self.change_map('Town10')
+            elif event.key == pygame.K_ESCAPE:
+                return False  # Signal to quit
+        
+        elif event.type == pygame.KEYUP:
+            # Reset controls when keys are released
+            if event.key in (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, 
+                            pygame.K_q, pygame.K_SPACE):
+                self.vehicle.apply_control(carla.VehicleControl())
+        
+        # Always publish navigation mode
+        self.nav_mode_pub.publish(self.current_nav_mode)
+        return True
+
+    def publish_control(self, control_type):
+        self.control_pub.publish(control_type)
 
     def toggle_autopilot(self):
-        if self.autopilot:
-            control = carla.VehicleControl()
-            control.throttle = 0.0
-            control.brake = 0.5
-            self.vehicle.apply_control(control)
-            time.sleep(0.5)
-        
         self.autopilot = not self.autopilot
-        try:
-            self.vehicle.set_autopilot(self.autopilot, self.traffic_manager.get_port())
-            print(f"Autopilot {'ON' if self.autopilot else 'OFF'} (TM Port: {self.traffic_manager.get_port()})")
-        except RuntimeError as e:
-            print(f"Autopilot toggle failed: {str(e)}")
-            self.autopilot = False
-
-    def toggle_manual_transmission(self):
-        if self.autopilot:
-            self.toggle_autopilot()
-
-        self.manual_transmission = not self.manual_transmission
-        print(f"Manual Transmission {'ON' if self.manual_transmission else 'OFF'}")
-
-    def shift_gear(self, direction):
-        if self.manual_transmission:
-            control = self.vehicle.get_control()
-            if direction == 1:
-                self.current_gear += 1
-            elif direction == -1:
-                self.current_gear = max(0, self.current_gear - 1)
-            control.manual_gear_shift = True
-            control.gear = self.current_gear
-            self.vehicle.apply_control(control)
-            print(f"Shifted to gear {self.current_gear}")
-        else:
-            print("Manual transmission not enabled")
+        self.vehicle.set_autopilot(self.autopilot)
+        status = "autopilot_on" if self.autopilot else "autopilot_off"
+        self.control_pub.publish(status)
 
     def toggle_constant_velocity_mode(self):
         self.constant_velocity_mode = not self.constant_velocity_mode
         if self.constant_velocity_mode:
-            self.vehicle.enable_constant_velocity(carla.Vector3D(16.66, 0, 0))
-            print("Constant velocity mode ON (60 km/h)")
+            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=0, brake=0))
+            self.control_pub.publish("constant_velocity_on")
         else:
-            self.vehicle.disable_constant_velocity()
-            print("Constant velocity mode OFF")
+            self.vehicle.apply_control(carla.VehicleControl())
+            self.control_pub.publish("constant_velocity_off")
 
-class CollisionSensor:
-    def __init__(self, vehicle):
-        self.vehicle = vehicle
-        self.destroyed = False
-        world = vehicle.get_world()
-        bp = world.get_blueprint_library().find('sensor.other.collision')
-        self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=vehicle)
-        self.sensor.listen(self.on_collision)
+    def change_weather(self, direction):
+        self.current_weather_index = (self.current_weather_index + direction) % len(self.weather_presets)
+        self.world.set_weather(self.weather_presets[self.current_weather_index])
 
-    def on_collision(self, event):
-        if self.destroyed: return
-        impulse = event.normal_impulse
-        intensity = np.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
-        if intensity > 500:
-            print(f"Emergency stop! Collision intensity: {intensity:.2f}")
-            control = self.vehicle.get_control()
-            control.throttle = 0.0
-            control.brake = 1.0
-            self.vehicle.apply_control(control)
+    def change_map_layer(self, direction):
+        self.current_layer_index = (self.current_layer_index + direction) % len(self.map_layers)
+        self.current_layer = self.map_layers[self.current_layer_index]
 
-    def destroy(self):
-        if not self.destroyed:
-            self.sensor.destroy()
-            self.destroyed = True
+    def toggle_recording_simulation(self):
+        if self.recording_simulation:
+            self.client.stop_recorder()
+            print("Stopped recording simulation")
+        else:
+            filename = os.path.join(self.log_dir, f"recording_{time.strftime('%Y%m%d_%H%M%S')}.log")
+            self.client.start_recorder(filename)
+            print(f"Started recording simulation to {filename}")
+        self.recording_simulation = not self.recording_simulation
 
-class LaneInvasionSensor:
-    def __init__(self, vehicle):
-        self.vehicle = vehicle
-        self.destroyed = False
-        world = vehicle.get_world()
-        bp = world.get_blueprint_library().find('sensor.other.lane_invasion')
-        self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=vehicle)
-        self.sensor.listen(self.on_invasion)
+    def start_replay(self):
+        # Look for the most recent recording
+        recordings = glob.glob(os.path.join(self.log_dir, "recording_*.log"))
+        if recordings:
+            # Get the latest recording
+            latest_recording = max(recordings, key=os.path.getctime)
+            self.client.replay_file(latest_recording, self.replay_start, 0, 0)
+            print(f"Started replay from {self.replay_start} seconds: {os.path.basename(latest_recording)}")
+        else:
+            print("No recording found")
 
-    def on_invasion(self, event):
-        if self.destroyed: return
-        print("Lane invasion detected! Correcting trajectory...")
-        control = self.vehicle.get_control()
-        control.steer = -0.2 * control.steer
-        self.vehicle.apply_control(control)
+    def change_map(self, map_name):
+        print(f"Loading map: {map_name}")
+        self.client.load_world(map_name)
+        # Reinitialize after map change
+        self.world = self.client.get_world()
+        self.world.set_weather(self.weather_presets[self.current_weather_index])
+        self.world.load_map_layer(self.current_layer)
 
-    def destroy(self):
-        if not self.destroyed:
-            self.sensor.destroy()
-            self.destroyed = True
+    def render_hud(self, display):
+        if not self.show_hud:
+            return
+            
+        # Get vehicle speed
+        velocity = self.vehicle.get_velocity()
+        speed = 3.6 * np.linalg.norm(np.array([velocity.x, velocity.y, velocity.z]))  # m/s to km/h
+        
+        # Create HUD text
+        hud_text = [
+            f"Speed: {speed:.2f} km/h",
+            f"Autopilot: {'ON' if self.autopilot else 'OFF'}",
+            f"Recording Images: {'ON' if self.recording_images else 'OFF'}",
+            f"Recording Sim: {'ON' if self.recording_simulation else 'OFF'}",
+            f"Replay Start: {self.replay_start}s",
+            f"Weather: {type(self.weather_presets[self.current_weather_index]).__name__}",
+            f"Map Layer: {self.current_layer.name if hasattr(self.current_layer, 'name') else str(self.current_layer)}",
+            f"Map: {self.world.get_map().name}",
+            f"Nav Mode: {self.current_nav_mode}"
+        ]
+        
+        # Render HUD text
+        y_offset = 10
+        for text in hud_text:
+            text_surface = self.font.render(text, True, (255, 255, 255))
+            display.blit(text_surface, (10, y_offset))
+            y_offset += 25
+
+    def render_help(self, display):
+        help_text = [
+            "Controls:",
+            "W/S: Throttle/Brake",
+            "A/D: Steer Left/Right",
+            "Q: Toggle Reverse",
+            "Space: Hand Brake",
+            "P: Toggle Autopilot",
+            "Ctrl+W: Constant Velocity Mode",
+            "C: Next Weather (Shift+C: Prev)",
+            "V: Next Map Layer (Shift+V: Prev)",
+            "B: Load Layer (Shift+B: Unload)",
+            "R: Toggle Image Recording",
+            "Ctrl+R: Toggle Simulation Recording",
+            "Ctrl+P: Start Replay",
+            "Ctrl++/-: Adjust Replay Time",
+            "F1: Toggle HUD",
+            "H: Toggle Help",
+            "3: Switch to Town03",
+            "0: Switch to Town10",
+            "1-6: Navigation Modes",
+            "ESC: Quit",
+            "",
+            "Navigation Modes:",
+            "1: Lane Keeping",
+            "2: Turning Left",
+            "3: Turning Right",
+            "4: Stopping",
+            "5: Changing Lanes",
+            "6: Reversing"
+        ]
+        
+        # Create a semi-transparent background
+        s = pygame.Surface((500, 500))
+        s.set_alpha(200)
+        s.fill((0, 0, 0))
+        display.blit(s, (50, 50))
+        
+        # Render help text
+        y_offset = 60
+        for text in help_text:
+            text_surface = self.font.render(text, True, (255, 255, 255))
+            display.blit(text_surface, (60, y_offset))
+            y_offset += 30
 
 class DisplayManager:
     def __init__(self, grid_size):
-        pygame.init()
         self.display = pygame.display.set_mode((grid_size[0]*320, grid_size[1]*240))
-        pygame.display.set_caption("CARLA Multi-Sensor View")
+        pygame.display.set_caption("Sensor Data")
         self.grid_size = grid_size
         self.sensors = []
 
@@ -180,417 +351,353 @@ class DisplayManager:
         for sensor, position in self.sensors:
             if sensor.surface is not None:
                 self.display.blit(sensor.surface, (position[0]*320, position[1]*240))
-        pygame.display.flip()
+        return self.display
 
 class SensorManager:
-    def __init__(self, world, display_manager, sensor_type, transform, attached_vehicle, camera_position="front", attributes=None, display_pos=(0,0)):
-        self.destroyed = False
-        self.world = world
-        self.display_manager = display_manager
-        self.sensor_type = sensor_type.lower()
-        self.camera_position = camera_position
-        self.save_images = False
-        self.frame_count = 0
-        self.display_pos = display_pos
-        self.surface = None
-        self.data = None
-        self.combined_surface = None
-        
-        self.initialize_sensor(transform, attached_vehicle, attributes)
-        
-        if display_pos is not None:
-            display_manager.attach_sensor(self, display_pos)
+    def __init__(self, world, display_manager, sensor_type, transform, attached_vehicle, attributes=None, display_pos=(0,0), camera_name='front'):
+        blueprint_library = world.get_blueprint_library()
+        self.sensor_type = sensor_type
+        self.camera_name = camera_name  # Store camera name for saving images
 
-    def initialize_sensor(self, transform, attached_vehicle, attributes):
-        blueprint_library = self.world.get_blueprint_library()
-        
-        if self.sensor_type == 'rgb':
+        if sensor_type == 'RGB':
             bp = blueprint_library.find('sensor.camera.rgb')
-        elif self.sensor_type == 'depth':
-            bp = blueprint_library.find('sensor.camera.depth')
-        elif self.sensor_type == 'semantic':
-            bp = blueprint_library.find('sensor.camera.semantic_segmentation')
-        elif self.sensor_type == 'lidar':
-            bp = blueprint_library.find('sensor.lidar.ray_cast')
-        elif self.sensor_type == 'imu':
-            bp = blueprint_library.find('sensor.other.imu')
-        elif self.sensor_type == 'gnss':
-            bp = blueprint_library.find('sensor.other.gnss')
-        else:
-            raise ValueError(f"Unknown sensor type: {self.sensor_type}")
-
-        if self.sensor_type in ['rgb', 'depth', 'semantic']:
             bp.set_attribute('image_size_x', '320')
             bp.set_attribute('image_size_y', '240')
             bp.set_attribute('fov', '90')
-
-        if self.sensor_type == 'lidar':
+            # ROS Publisher for camera
+            self.ros_publisher = rospy.Publisher(f'/carla/{camera_name}/image_raw', Image, queue_size=10)
+        elif sensor_type == 'LIDAR':
+            bp = blueprint_library.find('sensor.lidar.ray_cast')
             bp.set_attribute('range', '50')
             bp.set_attribute('rotation_frequency', '10')
             bp.set_attribute('channels', '64')
             bp.set_attribute('points_per_second', '56000')
+        elif sensor_type == 'IMU':
+            bp = blueprint_library.find('sensor.other.imu')
+            # ROS Publisher for IMU
+            self.ros_publisher = rospy.Publisher('/carla/imu', Imu, queue_size=10)
+        elif sensor_type == 'GNSS':
+            bp = blueprint_library.find('sensor.other.gnss')
+            bp.set_attribute('noise_alt_stddev', '0.0')
+            bp.set_attribute('noise_lat_stddev', '0.0')
+            bp.set_attribute('noise_lon_stddev', '0.0')
+            # ROS Publisher for GNSS
+            self.ros_publisher = rospy.Publisher('/carla/gnss', NavSatFix, queue_size=10)
+        else:
+            raise ValueError(f"Unknown sensor type: {sensor_type}")
 
         if attributes:
             for attr_name, attr_value in attributes.items():
-                bp.set_attribute(attr_name, str(attr_value))
+                bp.set_attribute(attr_name, attr_value)
 
-        self.sensor = self.world.spawn_actor(bp, transform, attach_to=attached_vehicle)
-        
-        if self.sensor_type in ['rgb', 'depth', 'semantic']:
-            self.sensor.listen(self._parse_image)
-            self.detected_objects = []
-            self.lane_offset = 0.0
-            self.traffic_light_state = "UNKNOWN"
-        elif self.sensor_type == 'lidar':
-            self.sensor.listen(self._parse_lidar)
-            self.obstacle_stats = {
-                'front_min': 0, 'front_avg': 0,
-                'left_min': 0, 'left_avg': 0,
-                'right_min': 0, 'right_avg': 0,
-                'rear_min': 0, 'rear_avg': 0,
-                'point_density': 0
-            }
-        else:
-            self.sensor.listen(self._parse_other)
+        self.sensor = world.spawn_actor(bp, transform, attach_to=attached_vehicle)
+        self.surface = None
+        self.data = None
+        self.attached_vehicle = attached_vehicle
 
-    def _parse_image(self, image):
-        if self.destroyed: return
-        try:
-            array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4))
+        self.sensor.listen(lambda data: self._parse_image(data))
+        display_manager.attach_sensor(self, display_pos)
+
+    def _parse_image(self, data):
+        if self.sensor_type == 'RGB':
+            array = np.frombuffer(data.raw_data, dtype=np.dtype("uint8"))
+            array = np.reshape(array, (data.height, data.width, 4))
             array = array[:, :, :3]
+            array = array[:, :, ::-1]
+            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+            self.data = array
             
-            if self.save_images:
-                self.save_image_data(image, array)
+            # Publish to ROS
+            ros_image = bridge.cv2_to_imgmsg(array, encoding="bgr8")
+            ros_image.header.stamp = rospy.Time.now()
+            ros_image.header.frame_id = f"{self.camera_name}_camera"
+            self.ros_publisher.publish(ros_image)
             
-            self.process_image_for_display(array)
-            self.generate_detection_data()
+        elif self.sensor_type == 'IMU':
+            self.data = data
+            # Create and publish ROS IMU message
+            imu_msg = Imu()
+            imu_msg.header.stamp = rospy.Time.now()
+            imu_msg.header.frame_id = "imu_link"
             
-        except Exception as e:
-            print(f"Image processing error: {e}")
-
-    def save_image_data(self, image, array):
-        try:
-            filename = f"data/{manual_control.session_id}/images/{self.sensor_type}/{self.camera_position}/{image.frame:08d}.png"
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            # Convert from CARLA to ROS coordinate system
+            imu_msg.linear_acceleration.x = data.accelerometer.x
+            imu_msg.linear_acceleration.y = -data.accelerometer.y
+            imu_msg.linear_acceleration.z = data.accelerometer.z
             
-            if self.sensor_type == 'depth':
-                save_array = (array[:,:,0] / 256).astype(np.uint8)
-            elif self.sensor_type == 'semantic':
-                save_array = array[:,:,2]
-            else:
-                save_array = array[:, :, ::-1]
+            imu_msg.angular_velocity.x = data.gyroscope.x
+            imu_msg.angular_velocity.y = -data.gyroscope.y
+            imu_msg.angular_velocity.z = data.gyroscope.z
+            
+            self.ros_publisher.publish(imu_msg)
+            
+        elif self.sensor_type == 'GNSS':
+            self.data = data
+            # Create and publish ROS NavSatFix message
+            gnss_msg = NavSatFix()
+            gnss_msg.header.stamp = rospy.Time.now()
+            gnss_msg.header.frame_id = "gps"
+            gnss_msg.latitude = data.latitude
+            gnss_msg.longitude = data.longitude
+            gnss_msg.altitude = data.altitude
+            self.ros_publisher.publish(gnss_msg)
 
-            pygame_surface = pygame.surfarray.make_surface(save_array.swapaxes(0,1))
-            pygame.image.save(pygame_surface, filename)
-            self.frame_count += 1
-        except Exception as e:
-            print(f"Image save error: {e}")
-
-    def process_image_for_display(self, array):
-        display_array = array[:, :, ::-1] if self.sensor_type == 'rgb' else array
-        self.surface = pygame.surfarray.make_surface(display_array.swapaxes(0,1))
-        self.data = array
-
-    def generate_detection_data(self):
-        self.detected_objects = []
-        if random.random() > 0.7:
-            self.detected_objects = [{
-                'type': random.choice(['vehicle', 'pedestrian', 'bicycle']),
-                'x': random.uniform(-10, 10),
-                'y': random.uniform(2, 50),
-                'width': random.uniform(1, 3),
-                'height': random.uniform(1, 3)
-            } for _ in range(random.randint(0, 3))]
+# ROS Publisher for vehicle state
+class VehicleStatePublisher:
+    def __init__(self, vehicle):
+        self.vehicle = vehicle
+        self.odom_pub = rospy.Publisher('/carla/odometry', Odometry, queue_size=10)
+        self.speed_pub = rospy.Publisher('/carla/speed', Float32, queue_size=10)
         
-        self.lane_offset = random.uniform(-0.5, 0.5)
-        self.traffic_light_state = random.choice(["RED", "GREEN", "YELLOW", "UNKNOWN"])
+    def publish(self):
+        # Get vehicle state
+        transform = self.vehicle.get_transform()
+        velocity = self.vehicle.get_velocity()
+        angular_velocity = self.vehicle.get_angular_velocity()
+        
+        # Create Odometry message
+        odom_msg = Odometry()
+        odom_msg.header.stamp = rospy.Time.now()
+        odom_msg.header.frame_id = "map"
+        odom_msg.child_frame_id = "base_link"
+        
+        # Position
+        odom_msg.pose.pose.position.x = transform.location.x
+        odom_msg.pose.pose.position.y = -transform.location.y  # Convert to ROS right-handed
+        odom_msg.pose.pose.position.z = transform.location.z
+        
+        # Orientation - convert from Euler angles to quaternion
+        roll = math.radians(transform.rotation.roll)
+        pitch = math.radians(transform.rotation.pitch)
+        yaw = math.radians(-transform.rotation.yaw)  # Convert to ROS right-handed
+        
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+        cp = math.cos(pitch * 0.5)
+        sp = math.sin(pitch * 0.5)
+        cr = math.cos(roll * 0.5)
+        sr = math.sin(roll * 0.5)
+        
+        odom_msg.pose.pose.orientation.w = cy * cp * cr + sy * sp * sr
+        odom_msg.pose.pose.orientation.x = cy * cp * sr - sy * sp * cr
+        odom_msg.pose.pose.orientation.y = sy * cp * sr + cy * sp * cr
+        odom_msg.pose.pose.orientation.z = sy * cp * cr - cy * sp * sr
+        
+        # Velocity
+        odom_msg.twist.twist.linear.x = velocity.x
+        odom_msg.twist.twist.linear.y = -velocity.y  # Convert to ROS right-handed
+        odom_msg.twist.twist.linear.z = velocity.z
+        
+        odom_msg.twist.twist.angular.x = angular_velocity.x
+        odom_msg.twist.twist.angular.y = -angular_velocity.y  # Convert to ROS right-handed
+        odom_msg.twist.twist.angular.z = angular_velocity.z
+        
+        self.odom_pub.publish(odom_msg)
+        
+        # Publish speed separately
+        speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
+        self.speed_pub.publish(speed)
 
-    def _parse_lidar(self, lidar_data):
-        if self.destroyed: return
-        try:
-            points = np.frombuffer(lidar_data.raw_data, dtype=np.dtype('f4'))
-            points = np.reshape(points, (int(points.shape[0]/4), 4))
+# Main execution
+def main():
+    # Create data directories if they don't exist
+    data_dir = 'data'
+    image_dir = os.path.join(data_dir, 'images')
+    log_dir = os.path.join(data_dir, 'logs')
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Create subdirectories for each camera view
+    camera_dirs = {
+        'front': os.path.join(image_dir, 'front'),
+        'back': os.path.join(image_dir, 'back'),
+        'left': os.path.join(image_dir, 'left'),
+        'right': os.path.join(image_dir, 'right')
+    }
+
+    for dir_path in camera_dirs.values():
+        os.makedirs(dir_path, exist_ok=True)
+
+    try:
+        # Connect to CARLA and load Town03
+        client = carla.Client('localhost', 2000)
+        client.set_timeout(20.0)
+        client.load_world('Town03')
+        world = client.get_world()
+
+        # Set synchronous mode
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05
+        world.apply_settings(settings)
+
+        blueprint_library = world.get_blueprint_library()
+        vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
+        spawn_point = random.choice(world.get_map().get_spawn_points())
+        vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+
+        # Create display manager with a 2x2 grid for the 4 cameras
+        display_manager = DisplayManager(grid_size=(2, 2))
+
+        # Manual Control Setup
+        manual_control = ManualControl(vehicle, world, client)
+        
+        # Vehicle state publisher
+        vehicle_publisher = VehicleStatePublisher(vehicle)
+
+        # Sensor Setup - Add 4 RGB cameras for each side
+        # Front camera
+        camera_front = SensorManager(world, display_manager, 'RGB', 
+                                   carla.Transform(carla.Location(x=1.5, z=2.4)), 
+                                   vehicle, display_pos=(0, 0), camera_name='front')
+
+        # Back camera
+        camera_back = SensorManager(world, display_manager, 'RGB', 
+                                  carla.Transform(carla.Location(x=-1.5, z=2.4), carla.Rotation(yaw=180)), 
+                                  vehicle, display_pos=(1, 0), camera_name='back')
+
+        # Left camera
+        camera_left = SensorManager(world, display_manager, 'RGB', 
+                                  carla.Transform(carla.Location(y=-1.5, z=2.4), carla.Rotation(yaw=-90)), 
+                                  vehicle, display_pos=(0, 1), camera_name='left')
+
+        # Right camera
+        camera_right = SensorManager(world, display_manager, 'RGB', 
+                                   carla.Transform(carla.Location(y=1.5, z=2.4), carla.Rotation(yaw=90)), 
+                                   vehicle, display_pos=(1, 1), camera_name='right')
+
+        # Other sensors (positioned at the center of the vehicle)
+        lidar_sensor = SensorManager(world, display_manager, 'LIDAR', carla.Transform(carla.Location(x=0, z=2.5)), vehicle)
+        imu_sensor = SensorManager(world, display_manager, 'IMU', carla.Transform(carla.Location()), vehicle)
+        gnss_sensor = SensorManager(world, display_manager, 'GNSS', carla.Transform(carla.Location()), vehicle)
+
+        # CSV Data Saving
+        csv_path = os.path.join(data_dir, 'sensor_data.csv')
+        csv_file = open(csv_path, mode='w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['timestamp', 'speed_kmph', 'vehicle_x', 'vehicle_y', 'vehicle_z',
+                             'gnss_latitude', 'gnss_longitude', 'gnss_altitude',
+                             'imu_acc_x', 'imu_acc_y', 'imu_acc_z',
+                             'imu_gyro_x', 'imu_gyro_y', 'imu_gyro_z',
+                             'nav_mode'])
+
+        clock = pygame.time.Clock()
+        frame_count = 0
+
+        running = True
+        while running and not rospy.is_shutdown():
+            # Handle pygame events to prevent freezing
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
+                    if not manual_control.handle_key_event(event):
+                        running = False
+
+            # Tick the world
+            world.tick()
             
-            vis_points = np.copy(points[::10])
+            # Publish vehicle state to ROS
+            vehicle_publisher.publish()
             
-            front_points = points[(points[:,1]>-2)&(points[:,1]<2)&(points[:,0]>0)]
-            rear_points = points[(points[:,1]>-2)&(points[:,1]<2)&(points[:,0]<0)]
-            left_points = points[(points[:,1]>2)&(points[:,0]>0)]
-            right_points = points[(points[:,1]<-2)&(points[:,0]>0)]
+            # Render the display
+            display = display_manager.render()
             
-            self.update_obstacle_stats(front_points, rear_points, left_points, right_points, points)
-            
-            if len(vis_points) > 0:
-                self.create_lidar_visualization(vis_points)
+            # Save RGB images from all cameras if recording is enabled
+            if manual_control.recording_images:
+                # Save front camera image
+                if camera_front.data is not None:
+                    image_path = os.path.join(camera_dirs['front'], f'frame_{frame_count:05d}.png')
+                    pygame.image.save(camera_front.surface, image_path)
                 
-        except Exception as e:
-            print(f"LIDAR error: {e}")
+                # Save back camera image
+                if camera_back.data is not None:
+                    image_path = os.path.join(camera_dirs['back'], f'frame_{frame_count:05d}.png')
+                    pygame.image.save(camera_back.surface, image_path)
+                
+                # Save left camera image
+                if camera_left.data is not None:
+                    image_path = os.path.join(camera_dirs['left'], f'frame_{frame_count:05d}.png')
+                    pygame.image.save(camera_left.surface, image_path)
+                
+                # Save right camera image
+                if camera_right.data is not None:
+                    image_path = os.path.join(camera_dirs['right'], f'frame_{frame_count:05d}.png')
+                    pygame.image.save(camera_right.surface, image_path)
+                
+                frame_count += 1
 
-    def update_obstacle_stats(self, front_points, rear_points, left_points, right_points, all_points):
+            # Render HUD and help
+            manual_control.render_hud(display)
+            if manual_control.show_help:
+                manual_control.render_help(display)
+            pygame.display.flip()
+
+            # Get vehicle speed
+            velocity = vehicle.get_velocity()
+            speed = 3.6 * np.linalg.norm(np.array([velocity.x, velocity.y, velocity.z]))  # m/s to km/h
+
+            # Get vehicle position
+            transform = vehicle.get_transform()
+            location = transform.location
+
+            # GNSS data
+            if gnss_sensor.data:
+                gnss_lat = gnss_sensor.data.latitude
+                gnss_lon = gnss_sensor.data.longitude
+                gnss_alt = gnss_sensor.data.altitude
+            else:
+                gnss_lat = gnss_lon = gnss_alt = None
+
+            # IMU data
+            if imu_sensor.data:
+                imu_acc = imu_sensor.data.accelerometer
+                imu_gyro = imu_sensor.data.gyroscope
+            else:
+                imu_acc = imu_gyro = None
+
+            # Write to CSV
+            csv_writer.writerow([
+                time.time(),
+                speed,
+                location.x, location.y, location.z,
+                gnss_lat, gnss_lon, gnss_alt,
+                imu_acc.x if imu_acc else None,
+                imu_acc.y if imu_acc else None,
+                imu_acc.z if imu_acc else None,
+                imu_gyro.x if imu_gyro else None,
+                imu_gyro.y if imu_gyro else None,
+                imu_gyro.z if imu_gyro else None,
+                manual_control.current_nav_mode
+            ])
+
+            clock.tick(30)
+
+    except KeyboardInterrupt:
+        print('Simulation interrupted by user.')
+    except Exception as e:
+        print(f'Error occurred: {e}')
+    finally:
         try:
-            self.obstacle_stats = {
-                'front_min': np.min(front_points[:,0]) if len(front_points)>0 else 999,
-                'front_avg': np.mean(front_points[:,0]) if len(front_points)>0 else 999,
-                'rear_min': np.min(rear_points[:,0]) if len(rear_points)>0 else 999,
-                'rear_avg': np.mean(rear_points[:,0]) if len(rear_points)>0 else 999,
-                'left_min': np.min(left_points[:,0]) if len(left_points)>0 else 999,
-                'left_avg': np.mean(left_points[:,0]) if len(left_points)>0 else 999,
-                'right_min': np.min(right_points[:,0]) if len(right_points)>0 else 999,
-                'right_avg': np.mean(right_points[:,0]) if len(right_points)>0 else 999,
-                'point_density': len(all_points)/1000
-            }
+            csv_file.close()
+            print(f"Data saved to: {csv_path}")
+            
+            # Destroy actors
+            print("Destroying actors...")
+            vehicle.destroy()
+            for sensor in world.get_actors().filter('*sensor*'):
+                sensor.destroy()
+            
+            # Reset world settings
+            settings = world.get_settings()
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            world.apply_settings(settings)
         except:
-            self.obstacle_stats = dict.fromkeys(self.obstacle_stats.keys(), 0)
-
-    def create_lidar_visualization(self, points):
-        lidar_image = np.zeros((240,320,3), dtype=np.uint8)
+            pass
         
-        points[:,0] = (points[:,0]/50*320).clip(0,319)
-        points[:,1] = (points[:,1]/20*120+120).clip(0,239)
-        
-        for x,y,z,i in points:
-            color = (255,255,255)
-            if y < 100: color = (255,0,0)
-            elif y > 140: color = (0,0,255)
-            elif x < 100: color = (0,255,0)
-            x,y = int(x),int(y)
-            if 0<=x<320 and 0<=y<240:
-                lidar_image[y,x] = color
-        
-        self.surface = pygame.surfarray.make_surface(lidar_image)
+        pygame.quit()
+        print("Simulation ended.")
 
-    def _parse_other(self, data):
-        if self.destroyed: return
-        self.data = data
-
-    def destroy(self):
-        if not self.destroyed:
-            self.sensor.destroy()
-            self.destroyed = True
-
-class ROSPublisher:
-    def __init__(self):
-        rospy.init_node('carla_data_publisher', anonymous=True)
-        self.lock = threading.Lock()
-        self.vehicle_data_pub = rospy.Publisher('/carla/vehicle_data', Float32MultiArray, queue_size=10)
-        self.sensor_data_pub = rospy.Publisher('/carla/sensor_data', Float32MultiArray, queue_size=10)
-        self.status_pub = rospy.Publisher('/carla/status', String, queue_size=10)
-        
-    def publish_vehicle_data(self, vehicle_data):
-        with self.lock:
-            msg = Float32MultiArray()
-            msg.data = vehicle_data
-            self.vehicle_data_pub.publish(msg)
-        
-    def publish_sensor_data(self, sensor_data):
-        with self.lock:
-            msg = Float32MultiArray()
-            msg.data = sensor_data
-            self.sensor_data_pub.publish(msg)
-        
-    def publish_status(self, status):
-        with self.lock:
-            self.status_pub.publish(String(status))
-
-def system_health_check(vehicle):
-    try:
-        if vehicle.get_velocity().length() > 50:
-            control = vehicle.get_control()
-            control.throttle = 0.0
-            vehicle.apply_control(control)
-            print("Speed limit exceeded! Engaging speed limiter")
-            return False
-        return True
-    except:
-        return False
-
-try:
-    ros_publisher = ROSPublisher()
-    ros_publisher.publish_status("CARLA simulation starting...")
-
-    client = carla.Client('192.168.1.19', 2000)
-    client.set_timeout(20.0)
-    world = client.get_world()
-    
-    # Traffic Manager Setup
-    traffic_manager = client.get_trafficmanager(8000 + random.randint(0, 100))
-    traffic_manager.set_synchronous_mode(True)
-    traffic_manager.set_global_distance_to_leading_vehicle(3.0)
-    traffic_manager.global_percentage_speed_difference(30.0)
-    traffic_manager.set_random_device_seed(0)
-    traffic_manager.set_hybrid_physics_mode(True)
-
-    # Vehicle Setup
-    blueprint_library = world.get_blueprint_library()
-    vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
-    map = world.get_map()
-    valid_spawn_points = [sp for sp in map.get_spawn_points() 
-                        if map.get_waypoint(sp.location).is_junction == False]
-    spawn_point = random.choice(valid_spawn_points)
-    vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-
-    # Configure TM Route
-    destination = random.choice(valid_spawn_points).location
-    traffic_manager.set_path(vehicle, [destination])
-    traffic_manager.auto_lane_change(vehicle, False)
-    traffic_manager.distance_to_leading_vehicle(vehicle, 5)
-    traffic_manager.ignore_lights_percentage(vehicle, 0)
-    traffic_manager.ignore_signs_percentage(vehicle, 0)
-
-    manual_control = ManualControl(vehicle, traffic_manager)
-    display_manager = DisplayManager(grid_size=(2, 1))
-
-    # Create Sensors
-    collision_sensor = CollisionSensor(vehicle)
-    lane_invasion_sensor = LaneInvasionSensor(vehicle)
-    
-    cameras = []
-    for side, transform in [
-        ('front', carla.Transform(carla.Location(x=1.5, z=2.4))),
-        ('rear', carla.Transform(carla.Location(x=-1.5, z=2.4), carla.Rotation(yaw=180))),
-        ('left', carla.Transform(carla.Location(y=-1.0, z=2.4), carla.Rotation(yaw=-90))),
-        ('right', carla.Transform(carla.Location(y=1.0, z=2.4), carla.Rotation(yaw=90)))
-    ]:
-        for cam_type in ['rgb', 'depth', 'semantic']:
-            try:
-                display_pos = (0, 0) if side == 'front' and cam_type == 'rgb' else None
-                cam = SensorManager(world, display_manager, cam_type, transform, vehicle, side, display_pos=display_pos)
-                cameras.append(cam)
-            except Exception as e:
-                print(f"Sensor error: {e}")
-
-    lidar_sensor = SensorManager(world, display_manager, 'lidar',
-                               carla.Transform(carla.Location(z=2.5)),
-                               vehicle, display_pos=(1, 0))
-
-    imu_sensor = SensorManager(world, display_manager, 'imu',
-                             carla.Transform(carla.Location()),
-                             vehicle, display_pos=None)
-
-    gnss_sensor = SensorManager(world, display_manager, 'gnss',
-                              carla.Transform(carla.Location()),
-                              vehicle, display_pos=None)
-
-    # Data Logging Setup
-    csv_path = f"data/{manual_control.session_id}/sensor_data.csv"
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    csv_file = open(csv_path, mode='w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        'timestamp', 'frame', 'speed_kmph', 'vehicle_x', 'vehicle_y', 'vehicle_z',
-        'throttle', 'brake', 'steer', 'reverse', 'hand_brake', 'gear',
-        'autopilot', 'manual_transmission', 'constant_velocity',
-        'driver_present', 'eye_gaze_x', 'eye_gaze_y', 'head_pitch', 'head_yaw', 'head_roll',
-        'front_objects', 'rear_objects', 'left_objects', 'right_objects',
-        'lane_offset', 'traffic_light_state',
-        'lidar_front_min', 'lidar_front_avg', 'lidar_left_min', 'lidar_left_avg',
-        'lidar_right_min', 'lidar_right_avg', 'lidar_rear_min', 'lidar_rear_avg', 'lidar_point_density',
-        'gnss_lat', 'gnss_lon', 'gnss_alt',
-        'imu_acc_x', 'imu_acc_y', 'imu_acc_z', 'imu_gyro_x', 'imu_gyro_y', 'imu_gyro_z'
-    ])
-
-    clock = pygame.time.Clock()
-    running = True
-
-    while running and not rospy.is_shutdown():
-        if not system_health_check(vehicle):
-            ros_publisher.publish_status("System health check failed!")
-            break
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_r:
-                    manual_control.save_images = not manual_control.save_images
-                    for cam in cameras:
-                        cam.save_images = manual_control.save_images
-                    print(f"Image saving {'ON' if manual_control.save_images else 'OFF'}")
-                manual_control.handle_key_press(event.key, event.mod)
-
-        world.tick()
-        display_manager.render()
-
-        # Data Collection
-        velocity = vehicle.get_velocity()
-        speed = 3.6 * np.linalg.norm([velocity.x, velocity.y, velocity.z])
-        transform = vehicle.get_transform()
-        control = vehicle.get_control()
-        frame = world.get_snapshot().frame
-
-        # Prepare Data
-        current_time = time.time()
-        vehicle_data = [
-            current_time, frame, speed,
-            transform.location.x, transform.location.y, transform.location.z,
-            control.throttle, control.brake, control.steer,
-            float(control.reverse), float(control.hand_brake), control.gear,
-            float(manual_control.autopilot), float(manual_control.manual_transmission), 
-            float(manual_control.constant_velocity_mode),
-            float(manual_control.driver_presence), manual_control.eye_gaze[0], manual_control.eye_gaze[1],
-            manual_control.head_pose[0], manual_control.head_pose[1], manual_control.head_pose[2]
-        ]
-        
-        front_cam = [c for c in cameras if c.camera_position=='front' and c.sensor_type=='rgb'][0]
-        sensor_data = [
-            len(front_cam.detected_objects),
-            len([c for c in cameras if c.camera_position=='rear' and c.sensor_type=='rgb'][0].detected_objects),
-            len([c for c in cameras if c.camera_position=='left' and c.sensor_type=='rgb'][0].detected_objects),
-            len([c for c in cameras if c.camera_position=='right' and c.sensor_type=='rgb'][0].detected_objects),
-            front_cam.lane_offset,
-            0 if front_cam.traffic_light_state == "RED" else 
-            1 if front_cam.traffic_light_state == "GREEN" else 
-            2 if front_cam.traffic_light_state == "YELLOW" else 3,
-            lidar_sensor.obstacle_stats['front_min'], lidar_sensor.obstacle_stats['front_avg'],
-            lidar_sensor.obstacle_stats['left_min'], lidar_sensor.obstacle_stats['left_avg'],
-            lidar_sensor.obstacle_stats['right_min'], lidar_sensor.obstacle_stats['right_avg'],
-            lidar_sensor.obstacle_stats['rear_min'], lidar_sensor.obstacle_stats['rear_avg'],
-            lidar_sensor.obstacle_stats['point_density'],
-            gnss_sensor.data.latitude if gnss_sensor.data else 0,
-            gnss_sensor.data.longitude if gnss_sensor.data else 0,
-            gnss_sensor.data.altitude if gnss_sensor.data else 0,
-            imu_sensor.data.accelerometer.x if imu_sensor.data else 0,
-            imu_sensor.data.accelerometer.y if imu_sensor.data else 0,
-            imu_sensor.data.accelerometer.z if imu_sensor.data else 0,
-            imu_sensor.data.gyroscope.x if imu_sensor.data else 0,
-            imu_sensor.data.gyroscope.y if imu_sensor.data else 0,
-            imu_sensor.data.gyroscope.z if imu_sensor.data else 0
-        ]
-
-        # Log Data
-        csv_writer.writerow(vehicle_data + sensor_data)
-        ros_publisher.publish_vehicle_data(vehicle_data)
-        ros_publisher.publish_sensor_data(sensor_data)
-        
-        clock.tick(30)
-
-except Exception as e:
-    ros_publisher.publish_status(f"Critical error: {str(e)}")
-    traceback.print_exc()
-
-finally:
-    print("Cleaning up...")
-    try:
-        time.sleep(1)
-        csv_file.close()
-    except: pass
-    
-    sensor_destruction_order = [
-        'collision_sensor', 'lane_invasion_sensor',
-        'lidar_sensor', 'imu_sensor', 'gnss_sensor'
-    ]
-    
-    for sensor in sensor_destruction_order:
-        if sensor in locals():
-            try: locals()[sensor].destroy()
-            except: pass
-    
-    try: [cam.destroy() for cam in cameras]
-    except: pass
-    
-    try: vehicle.destroy()
-    except: pass
-    
-    pygame.quit()
-    print("Simulation closed")
+if __name__ == '__main__':
+    main()

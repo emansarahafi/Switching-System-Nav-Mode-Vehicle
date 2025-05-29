@@ -7,6 +7,7 @@ import pygame
 import carla
 import csv
 import time
+import threading
 from pygame.locals import *
 
 # Initialize Pygame and font module first
@@ -25,6 +26,15 @@ class ManualControl:
         self.replay_start = 0
         self.show_hud = True
         self.show_help = False
+        self.collision_count = 0
+        self.lane_invasion_count = 0
+        self.control_state = {
+            'throttle': 0.0,
+            'brake': 0.0,
+            'steer': 0.0,
+            'reverse': False,
+            'hand_brake': False
+        }
         
         # Weather presets
         self.weather_presets = [
@@ -91,17 +101,19 @@ class ManualControl:
         if event.type == pygame.KEYDOWN:
             # Basic vehicle controls
             if event.key == pygame.K_w:
-                self.vehicle.apply_control(carla.VehicleControl(throttle=1.0))
+                self.control_state['throttle'] = 1.0
+                self.control_state['brake'] = 0.0
             elif event.key == pygame.K_s:
-                self.vehicle.apply_control(carla.VehicleControl(brake=1.0))
+                self.control_state['brake'] = 1.0
+                self.control_state['throttle'] = 0.0
             elif event.key == pygame.K_a:
-                self.vehicle.apply_control(carla.VehicleControl(steer=-1.0))
+                self.control_state['steer'] = -0.7  # Reduced steering for better control
             elif event.key == pygame.K_d:
-                self.vehicle.apply_control(carla.VehicleControl(steer=1.0))
+                self.control_state['steer'] = 0.7   # Reduced steering for better control
             elif event.key == pygame.K_q:
-                self.vehicle.apply_control(carla.VehicleControl(reverse=True))
+                self.control_state['reverse'] = True
             elif event.key == pygame.K_SPACE:
-                self.vehicle.apply_control(carla.VehicleControl(hand_brake=True))
+                self.control_state['hand_brake'] = True
             elif event.key == pygame.K_p:
                 self.toggle_autopilot()
             elif event.key == pygame.K_w and pygame.key.get_mods() & pygame.KMOD_CTRL:
@@ -160,26 +172,64 @@ class ManualControl:
         
         elif event.type == pygame.KEYUP:
             # Reset controls when keys are released
-            if event.key in (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, 
-                            pygame.K_q, pygame.K_SPACE):
-                self.vehicle.apply_control(carla.VehicleControl())
+            if event.key == pygame.K_w:
+                self.control_state['throttle'] = 0.0
+            elif event.key == pygame.K_s:
+                self.control_state['brake'] = 0.0
+            elif event.key == pygame.K_a or event.key == pygame.K_d:
+                self.control_state['steer'] = 0.0
+            elif event.key == pygame.K_q:
+                self.control_state['reverse'] = False
+            elif event.key == pygame.K_SPACE:
+                self.control_state['hand_brake'] = False
+        
+        # Apply controls if not in autopilot
+        if not self.autopilot:
+            self.apply_control()
         
         return True
+
+    def apply_control(self):
+        """Apply current control state to vehicle"""
+        control = carla.VehicleControl(
+            throttle=self.control_state['throttle'],
+            steer=self.control_state['steer'],
+            brake=self.control_state['brake'],
+            hand_brake=self.control_state['hand_brake'],
+            reverse=self.control_state['reverse']
+        )
+        self.vehicle.apply_control(control)
 
     def toggle_autopilot(self):
         self.autopilot = not self.autopilot
         self.vehicle.set_autopilot(self.autopilot)
+        
+        # Reset controls when switching to autopilot
+        if self.autopilot:
+            self.control_state = {
+                'throttle': 0.0,
+                'brake': 0.0,
+                'steer': 0.0,
+                'reverse': False,
+                'hand_brake': False
+            }
+            self.apply_control()
 
     def toggle_constant_velocity_mode(self):
         self.constant_velocity_mode = not self.constant_velocity_mode
         if self.constant_velocity_mode:
-            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=0, brake=0))
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.7, steer=0, brake=0))  # Reduced throttle
         else:
             self.vehicle.apply_control(carla.VehicleControl())
 
     def change_weather(self, direction):
         self.current_weather_index = (self.current_weather_index + direction) % len(self.weather_presets)
-        self.world.set_weather(self.weather_presets[self.current_weather_index])
+        weather = self.weather_presets[self.current_weather_index]
+        
+        # Reduce lighting changes to help autopilot
+        weather.sun_altitude_angle = 70  # Higher sun angle for more consistent lighting
+        weather.sun_azimuth_angle = 0    # Fixed azimuth
+        self.world.set_weather(weather)
 
     def change_map_layer(self, direction):
         self.current_layer_index = (self.current_layer_index + direction) % len(self.map_layers)
@@ -231,7 +281,12 @@ class ManualControl:
             f"Replay Start: {self.replay_start}s",
             f"Weather: {type(self.weather_presets[self.current_weather_index]).__name__}",
             f"Map Layer: {self.current_layer.name if hasattr(self.current_layer, 'name') else str(self.current_layer)}",
-            f"Map: {self.world.get_map().name}"
+            f"Map: {self.world.get_map().name}",
+            f"Collisions: {self.collision_count}",
+            f"Lane Invasions: {self.lane_invasion_count}",
+            f"Steering: {self.control_state['steer']:.2f}",
+            f"Throttle: {self.control_state['throttle']:.2f}",
+            f"Brake: {self.control_state['brake']:.2f}"
         ]
         
         # Render HUD text
@@ -299,6 +354,10 @@ class SensorManager:
         blueprint_library = world.get_blueprint_library()
         self.sensor_type = sensor_type
         self.camera_name = camera_name  # Store camera name for saving images
+        self.collision_events = []
+        self.collision_lock = threading.Lock()
+        self.lane_invasion_events = []
+        self.lane_invasion_lock = threading.Lock()
 
         if sensor_type == 'RGB':
             bp = blueprint_library.find('sensor.camera.rgb')
@@ -318,6 +377,10 @@ class SensorManager:
             bp.set_attribute('noise_alt_stddev', '0.0')
             bp.set_attribute('noise_lat_stddev', '0.0')
             bp.set_attribute('noise_lon_stddev', '0.0')
+        elif sensor_type == 'COLLISION':
+            bp = blueprint_library.find('sensor.other.collision')
+        elif sensor_type == 'LANE_INVASION':
+            bp = blueprint_library.find('sensor.other.lane_invasion')
         else:
             raise ValueError(f"Unknown sensor type: {sensor_type}")
 
@@ -329,8 +392,18 @@ class SensorManager:
         self.surface = None
         self.data = None
 
-        self.sensor.listen(lambda data: self._parse_image(data))
-        display_manager.attach_sensor(self, display_pos)
+        # Set up appropriate callback based on sensor type
+        if sensor_type == 'RGB':
+            self.sensor.listen(lambda data: self._parse_image(data))
+        elif sensor_type in ['LIDAR', 'IMU', 'GNSS']:
+            self.sensor.listen(lambda data: setattr(self, 'data', data))
+        elif sensor_type == 'COLLISION':
+            self.sensor.listen(lambda event: self._parse_collision(event))
+        elif sensor_type == 'LANE_INVASION':
+            self.sensor.listen(lambda event: self._parse_lane_invasion(event))
+
+        if display_manager and display_pos is not None:
+            display_manager.attach_sensor(self, display_pos)
 
     def _parse_image(self, image):
         if self.sensor_type == 'RGB':
@@ -340,8 +413,26 @@ class SensorManager:
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
             self.data = array
-        else:
-            self.data = image
+
+    def _parse_collision(self, event):
+        with self.collision_lock:
+            self.collision_events.append(event)
+
+    def _parse_lane_invasion(self, event):
+        with self.lane_invasion_lock:
+            self.lane_invasion_events.append(event)
+
+    def get_collision_events(self):
+        with self.collision_lock:
+            events = self.collision_events[:]
+            self.collision_events = []
+        return events
+
+    def get_lane_invasion_events(self):
+        with self.lane_invasion_lock:
+            events = self.lane_invasion_events[:]
+            self.lane_invasion_events = []
+        return events
 
 # Main execution
 def main():
@@ -367,8 +458,16 @@ def main():
         # Connect to CARLA and load Town03
         client = carla.Client('localhost', 2000)
         client.set_timeout(20.0)
-        client.load_world('Town03')
         world = client.get_world()
+        
+        # Set default weather to reduce shadow issues
+        weather = carla.WeatherParameters(
+            cloudiness=30,
+            precipitation=0,
+            sun_altitude_angle=70.0,
+            fog_density=0
+        )
+        world.set_weather(weather)
 
         # Set synchronous mode
         settings = world.get_settings()
@@ -378,7 +477,17 @@ def main():
 
         blueprint_library = world.get_blueprint_library()
         vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
-        spawn_point = random.choice(world.get_map().get_spawn_points())
+        
+        # Choose spawn point carefully to avoid autopilot issues
+        spawn_points = world.get_map().get_spawn_points()
+        spawn_point = None
+        for point in spawn_points:
+            if point.location.z > 0.5:  # Ensure it's not underground
+                spawn_point = point
+                break
+        if not spawn_point:
+            spawn_point = random.choice(spawn_points)
+            
         vehicle = world.spawn_actor(vehicle_bp, spawn_point)
 
         # Create display manager with a 2x2 grid for the 4 cameras
@@ -412,6 +521,10 @@ def main():
         lidar_sensor = SensorManager(world, display_manager, 'LIDAR', carla.Transform(carla.Location(x=0, z=2.5)), vehicle)
         imu_sensor = SensorManager(world, display_manager, 'IMU', carla.Transform(carla.Location()), vehicle)
         gnss_sensor = SensorManager(world, display_manager, 'GNSS', carla.Transform(carla.Location()), vehicle)
+        
+        # Collision and lane detection sensors
+        collision_sensor = SensorManager(world, None, 'COLLISION', carla.Transform(carla.Location()), vehicle)
+        lane_invasion_sensor = SensorManager(world, None, 'LANE_INVASION', carla.Transform(carla.Location()), vehicle)
 
         # CSV Data Saving
         csv_path = os.path.join(data_dir, 'sensor_data.csv')
@@ -420,7 +533,20 @@ def main():
         csv_writer.writerow(['timestamp', 'speed_kmph', 'vehicle_x', 'vehicle_y', 'vehicle_z',
                              'gnss_latitude', 'gnss_longitude', 'gnss_altitude',
                              'imu_acc_x', 'imu_acc_y', 'imu_acc_z',
-                             'imu_gyro_x', 'imu_gyro_y', 'imu_gyro_z'])
+                             'imu_gyro_x', 'imu_gyro_y', 'imu_gyro_z',
+                             'collision_count', 'lane_invasion_count'])
+
+        # Collision log file
+        collision_log_path = os.path.join(log_dir, 'collision_log.csv')
+        collision_log_file = open(collision_log_path, 'w', newline='')
+        collision_log_writer = csv.writer(collision_log_file)
+        collision_log_writer.writerow(['timestamp', 'frame', 'intensity', 'other_actor_type', 'other_actor_id'])
+
+        # Lane invasion log file
+        lane_invasion_log_path = os.path.join(log_dir, 'lane_invasion_log.csv')
+        lane_invasion_log_file = open(lane_invasion_log_path, 'w', newline='')
+        lane_invasion_log_writer = csv.writer(lane_invasion_log_file)
+        lane_invasion_log_writer.writerow(['timestamp', 'frame', 'lane_types', 'invasion_count'])
 
         clock = pygame.time.Clock()
         frame_count = 0
@@ -465,6 +591,32 @@ def main():
                 
                 frame_count += 1
 
+            # Process collision events
+            collision_events = collision_sensor.get_collision_events()
+            for event in collision_events:
+                manual_control.collision_count += 1
+                intensity = np.sqrt(event.normal_impulse.x**2 + event.normal_impulse.y**2 + event.normal_impulse.z**2)
+                other_actor = event.other_actor
+                collision_log_writer.writerow([
+                    time.time(),
+                    frame_count,
+                    intensity,
+                    other_actor.type_id if other_actor else "None",
+                    other_actor.id if other_actor else "None"
+                ])
+
+            # Process lane invasion events
+            lane_invasion_events = lane_invasion_sensor.get_lane_invasion_events()
+            for event in lane_invasion_events:
+                manual_control.lane_invasion_count += 1
+                lane_types = [marking.type.name for marking in event.crossed_lane_markings]
+                lane_invasion_log_writer.writerow([
+                    time.time(),
+                    frame_count,
+                    ','.join(lane_types),
+                    len(event.crossed_lane_markings)
+                ])
+
             # Render HUD and help
             manual_control.render_hud(display)
             if manual_control.show_help:
@@ -506,6 +658,8 @@ def main():
                 imu_gyro.x if imu_gyro else None,
                 imu_gyro.y if imu_gyro else None,
                 imu_gyro.z if imu_gyro else None,
+                manual_control.collision_count,
+                manual_control.lane_invasion_count
             ])
 
             clock.tick(30)
@@ -517,7 +671,11 @@ def main():
     finally:
         try:
             csv_file.close()
+            collision_log_file.close()
+            lane_invasion_log_file.close()
             print(f"Data saved to: {csv_path}")
+            print(f"Collision log saved to: {collision_log_path}")
+            print(f"Lane invasion log saved to: {lane_invasion_log_path}")
             
             # Destroy actors
             print("Destroying actors...")
@@ -530,8 +688,8 @@ def main():
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None
             world.apply_settings(settings)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
         
         pygame.quit()
         print("Simulation ended.")
