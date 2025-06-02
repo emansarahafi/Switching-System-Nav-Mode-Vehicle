@@ -11,6 +11,7 @@ import threading
 import socket
 import json
 import base64
+import cv2
 from pygame.locals import *
 
 # Initialize Pygame and font module first
@@ -561,28 +562,52 @@ class UDPSender:
     def send_data(self, data_dict):
         """Send dictionary data as JSON over UDP"""
         try:
-            # Remove large data to prevent oversized packets
-            if 'images' in data_dict:
-                del data_dict['images']
-            if 'imu' in data_dict and 'accel' in data_dict['imu']:
-                del data_dict['imu']['accel']
-                del data_dict['imu']['gyro']
+            # Compress and encode images
+            for camera in ['front', 'back', 'left', 'right']:
+                if f'image_{camera}' in data_dict:
+                    img = data_dict[f'image_{camera}']
+                    # Compress image to JPEG
+                    _, jpeg_img = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    # Convert to base64 string
+                    data_dict[f'image_{camera}'] = base64.b64encode(jpeg_img).decode('utf-8')
+            
+            # Process LIDAR data
+            if 'lidar' in data_dict:
+                # Convert to bytes and base64 encode
+                lidar_bytes = data_dict['lidar'].tobytes()
+                data_dict['lidar'] = base64.b64encode(lidar_bytes).decode('utf-8')
+            
+            # Process IMU data
+            if 'imu' in data_dict:
+                # Convert to bytes and base64 encode
+                imu_data = np.array([
+                    data_dict['imu']['accel_x'],
+                    data_dict['imu']['accel_y'],
+                    data_dict['imu']['accel_z'],
+                    data_dict['imu']['gyro_x'],
+                    data_dict['imu']['gyro_y'],
+                    data_dict['imu']['gyro_z']
+                ], dtype=np.float32)
+                imu_bytes = imu_data.tobytes()
+                data_dict['imu'] = base64.b64encode(imu_bytes).decode('utf-8')
             
             json_data = json.dumps(data_dict)
             
             # Check if data is too large
             if len(json_data) > 60000:
-                # Create minimal version for transmission
-                minimal_data = {
-                    'timestamp': data_dict.get('timestamp', 0),
-                    'frame': data_dict.get('frame', 0),
-                    'speed': data_dict.get('speed', 0),
-                    'position': data_dict.get('position', {'x':0, 'y':0, 'z':0}),
-                    'control': data_dict.get('control', {})
-                }
-                json_data = json.dumps(minimal_data)
-            
-            self.sock.sendto(json_data.encode('utf-8'), (self.ip, self.port))
+                # Split into chunks
+                chunks = [json_data[i:i+60000] for i in range(0, len(json_data), 60000)]
+                frame_id = data_dict.get('frame', -1)  # Use -1 or other default if not found
+                for i, chunk in enumerate(chunks):
+                    packet = {
+                        'frame': frame_id,
+                        'chunk': i,
+                        'total_chunks': len(chunks),
+                        'data': chunk
+                    }
+                    self.sock.sendto(json.dumps(packet).encode('utf-8'), (self.ip, self.port))
+            else:
+                self.sock.sendto(json_data.encode('utf-8'), (self.ip, self.port))
         except Exception as e:
             print(f"UDP send error: {e}")
 
@@ -836,7 +861,7 @@ def main():
 
             # Prepare data for UDP transmission
             current_time = time.time()
-            if current_time - last_udp_send_time >= 0.1:  # Send at 10Hz
+            if current_time - last_udp_send_time >= 0.05:  # Send at 20Hz (increased frequency)
                 data_dict = {
                     'timestamp': current_time,
                     'frame': frame_count,
@@ -856,8 +881,35 @@ def main():
                     'lane_invasions': manual_control.lane_invasion_count
                 }
                 
-                # Add sensor data if available
-                if gnss_sensor.data:
+                # Add camera images
+                if camera_front.data is not None:
+                    data_dict['image_front'] = camera_front.data
+                if camera_back.data is not None:
+                    data_dict['image_back'] = camera_back.data
+                if camera_left.data is not None:
+                    data_dict['image_left'] = camera_left.data
+                if camera_right.data is not None:
+                    data_dict['image_right'] = camera_right.data
+                
+                # Add LIDAR data
+                if lidar_sensor.data is not None:
+                    points = np.frombuffer(lidar_sensor.data.raw_data, dtype=np.dtype('f4'))
+                    points = np.reshape(points, (int(points.shape[0]/4), 4))
+                    data_dict['lidar'] = points
+                
+                # Add IMU data
+                if imu_sensor.data is not None:
+                    data_dict['imu'] = {
+                        'accel_x': float(imu_sensor.data.accelerometer.x),
+                        'accel_y': float(imu_sensor.data.accelerometer.y),
+                        'accel_z': float(imu_sensor.data.accelerometer.z),
+                        'gyro_x': float(imu_sensor.data.gyroscope.x),
+                        'gyro_y': float(imu_sensor.data.gyroscope.y),
+                        'gyro_z': float(imu_sensor.data.gyroscope.z)
+                    }
+                
+                # Add GNSS data
+                if gnss_sensor.data is not None:
                     data_dict['gnss'] = {
                         'lat': float(gnss_sensor.data.latitude),
                         'lon': float(gnss_sensor.data.longitude),
