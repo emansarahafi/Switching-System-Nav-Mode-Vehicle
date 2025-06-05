@@ -1,5 +1,5 @@
 function carla_udp_receiver(port)
-    % Enhanced CARLA UDP receiver with chunked data, base64 decoding, and sensor processing
+    % Enhanced CARLA UDP receiver with full data saving
     if nargin < 1
         port = 10000;
     end
@@ -103,9 +103,14 @@ function carla_udp_receiver(port)
     
     % Create data directories
     data_dir = 'matlab_data';
+    frames_dir = fullfile(data_dir, 'frames');
     if ~exist(data_dir, 'dir')
         mkdir(data_dir);
         log_diag(diag_text, sprintf('Created data directory: %s', data_dir));
+    end
+    if ~exist(frames_dir, 'dir')
+        mkdir(frames_dir);
+        log_diag(diag_text, sprintf('Created frames directory: %s', frames_dir));
     end
     
     % Create CSV log file
@@ -286,6 +291,7 @@ function carla_udp_receiver(port)
                 status_msg = [status_msg sprintf('Bytes received: %d\n', bytes_received)];
                 status_msg = [status_msg sprintf('Messages received: %d\n', messages_received)];
                 status_msg = [status_msg sprintf('Buffered chunks: %d\n', chunkBuffer.Count)];
+                status_msg = [status_msg sprintf('Frames saved: %d\n', messages_received)];
                 
                 if connection_active
                     if toc(last_message_time) > 5
@@ -467,6 +473,17 @@ function processCompleteFrame(frameData, log_fid, diag_text)
             gnss_lat, gnss_lon, gnss_alt);
     end
     
+    % Save ALL raw sensor data to disk
+    try
+        frame_dir = fullfile('matlab_data', 'frames', sprintf('frame_%06d', frame_id));
+        if ~exist(frame_dir, 'dir')
+            mkdir(frame_dir);
+        end
+        saveFrameData(frameData, frame_dir, diag_text);
+    catch ME
+        log_diag(diag_text, sprintf('Frame %d save error: %s', frame_id, ME.message));
+    end
+    
     % Print detailed update every 2 seconds
     if toc(last_print) > 2.0
         % List all available fields for debugging
@@ -514,6 +531,78 @@ function processCompleteFrame(frameData, log_fid, diag_text)
         catch ME
             log_diag(diag_text, sprintf('Data print error: %s', ME.message));
         end
+    end
+end
+
+function saveFrameData(frameData, frame_dir, diag_text)
+    % Save all sensor data for a single frame
+    try
+        % Save camera images
+        cameras = {'front', 'back', 'left', 'right'};
+        for i = 1:numel(cameras)
+            field = ['image_' cameras{i}];
+            if isfield(frameData, field)
+                img_bytes = base64decode(frameData.(field));
+                img_path = fullfile(frame_dir, [field '.jpg']);
+                fid = fopen(img_path, 'wb');
+                if fid ~= -1
+                    fwrite(fid, img_bytes, 'uint8');
+                    fclose(fid);
+                else
+                    log_diag(diag_text, sprintf('Failed to write image: %s', img_path));
+                end
+            end
+        end
+        
+        % Save LIDAR data
+        if isfield(frameData, 'lidar')
+            lidar_bytes = base64decode(frameData.lidar);
+            lidar_path = fullfile(frame_dir, 'lidar.bin');
+            fid = fopen(lidar_path, 'wb');
+            if fid ~= -1
+                fwrite(fid, lidar_bytes, 'uint8');
+                fclose(fid);
+            else
+                log_diag(diag_text, sprintf('Failed to write LIDAR: %s', lidar_path));
+            end
+        end
+        
+        % Save IMU data
+        if isfield(frameData, 'imu')
+            imu_bytes = base64decode(frameData.imu);
+            imu_path = fullfile(frame_dir, 'imu.bin');
+            fid = fopen(imu_path, 'wb');
+            if fid ~= -1
+                fwrite(fid, imu_bytes, 'uint8');
+                fclose(fid);
+            else
+                log_diag(diag_text, sprintf('Failed to write IMU: %s', imu_path));
+            end
+        end
+        
+        % Save metadata (excluding large sensor fields)
+        meta = frameData;
+        large_fields = [...
+            arrayfun(@(c) ['image_' c], cameras, 'UniformOutput', false), ...
+            {'lidar', 'imu'}];
+        for i = 1:length(large_fields)
+            if isfield(meta, large_fields{i})
+                meta = rmfield(meta, large_fields{i});
+            end
+        end
+        
+        json_str = jsonencode(meta);
+        json_path = fullfile(frame_dir, 'frame.json');
+        fid = fopen(json_path, 'w');
+        if fid ~= -1
+            fprintf(fid, '%s', json_str);
+            fclose(fid);
+        else
+            log_diag(diag_text, sprintf('Failed to write metadata: %s', json_path));
+        end
+        
+    catch ME
+        log_diag(diag_text, sprintf('Frame save error: %s', ME.message));
     end
 end
 
