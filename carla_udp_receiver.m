@@ -1,5 +1,5 @@
 function carla_udp_receiver(port)
-    % Enhanced CARLA UDP receiver with full data saving
+    % Enhanced CARLA UDP receiver with Sensor Processing Block
     if nargin < 1
         port = 10000;
     end
@@ -121,6 +121,10 @@ function carla_udp_receiver(port)
     else
         fprintf(log_fid, 'timestamp,frame,speed,x,y,z,yaw,pitch,roll,throttle,steer,brake,gnss_lat,gnss_lon,gnss_alt\n');
     end
+    
+    % Initialize Kalman Filter state
+    ekf_state = zeros(6,1); % [x; y; z; vx; vy; vz]
+    ekf_covariance = eye(6)*10;
     
     % Main processing loop
     try
@@ -285,6 +289,27 @@ function carla_udp_receiver(port)
                 end
             end
             
+            % ==================== SENSOR PROCESSING BLOCK ====================
+            if ~isempty(frame_data)
+                [fused_data, health_status, attention, env_cond, ekf_state, ekf_covariance] = ...
+                    sensorProcessingBlock(frame_data, ekf_state, ekf_covariance, diag_text);
+                
+                % Store processed outputs in frame_data
+                frame_data.fused = fused_data;
+                frame_data.health = health_status;
+                frame_data.driver_attention = attention;
+                frame_data.environment = env_cond;
+                
+                % Log sensor health status
+                health_msg = 'Sensor Health: ';
+                sensor_names = fieldnames(health_status);
+                for i = 1:length(sensor_names)
+                    health_msg = [health_msg sprintf('%s: %s, ', sensor_names{i}, health_status.(sensor_names{i}))];
+                end
+                log_diag(diag_text, health_msg(1:end-2));
+            end
+            % ================================================================
+            
             % Update diagnostics panel
             if toc(last_diag_update) > 1.0
                 status_msg = sprintf('PORT STATUS: %d\n', port);
@@ -317,6 +342,19 @@ function carla_udp_receiver(port)
                         frame_id = frame_data.frameId;
                     end
                     status_msg = [status_msg sprintf('Last frame: %d\n', frame_id)];
+                end
+
+                % Inside the diagnostic panel update section (where status_msg is built)
+                if isfield(frame_data, 'environment')
+                    status_msg = [status_msg sprintf('Environment:\n')];
+                    status_msg = [status_msg sprintf('  Map: %s\n', frame_data.environment.map)];
+                    status_msg = [status_msg sprintf('  Weather: %s\n', frame_data.environment.weather)];
+                    status_msg = [status_msg sprintf('  Layer: %s\n', frame_data.environment.layer)];
+                end
+                
+                % Display attention level if available
+                if isfield(frame_data, 'driver_attention')
+                    status_msg = [status_msg sprintf('Driver Attention: %.2f\n', frame_data.driver_attention)];
                 end
                 
                 set(diag_text, 'String', status_msg);
@@ -392,6 +430,364 @@ function carla_udp_receiver(port)
     log_diag(diag_text, 'Receiver shutdown complete');
 end
 
+%% ==================== SENSOR PROCESSING BLOCK ====================
+function [fused, health, attention, env_cond, new_state, new_cov] = ...
+         sensorProcessingBlock(frame, state, cov, diag_text)
+    
+    % Initialize with CARLA environment data if available
+    env_cond = struct('map', '', 'weather', '', 'layer', '', 'lighting', 'day');
+    if isfield(frame, 'environment')
+        env_cond.map = frame.environment.map;
+        env_cond.weather = frame.environment.weather;
+        env_cond.layer = frame.environment.layer;
+    end
+
+    % Use front camera for lighting and fallback weather
+    if isfield(frame, 'image_front') && ~isempty(frame.image_front)
+        img_env = detect_environment(frame.image_front);
+        env_cond.lighting = img_env.lighting;
+        
+        % Fallback for weather if not provided by CARLA
+        if ~isfield(frame, 'environment') || isempty(env_cond.weather)
+            env_cond.weather = img_env.weather;
+        end
+    end
+    
+    % Initialize outputs
+    fused = struct();
+    health = struct();
+    attention = 1.0; % Default: fully attentive
+    env_cond = struct('lighting', 'day', 'weather', 'clear');
+    
+    % 1. Sensor health monitoring with field mapping
+    sensor_map = {
+        'lidar',        'lidar';
+        'imu',          'imu';
+        'gnss',         'gnss';
+        'camera_front', 'image_front';
+        'camera_rear',  'image_back';
+        'camera_left',  'image_left';
+        'camera_right', 'image_right'
+    };
+    
+    for i = 1:size(sensor_map, 1)
+        display_name = sensor_map{i,1};
+        field_name = sensor_map{i,2};
+        
+        if isfield(frame, field_name)
+            health.(display_name) = monitor_sensor_health(frame.(field_name), display_name);
+        else
+            health.(display_name) = 'missing';
+        end
+    end
+    
+    % 2. Data synchronization and timestamping
+    synced_data = synchronize_sensor_data(frame);
+    
+    % 3. Noise reduction
+    filtered = apply_noise_reduction(synced_data);
+    
+    % 4. Sensor fusion with Kalman Filter
+    [fused, new_state, new_cov] = kalman_sensor_fusion(filtered, state, cov);
+    
+    % 5. Environmental conditions detection (use front camera)
+    if isfield(frame, 'image_front') && ~isempty(frame.image_front)
+        env_cond = detect_environment(frame.image_front);
+    end
+    
+    % 6. Driver attention estimation (if available)
+    if isfield(frame, 'camera_interior') && ~isempty(frame.camera_interior)
+        attention = estimate_attention(frame.camera_interior);
+    end
+end
+
+%% ==================== UPDATED HEALTH MONITORING ====================
+function health = monitor_sensor_health(data, sensor_type)
+    % Check sensor data validity
+    if isempty(data)
+        health = 'missing';
+        return;
+    end
+    
+    % Extract base sensor type (remove camera position suffix)
+    base_type = regexprep(sensor_type, '^(camera|image)_.*', '$1');
+    
+    switch base_type
+        case 'lidar'
+            try
+                % Check point cloud density
+                point_count = numel(typecast(base64decode(data), 'single'))/4;
+                if point_count > 1000
+                    health = 'ok';
+                else
+                    health = 'low_density';
+                end
+            catch
+                health = 'decode_failed';
+            end
+            
+        case 'imu'
+            try
+                % Check data range validity
+                imu_vals = typecast(base64decode(data), 'single');
+                if any(abs(imu_vals(1:3)) > 20) % Acceleration check
+                    health = 'out_of_range';
+                else
+                    health = 'ok';
+                end
+            catch
+                health = 'decode_failed';
+            end
+            
+        case 'gnss'
+            try
+                % Handle both struct and numeric formats
+                if isstruct(data)
+                    % Structure format
+                    lat = data.lat;
+                    lon = data.lon;
+                elseif isnumeric(data) && numel(data) >= 2
+                    % Array format [lat, lon]
+                    lat = data(1);
+                    lon = data(2);
+                else
+                    health = 'invalid_format';
+                    return;
+                end
+                
+                % Validate coordinates
+                if abs(lat) > 90 || abs(lon) > 180
+                    health = 'invalid';
+                else
+                    health = 'ok';
+                end
+            catch
+                health = 'invalid_structure';
+            end
+            
+        case 'camera'
+            try
+                % Check image data integrity
+                img = base64decode(data);
+                if numel(img) > 1000
+                    health = 'ok';
+                else
+                    health = 'corrupted';
+                end
+            catch
+                health = 'decode_failed';
+            end
+            
+        otherwise
+            health = 'unknown_type';
+    end
+end
+
+%% ==================== HELPER FUNCTIONS ====================
+function synced = synchronize_sensor_data(frame)
+    % Simple synchronization using frame timestamp
+    synced = struct();
+    if isfield(frame, 'timestamp')
+        synced.timestamp = frame.timestamp;
+    else
+        synced.timestamp = now();
+    end
+    
+    % IMU data
+    if isfield(frame, 'imu')
+        synced.imu = frame.imu;
+    end
+    
+    % GPS data
+    if isfield(frame, 'gnss')
+        synced.gnss = [frame.gnss.lat, frame.gnss.lon, frame.gnss.alt];
+    end
+    
+    % Vehicle dynamics
+    if isfield(frame, 'speed')
+        synced.speed = frame.speed;
+    end
+    if isfield(frame, 'position')
+        synced.position = [frame.position.x, frame.position.y, frame.position.z];
+    end
+end
+
+function filtered = apply_noise_reduction(data)
+    % Apply noise reduction techniques
+    filtered = data;
+    
+    % Low-pass filter for IMU
+    if isfield(data, 'imu')
+        persistent imu_filter_state;
+        if isempty(imu_filter_state)
+            imu_filter_state = zeros(6,1);
+        end
+        
+        try
+            imu_vals = typecast(base64decode(data.imu), 'single');
+            filtered_vals = 0.8*imu_filter_state + 0.2*imu_vals;
+            imu_filter_state = filtered_vals;
+            filtered.imu = filtered_vals;
+        catch
+            % Keep original if decoding fails
+        end
+    end
+    
+    % Moving average for GNSS
+    if isfield(data, 'gnss')
+        persistent gnss_history;
+        if isempty(gnss_history)
+            gnss_history = repmat(data.gnss, 5, 1);
+        end
+        
+        gnss_history = [data.gnss; gnss_history(1:end-1,:)];
+        filtered.gnss = mean(gnss_history, 1);
+    end
+end
+
+function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
+    % Simplified Kalman Filter for sensor fusion
+    dt = 0.1; % Time step (adjust based on actual timing)
+    
+    % State transition matrix
+    F = [1 0 0 dt 0 0;
+         0 1 0 0 dt 0;
+         0 0 1 0 0 dt;
+         0 0 0 1 0 0;
+         0 0 0 0 1 0;
+         0 0 0 0 0 1];
+     
+    % Process noise
+    Q = diag([0.1, 0.1, 0.1, 0.5, 0.5, 0.5]);
+    
+    % Prediction step
+    pred_state = F * state;
+    pred_cov = F * cov * F' + Q;
+    
+    % Measurement update
+    if isfield(data, 'gnss') && isfield(data, 'speed')
+        % Measurement vector [x, y, z, vx, vy, vz]
+        z = [data.gnss(1), data.gnss(2), data.gnss(3), ...
+             data.speed*cos(state(4)), data.speed*sin(state(5)), 0]';
+        
+        % Measurement matrix
+        H = eye(6);
+        
+        % Measurement noise
+        R = diag([0.5, 0.5, 1, 0.2, 0.2, 0.1]);
+        
+        % Kalman gain
+        K = pred_cov * H' / (H * pred_cov * H' + R);
+        
+        % Update state
+        new_state = pred_state + K * (z - H * pred_state);
+        new_cov = (eye(6) - K * H) * pred_cov;
+    else
+        new_state = pred_state;
+        new_cov = pred_cov;
+    end
+    
+    % Prepare fused output
+    fused.position = new_state(1:3)';
+    fused.velocity = new_state(4:6)';
+    fused.orientation = []; % Placeholder for actual orientation fusion
+end
+
+function env_cond = detect_environment(img_data)
+    % Detect environmental conditions from image data
+    env_cond = struct('lighting', 'unknown', 'weather', 'unknown');
+    
+    try
+        % Decode base64 image
+        img_bytes = base64decode(img_data);
+        
+        % Create temporary file
+        temp_file = [tempname '.jpg'];
+        fid = fopen(temp_file, 'wb');
+        if fid == -1
+            return;
+        end
+        fwrite(fid, img_bytes, 'uint8');
+        fclose(fid);
+        
+        % Read and process image
+        img = imread(temp_file);
+        delete(temp_file);
+        
+        % ==================== LIGHTING DETECTION ====================
+        % Convert to HSV and analyze brightness
+        hsv = rgb2hsv(img);
+        value_channel = hsv(:, :, 3);
+        
+        % Calculate brightness metrics
+        avg_brightness = mean(value_channel(:));
+        brightness_std = std(double(value_channel(:)));
+        
+        % Classify lighting conditions
+        if avg_brightness > 0.7
+            env_cond.lighting = 'day';
+        elseif avg_brightness > 0.4
+            env_cond.lighting = 'dawn/dusk';
+        elseif avg_brightness > 0.15
+            env_cond.lighting = 'night';
+        else
+            env_cond.lighting = 'dark_night';
+        end
+        
+        % ==================== WEATHER DETECTION ====================
+        % Analyze color channels for weather patterns
+        red_ch = img(:, :, 1);
+        green_ch = img(:, :, 2);
+        blue_ch = img(:, :, 3);
+        
+        % Calculate color ratios
+        blue_ratio = sum(blue_ch(:)) / (sum(red_ch(:)) + sum(green_ch(:)) + eps);
+        red_ratio = sum(red_ch(:)) / (sum(green_ch(:)) + sum(blue_ch(:)) + eps);
+        
+        % Calculate contrast metric (lower in fog/snow)
+        gray_img = rgb2gray(img);
+        contrast_metric = std(double(gray_img(:)));
+        
+        % Classify weather conditions
+        if blue_ratio > 0.45 && contrast_metric < 25
+            env_cond.weather = 'rainy';
+        elseif blue_ratio > 0.42 && avg_brightness > 0.75
+            env_cond.weather = 'snowy';
+        elseif blue_ratio > 0.4 && contrast_metric < 20
+            env_cond.weather = 'foggy';
+        elseif red_ratio > 0.38 && avg_brightness > 0.7
+            env_cond.weather = 'clear';
+        else
+            env_cond.weather = 'cloudy';
+        end
+        
+        % ==================== VALIDATION CHECKS ====================
+        % Nighttime overrides - can't have bright conditions at night
+        if contains(env_cond.lighting, {'night', 'dark_night'})
+            if contains(env_cond.weather, {'snowy', 'clear'}) && avg_brightness < 0.3
+                env_cond.weather = 'cloudy';
+            end
+        end
+        
+    catch ME
+        % Fallback to CARLA's weather data if available
+        env_cond.lighting = 'unknown';
+        env_cond.weather = 'unknown';
+    end
+end
+
+function attention = estimate_attention(img_data)
+    % Simplified attention estimation
+    try
+        img_bytes = base64decode(img_data);
+        % Actual implementation would use face/eye tracking
+        % Placeholder value - would be replaced with real algorithm
+        attention = 0.9;
+    catch
+        attention = 1.0; % Default to attentive
+    end
+end
+
 function processCompleteFrame(frameData, log_fid, diag_text)
     % Process a complete frame with all sensor data - handle flexible field names
     persistent last_print;
@@ -438,6 +834,25 @@ function processCompleteFrame(frameData, log_fid, diag_text)
             gnss_lon = frameData.gnss.lon;
             gnss_alt = frameData.gnss.alt;
         end
+
+        % Extract environment data
+        env_map = '';
+        env_weather = '';
+        env_layer = '';
+        if isfield(frameData, 'environment')
+            env_map = strrep(frameData.environment.map, ',', '_');
+            env_weather = strrep(frameData.environment.weather, ',', '_');
+            env_layer = strrep(frameData.environment.layer, ',', '_');
+        end
+        
+        % Update fprintf for CSV
+        fprintf(log_fid, '%.6f,%d,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%s,%s\n', ...
+                timestamp_val, frame_id, speed_val, ...
+                position_data.x, position_data.y, position_data.z, ...
+                rotation_data.yaw, rotation_data.pitch, rotation_data.roll, ...
+                control_data.throttle, control_data.steer, control_data.brake, ...
+                gnss_lat, gnss_lon, gnss_alt, ...
+                env_map, env_weather, env_layer);  % Added environment fields
         
         % Extract speed
         speed_val = 0;
@@ -535,7 +950,7 @@ function processCompleteFrame(frameData, log_fid, diag_text)
 end
 
 function saveFrameData(frameData, frame_dir, diag_text)
-    % Save all sensor data for a single frame
+    % Save all sensor data for a single frame while preserving environment data
     try
         % Save camera images
         cameras = {'front', 'back', 'left', 'right'};
@@ -580,17 +995,27 @@ function saveFrameData(frameData, frame_dir, diag_text)
             end
         end
         
-        % Save metadata (excluding large sensor fields)
+        % ====== KEY UPDATE: Preserve environment data in metadata ======
+        % Create metadata copy
         meta = frameData;
+        
+        % List of large binary fields to remove
         large_fields = [...
             arrayfun(@(c) ['image_' c], cameras, 'UniformOutput', false), ...
             {'lidar', 'imu'}];
+        
+        % Remove large binary fields while preserving environment data
         for i = 1:length(large_fields)
             if isfield(meta, large_fields{i})
                 meta = rmfield(meta, large_fields{i});
             end
         end
         
+        % ====== ENVIRONMENT DATA IS AUTOMATICALLY PRESERVED ======
+        % The 'environment' field remains in the metadata structure
+        % since it's not in the large_fields removal list
+        
+        % Save metadata as JSON
         json_str = jsonencode(meta);
         json_path = fullfile(frame_dir, 'frame.json');
         fid = fopen(json_path, 'w');
