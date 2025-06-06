@@ -440,6 +440,31 @@ class ManualControl:
             display.blit(text_surface, (60, y_offset))
             y_offset += 30
 
+    def get_environmental_data(self):
+        """Collect weather and map data"""
+        weather = self.world.get_weather()
+        weather_data = {
+            'cloudiness': weather.cloudiness,
+            'precipitation': weather.precipitation,
+            'precipitation_deposits': weather.precipitation_deposits,
+            'wind_intensity': weather.wind_intensity,
+            'sun_azimuth_angle': weather.sun_azimuth_angle,
+            'sun_altitude_angle': weather.sun_altitude_angle,
+            'fog_density': weather.fog_density,
+            'fog_distance': weather.fog_distance,
+            'wetness': weather.wetness,
+            'fog_falloff': getattr(weather, 'fog_falloff', 0.0)  # Handle version differences
+        }
+        
+        return {
+            'map': self.world.get_map().name,
+            'weather': weather_data,
+            'time': {
+                'system': time.time(),
+                'simulation': self.world.get_snapshot().timestamp.elapsed_seconds
+            }
+        }
+
 class DisplayManager:
     def __init__(self, grid_size):
         self.display = pygame.display.set_mode((grid_size[0]*320, grid_size[1]*240))
@@ -862,6 +887,7 @@ def main():
             # Prepare data for UDP transmission
             current_time = time.time()
             if current_time - last_udp_send_time >= 0.05:  # Send at 20Hz (increased frequency)
+                # Create base dictionary
                 data_dict = {
                     'timestamp': current_time,
                     'frame': frame_count,
@@ -880,6 +906,10 @@ def main():
                     'collisions': manual_control.collision_count,
                     'lane_invasions': manual_control.lane_invasion_count
                 }
+                
+                # Add environmental data
+                env_data = manual_control.get_environmental_data()
+                data_dict['environment'] = env_data
                 
                 # Add camera images
                 if camera_front.data is not None:
