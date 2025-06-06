@@ -343,14 +343,6 @@ function carla_udp_receiver(port)
                     end
                     status_msg = [status_msg sprintf('Last frame: %d\n', frame_id)];
                 end
-
-                % Inside the diagnostic panel update section (where status_msg is built)
-                if isfield(frame_data, 'environment')
-                    status_msg = [status_msg sprintf('Environment:\n')];
-                    status_msg = [status_msg sprintf('  Map: %s\n', frame_data.environment.map)];
-                    status_msg = [status_msg sprintf('  Weather: %s\n', frame_data.environment.weather)];
-                    status_msg = [status_msg sprintf('  Layer: %s\n', frame_data.environment.layer)];
-                end
                 
                 % Display attention level if available
                 if isfield(frame_data, 'driver_attention')
@@ -433,25 +425,6 @@ end
 %% ==================== SENSOR PROCESSING BLOCK ====================
 function [fused, health, attention, env_cond, new_state, new_cov] = ...
          sensorProcessingBlock(frame, state, cov, diag_text)
-    
-    % Initialize with CARLA environment data if available
-    env_cond = struct('map', '', 'weather', '', 'layer', '', 'lighting', 'day');
-    if isfield(frame, 'environment')
-        env_cond.map = frame.environment.map;
-        env_cond.weather = frame.environment.weather;
-        env_cond.layer = frame.environment.layer;
-    end
-
-    % Use front camera for lighting and fallback weather
-    if isfield(frame, 'image_front') && ~isempty(frame.image_front)
-        img_env = detect_environment(frame.image_front);
-        env_cond.lighting = img_env.lighting;
-        
-        % Fallback for weather if not provided by CARLA
-        if ~isfield(frame, 'environment') || isempty(env_cond.weather)
-            env_cond.weather = img_env.weather;
-        end
-    end
     
     % Initialize outputs
     fused = struct();
@@ -694,83 +667,14 @@ function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
 end
 
 function env_cond = detect_environment(img_data)
-    % Detect environmental conditions from image data
-    env_cond = struct('lighting', 'unknown', 'weather', 'unknown');
-    
+    % Simplified environmental condition detection
     try
-        % Decode base64 image
         img_bytes = base64decode(img_data);
-        
-        % Create temporary file
-        temp_file = [tempname '.jpg'];
-        fid = fopen(temp_file, 'wb');
-        if fid == -1
-            return;
-        end
-        fwrite(fid, img_bytes, 'uint8');
-        fclose(fid);
-        
-        % Read and process image
-        img = imread(temp_file);
-        delete(temp_file);
-        
-        % ==================== LIGHTING DETECTION ====================
-        % Convert to HSV and analyze brightness
-        hsv = rgb2hsv(img);
-        value_channel = hsv(:, :, 3);
-        
-        % Calculate brightness metrics
-        avg_brightness = mean(value_channel(:));
-        brightness_std = std(double(value_channel(:)));
-        
-        % Classify lighting conditions
-        if avg_brightness > 0.7
-            env_cond.lighting = 'day';
-        elseif avg_brightness > 0.4
-            env_cond.lighting = 'dawn/dusk';
-        elseif avg_brightness > 0.15
-            env_cond.lighting = 'night';
-        else
-            env_cond.lighting = 'dark_night';
-        end
-        
-        % ==================== WEATHER DETECTION ====================
-        % Analyze color channels for weather patterns
-        red_ch = img(:, :, 1);
-        green_ch = img(:, :, 2);
-        blue_ch = img(:, :, 3);
-        
-        % Calculate color ratios
-        blue_ratio = sum(blue_ch(:)) / (sum(red_ch(:)) + sum(green_ch(:)) + eps);
-        red_ratio = sum(red_ch(:)) / (sum(green_ch(:)) + sum(blue_ch(:)) + eps);
-        
-        % Calculate contrast metric (lower in fog/snow)
-        gray_img = rgb2gray(img);
-        contrast_metric = std(double(gray_img(:)));
-        
-        % Classify weather conditions
-        if blue_ratio > 0.45 && contrast_metric < 25
-            env_cond.weather = 'rainy';
-        elseif blue_ratio > 0.42 && avg_brightness > 0.75
-            env_cond.weather = 'snowy';
-        elseif blue_ratio > 0.4 && contrast_metric < 20
-            env_cond.weather = 'foggy';
-        elseif red_ratio > 0.38 && avg_brightness > 0.7
-            env_cond.weather = 'clear';
-        else
-            env_cond.weather = 'cloudy';
-        end
-        
-        % ==================== VALIDATION CHECKS ====================
-        % Nighttime overrides - can't have bright conditions at night
-        if contains(env_cond.lighting, {'night', 'dark_night'})
-            if contains(env_cond.weather, {'snowy', 'clear'}) && avg_brightness < 0.3
-                env_cond.weather = 'cloudy';
-            end
-        end
-        
-    catch ME
-        % Fallback to CARLA's weather data if available
+        % Actual implementation would use image processing
+        % Placeholder logic - would be replaced with real analysis
+        env_cond.lighting = 'day';
+        env_cond.weather = 'clear';
+    catch
         env_cond.lighting = 'unknown';
         env_cond.weather = 'unknown';
     end
@@ -834,25 +738,6 @@ function processCompleteFrame(frameData, log_fid, diag_text)
             gnss_lon = frameData.gnss.lon;
             gnss_alt = frameData.gnss.alt;
         end
-
-        % Extract environment data
-        env_map = '';
-        env_weather = '';
-        env_layer = '';
-        if isfield(frameData, 'environment')
-            env_map = strrep(frameData.environment.map, ',', '_');
-            env_weather = strrep(frameData.environment.weather, ',', '_');
-            env_layer = strrep(frameData.environment.layer, ',', '_');
-        end
-        
-        % Update fprintf for CSV
-        fprintf(log_fid, '%.6f,%d,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%s,%s\n', ...
-                timestamp_val, frame_id, speed_val, ...
-                position_data.x, position_data.y, position_data.z, ...
-                rotation_data.yaw, rotation_data.pitch, rotation_data.roll, ...
-                control_data.throttle, control_data.steer, control_data.brake, ...
-                gnss_lat, gnss_lon, gnss_alt, ...
-                env_map, env_weather, env_layer);  % Added environment fields
         
         % Extract speed
         speed_val = 0;
@@ -950,7 +835,7 @@ function processCompleteFrame(frameData, log_fid, diag_text)
 end
 
 function saveFrameData(frameData, frame_dir, diag_text)
-    % Save all sensor data for a single frame while preserving environment data
+    % Save all sensor data for a single frame
     try
         % Save camera images
         cameras = {'front', 'back', 'left', 'right'};
@@ -995,27 +880,17 @@ function saveFrameData(frameData, frame_dir, diag_text)
             end
         end
         
-        % ====== KEY UPDATE: Preserve environment data in metadata ======
-        % Create metadata copy
+        % Save metadata (excluding large sensor fields)
         meta = frameData;
-        
-        % List of large binary fields to remove
         large_fields = [...
             arrayfun(@(c) ['image_' c], cameras, 'UniformOutput', false), ...
             {'lidar', 'imu'}];
-        
-        % Remove large binary fields while preserving environment data
         for i = 1:length(large_fields)
             if isfield(meta, large_fields{i})
                 meta = rmfield(meta, large_fields{i});
             end
         end
         
-        % ====== ENVIRONMENT DATA IS AUTOMATICALLY PRESERVED ======
-        % The 'environment' field remains in the metadata structure
-        % since it's not in the large_fields removal list
-        
-        % Save metadata as JSON
         json_str = jsonencode(meta);
         json_path = fullfile(frame_dir, 'frame.json');
         fid = fopen(json_path, 'w');
