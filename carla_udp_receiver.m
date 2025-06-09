@@ -430,7 +430,7 @@ function [fused, health, attention, env_cond, new_state, new_cov] = ...
     fused = struct();
     health = struct();
     attention = 1.0; % Default: fully attentive
-    env_cond = struct('lighting', 'day', 'weather', 'clear');
+    env_cond = struct('lighting', 'unknown', 'weather', 'unknown'); % Initialize to unknown
     
     % 1. Sensor health monitoring with field mapping
     sensor_map = {
@@ -463,15 +463,54 @@ function [fused, health, attention, env_cond, new_state, new_cov] = ...
     % 4. Sensor fusion with Kalman Filter
     [fused, new_state, new_cov] = kalman_sensor_fusion(filtered, state, cov);
     
-    % 5. Environmental conditions detection (use front camera)
-    if isfield(frame, 'image_front') && ~isempty(frame.image_front)
-        env_cond = detect_environment(frame.image_front);
+    % 5. Environmental conditions detection using CARLA environmental data
+    if isfield(frame, 'environment') && ~isempty(frame.environment)
+        env_cond = detect_environment(frame.environment);
     end
     
     % 6. Driver attention estimation (if available)
     if isfield(frame, 'camera_interior') && ~isempty(frame.camera_interior)
         attention = estimate_attention(frame.camera_interior);
     end
+end
+
+%% ==================== UPDATED ENVIRONMENTAL DETECTION ====================
+function env_cond = detect_environment(env_struct)
+    % Use actual CARLA environmental data structure
+    if ~isfield(env_struct, 'weather')
+        env_cond = struct('lighting', 'unknown', 'weather', 'unknown');
+        return;
+    end
+    
+    weather_data = env_struct.weather;
+    
+    % 1. Determine lighting condition based on sun altitude
+    if isfield(weather_data, 'sun_altitude_angle')
+        if weather_data.sun_altitude_angle > 0
+            lighting_cond = 'day';
+        else
+            lighting_cond = 'night';
+        end
+    else
+        lighting_cond = 'unknown';
+    end
+    
+    % 2. Determine weather condition using CARLA weather parameters
+    if isfield(weather_data, 'precipitation') && weather_data.precipitation > 0.7
+        weather_cond = 'heavy rain';
+    elseif isfield(weather_data, 'precipitation') && weather_data.precipitation > 0.3
+        weather_cond = 'rain';
+    elseif isfield(weather_data, 'fog_density') && weather_data.fog_density > 0.7
+        weather_cond = 'thick fog';
+    elseif isfield(weather_data, 'fog_density') && weather_data.fog_density > 0.3
+        weather_cond = 'fog';
+    elseif isfield(weather_data, 'cloudiness') && weather_data.cloudiness > 0.5
+        weather_cond = 'cloudy';
+    else
+        weather_cond = 'clear';
+    end
+    
+    env_cond = struct('lighting', lighting_cond, 'weather', weather_cond);
 end
 
 %% ==================== UPDATED HEALTH MONITORING ====================
@@ -664,20 +703,6 @@ function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
     fused.position = new_state(1:3)';
     fused.velocity = new_state(4:6)';
     fused.orientation = []; % Placeholder for actual orientation fusion
-end
-
-function env_cond = detect_environment(img_data)
-    % Simplified environmental condition detection
-    try
-        img_bytes = base64decode(img_data);
-        % Actual implementation would use image processing
-        % Placeholder logic - would be replaced with real analysis
-        env_cond.lighting = 'day';
-        env_cond.weather = 'clear';
-    catch
-        env_cond.lighting = 'unknown';
-        env_cond.weather = 'unknown';
-    end
 end
 
 function attention = estimate_attention(img_data)
