@@ -705,15 +705,73 @@ function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
     fused.orientation = []; % Placeholder for actual orientation fusion
 end
 
-function attention = estimate_attention(img_data)
-    % Simplified attention estimation
+function attention = estimate_attention(data_struct)
+    % Validate input structure
+    if nargin < 1 || isempty(data_struct) || ~isstruct(data_struct)
+        error('Input must be a valid data structure');
+    end
+    
+    % Initialize attention with default value (assume attentive)
+    attention = 1.0;
+    
     try
-        img_bytes = base64decode(img_data);
-        % Actual implementation would use face/eye tracking
-        % Placeholder value - would be replaced with real algorithm
-        attention = 0.9;
-    catch
-        attention = 1.0; % Default to attentive
+        % Check for required fields
+        if ~isfield(data_struct, 'speed') || ~isfield(data_struct, 'control') || ...
+           ~isfield(data_struct, 'rotation') || ~isfield(data_struct, 'collisions') || ...
+           ~isfield(data_struct, 'lane_invasions') || ~isfield(data_struct, 'environment')
+            return;
+        end
+
+        % Extract relevant data
+        speed = data_struct.speed;
+        control = data_struct.control;
+        rotation = data_struct.rotation;
+        collisions = data_struct.collisions;
+        lane_invasions = data_struct.lane_invasions;
+        weather = data_struct.environment.weather;
+
+        % 1. Control Input Analysis
+        control_active = (control.throttle > 0.1) || ...
+                         (control.brake > 0.1) || ...
+                         (abs(control.steer) > 0.05);
+        
+        % 2. Vehicle Dynamics Analysis
+        yaw_variation = abs(rotation.yaw);
+        unusual_dynamics = (yaw_variation > 15) && (yaw_variation < 345) && (speed > 5);
+        
+        % 3. Safety Events Analysis
+        recent_safety_events = (collisions > 0) || (lane_invasions > 0);
+        
+        % 4. Environmental Factors
+        bad_weather = (weather.precipitation > 30) || ...
+                      (weather.fog_density > 20) || ...
+                      (weather.wetness > 0.5);
+        
+        % Decision Logic
+        if bad_weather
+            % Higher scrutiny in poor conditions
+            if ~control_active || recent_safety_events || unusual_dynamics
+                attention = 0.4;
+            end
+        else
+            % Normal conditions
+            if (speed > 2) && ~control_active
+                attention = 0.6;  % No input while moving
+            end
+            if recent_safety_events
+                attention = max(0.3, attention - 0.3);  % Penalize for safety events
+            end
+            if unusual_dynamics
+                attention = max(0.2, attention - 0.2);  % Penalize for erratic motion
+            end
+        end
+        
+        % Ensure attention stays within [0,1] range
+        attention = min(max(attention, 0), 1);
+        
+    catch ME
+        warning('Attention estimation error: %s', char(ME.message));
+        attention = 1.0;  % Fallback to attentive
     end
 end
 
