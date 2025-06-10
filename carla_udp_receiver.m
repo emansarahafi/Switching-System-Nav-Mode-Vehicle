@@ -1,4 +1,13 @@
 function carla_udp_receiver(port)
+    % Global output declaration
+    global carla_outputs;
+    carla_outputs = struct(...
+        'network_status', [], ...
+        'sensor_fusion_status', [], ...
+        'processed_sensor_data', [], ...
+        'fallback_initiation', false ...
+    );
+    
     % Enhanced CARLA UDP receiver with Sensor Processing Block
     if nargin < 1
         port = 10000;
@@ -300,13 +309,60 @@ function carla_udp_receiver(port)
                 frame_data.driver_attention = attention;
                 frame_data.environment = env_cond;
                 
-                % Log sensor health status
-                health_msg = 'Sensor Health: ';
-                sensor_names = fieldnames(health_status);
-                for i = 1:length(sensor_names)
-                    health_msg = [health_msg sprintf('%s: %s, ', sensor_names{i}, health_status.(sensor_names{i}))];
+                % ==================== OUTPUT GENERATION ====================
+                % 1. Network status
+                network_status = struct(...
+                    'connection_active', connection_active, ...
+                    'time_since_last_message', toc(last_message_time), ...
+                    'bytes_received', bytes_received, ...
+                    'messages_received', messages_received, ...
+                    'buffered_chunks', chunkBuffer.Count ...
+                );
+                
+                % 2. Sensor fusion status
+                sensor_fusion_status = struct(...
+                    'ekf_state', ekf_state, ...
+                    'ekf_covariance', ekf_covariance, ...
+                    'health', health_status ...
+                );
+                
+                % 3. Processed sensor data
+                processed_sensor_data = fused_data;
+                
+                % 4. Fallback initiation (decision logic)
+                fallback_initiation = false;
+                
+                % Condition 1: Network timeout
+                if connection_active && toc(last_message_time) > 5
+                    fallback_initiation = true;
+                    log_diag(diag_text, '[FALLBACK] Network timeout detected');
+                
+                % Condition 2: Critical sensor failures
+                elseif sum(~strcmp(struct2cell(health_status), 'ok')) > numel(fieldnames(health_status))/2
+                    fallback_initiation = true;
+                    log_diag(diag_text, '[FALLBACK] Critical sensor failure');
+                
+                % Condition 3: Environmental risk + low attention
+                elseif attention < 0.3 && ...
+                       (strcmp(env_cond.weather, 'rain') || ...
+                        strcmp(env_cond.weather, 'heavy rain') || ...
+                        strcmp(env_cond.weather, 'fog'))
+                    fallback_initiation = true;
+                    log_diag(diag_text, '[FALLBACK] Risky environment + low attention');
+                
+                % Condition 4: High position uncertainty
+                elseif any(diag(ekf_covariance(1:3,1:3)) > 10) % >10m variance
+                    fallback_initiation = true;
+                    log_diag(diag_text, '[FALLBACK] High position uncertainty');
                 end
-                log_diag(diag_text, health_msg(1:end-2));
+
+                % Update global outputs
+                carla_outputs = struct(...
+                    'network_status', network_status, ...
+                    'sensor_fusion_status', sensor_fusion_status, ...
+                    'processed_sensor_data', processed_sensor_data, ...
+                    'fallback_initiation', fallback_initiation ...
+                );
             end
             % ================================================================
             
