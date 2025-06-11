@@ -1,10 +1,15 @@
 function carla_udp_receiver(port)
-    % Global output declaration
+    % Global output declaration with enhanced fields for BBNA
     global carla_outputs;
     carla_outputs = struct(...
         'network_status', [], ...
         'sensor_fusion_status', [], ...
-        'processed_sensor_data', [], ...
+        'processed_sensor_data', struct(...
+            'fused_state', [], ...
+            'sensor_health', [], ...
+            'environment', [], ...
+            'attention', [], ...
+            'image_features', []), ...
         'fallback_initiation', false ...
     );
     
@@ -143,6 +148,9 @@ function carla_udp_receiver(port)
         log_diag(diag_text, '>> Verify matching port in Python script');
         
         while ishandle(fig)
+            % Initialize image_features for this iteration
+            image_features = struct();
+
             % Check for data
             if u.NumBytesAvailable > 0
                 % Read as bytes
@@ -298,9 +306,9 @@ function carla_udp_receiver(port)
                 end
             end
             
-            % ==================== SENSOR PROCESSING BLOCK ====================
+            % ==================== SENSOR PROCESSING ====================
             if ~isempty(frame_data)
-                [fused_data, health_status, attention, env_cond, ekf_state, ekf_covariance] = ...
+                [fused_data, health_status, attention, env_cond, ekf_state, ekf_covariance, image_features] = ...
                     sensorProcessingBlock(frame_data, ekf_state, ekf_covariance, diag_text);
                 
                 % Store processed outputs in frame_data
@@ -326,8 +334,14 @@ function carla_udp_receiver(port)
                     'health', health_status ...
                 );
                 
-                % 3. Processed sensor data
-                processed_sensor_data = fused_data;
+                % 3. Processed sensor data for BBNA
+                processed_sensor_data = struct(...
+                    'fused_state', fused_data, ...
+                    'sensor_health', health_status, ...
+                    'environment', env_cond, ...
+                    'attention', attention, ...
+                    'image_features', image_features ...
+                );
                 
                 % 4. Fallback initiation (decision logic)
                 fallback_initiation = false;
@@ -479,7 +493,7 @@ function carla_udp_receiver(port)
 end
 
 %% ==================== SENSOR PROCESSING BLOCK ====================
-function [fused, health, attention, env_cond, new_state, new_cov] = ...
+function [fused, health, attention, env_cond, new_state, new_cov, image_features] = ...
          sensorProcessingBlock(frame, state, cov, diag_text)
     
     % Initialize outputs
@@ -519,14 +533,67 @@ function [fused, health, attention, env_cond, new_state, new_cov] = ...
     % 4. Sensor fusion with Kalman Filter
     [fused, new_state, new_cov] = kalman_sensor_fusion(filtered, state, cov);
     
-    % 5. Environmental conditions detection using CARLA environmental data
+    % 5. Process orientation data
+    % Initialize with NaN
+    fused.orientation = struct('yaw', NaN, 'pitch', NaN, 'roll', NaN);
+    current_orientation = [];
+
+    if isfield(filtered, 'rotation')
+        % We have a struct with yaw, pitch, roll
+        current_orientation = [filtered.rotation.yaw, filtered.rotation.pitch, filtered.rotation.roll];
+    elseif isfield(filtered, 'orientation')
+        % Similarly for 'orientation' field
+        current_orientation = [filtered.orientation.yaw, filtered.orientation.pitch, filtered.orientation.roll];
+    end
+
+    if ~isempty(current_orientation)
+        persistent prev_orientation;
+        if isempty(prev_orientation)
+            prev_orientation = current_orientation;
+        end
+        alpha = 0.3; % smoothing factor
+        filtered_orientation = alpha * current_orientation + (1-alpha) * prev_orientation;
+        prev_orientation = filtered_orientation;
+        fused.orientation = struct('yaw', filtered_orientation(1), ...
+                                   'pitch', filtered_orientation(2), ...
+                                   'roll', filtered_orientation(3));
+    end
+
+    % 6. Environmental conditions detection using CARLA environmental data
     if isfield(frame, 'environment') && ~isempty(frame.environment)
         env_cond = detect_environment(frame.environment);
     end
     
-    % 6. Driver attention estimation (if available)
+    % 7. Driver attention estimation (if available)
     if isfield(frame, 'camera_interior') && ~isempty(frame.camera_interior)
         attention = estimate_attention(frame.camera_interior);
+    end
+
+    % 8. Image feature extraction for BBNA
+    image_features = struct();
+    cameras = {'front', 'back', 'left', 'right'};
+    
+    for cam = cameras
+        field_name = ['image_' cam{1}];
+        if isfield(frame, field_name) && ~isempty(frame.(field_name))
+            try
+                img_data = base64decode(frame.(field_name));
+                temp_file = [tempname '.jpg'];
+                fid = fopen(temp_file, 'wb');
+                fwrite(fid, img_data, 'uint8');
+                fclose(fid);
+                img = imread(temp_file);
+                delete(temp_file);
+                
+                % Extract features for BBNA
+                image_features.(cam{1}) = extractImageFeatures(img, cam{1});
+            catch ME
+                log_diag(diag_text, sprintf('Image processing error (%s): %s', cam{1}, ME.message));
+                image_features.(cam{1}) = struct('lane_confidence', 0, 'obstacle_density', 0);
+            end
+        else
+            image_features.(cam{1}) = struct('lane_confidence', 0, 'obstacle_density', 0);
+        end
     end
 end
 
@@ -678,6 +745,13 @@ function synced = synchronize_sensor_data(frame)
     if isfield(frame, 'position')
         synced.position = [frame.position.x, frame.position.y, frame.position.z];
     end
+
+    % Rotation data
+    if isfield(frame, 'rotation')
+        synced.rotation = frame.rotation;
+    elseif isfield(frame, 'orientation')
+        synced.orientation = frame.orientation;
+    end
 end
 
 function filtered = apply_noise_reduction(data)
@@ -714,8 +788,8 @@ function filtered = apply_noise_reduction(data)
 end
 
 function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
-    % Simplified Kalman Filter for sensor fusion
-    dt = 0.1; % Time step (adjust based on actual timing)
+    % Enhanced Kalman Filter with IMU integration
+    dt = 0.1; % Time step
     
     % State transition matrix
     F = [1 0 0 dt 0 0;
@@ -725,24 +799,70 @@ function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
          0 0 0 0 1 0;
          0 0 0 0 0 1];
      
+    % Control input matrix (for acceleration)
+    B = [0.5*dt^2 0 0;
+         0 0.5*dt^2 0;
+         0 0 0.5*dt^2;
+         dt 0 0;
+         0 dt 0;
+         0 0 dt];
+    
+    % Initialize control input (acceleration)
+    u = zeros(3,1);
+    
+    % Use IMU if available and orientation exists
+    if isfield(data, 'imu') && isfield(data, 'orientation')
+        try
+            % Decode IMU data
+            imu_bytes = base64decode(data.imu);
+            imu_vals = typecast(imu_bytes, 'single');
+            
+            % Extract acceleration in vehicle frame (first 3 values)
+            accel_vehicle = imu_vals(1:3)';
+            
+            % Get orientation for rotation matrix
+            yaw = deg2rad(data.orientation.yaw);
+            pitch = deg2rad(data.orientation.pitch);
+            roll = deg2rad(data.orientation.roll);
+            
+            % Create rotation matrix (vehicle to global frame)
+            R = rotation_matrix(yaw, pitch, roll);
+            
+            % Transform acceleration to global frame
+            accel_global = R * accel_vehicle;
+            u = accel_global;
+        catch
+            log_diag(diag_text, 'IMU processing failed - using default');
+        end
+    end
+    
     % Process noise
     Q = diag([0.1, 0.1, 0.1, 0.5, 0.5, 0.5]);
     
-    % Prediction step
-    pred_state = F * state;
+    % Prediction step with IMU
+    pred_state = F * state + B * u;
     pred_cov = F * cov * F' + Q;
     
     % Measurement update
-    if isfield(data, 'gnss') && isfield(data, 'speed')
+    if isfield(data, 'position') && isfield(data, 'speed') && ...
+       isfield(data, 'orientation')
+        % Position measurement
+        pos = [data.position.x; data.position.y; data.position.z];
+        
+        % Convert speed to global velocity using orientation
+        yaw = deg2rad(data.orientation.yaw);
+        vx = data.speed * cos(yaw);
+        vy = data.speed * sin(yaw);
+        vel_global = [vx; vy; 0];  % Assume minimal vertical velocity
+        
         % Measurement vector [x, y, z, vx, vy, vz]
-        z = [data.gnss(1), data.gnss(2), data.gnss(3), ...
-             data.speed*cos(state(4)), data.speed*sin(state(5)), 0]';
+        z = [pos; vel_global];
         
         % Measurement matrix
         H = eye(6);
         
         % Measurement noise
-        R = diag([0.5, 0.5, 1, 0.2, 0.2, 0.1]);
+        R = diag([0.1, 0.1, 0.1, 0.2, 0.2, 0.1]); % Tighter position noise
         
         % Kalman gain
         K = pred_cov * H' / (H * pred_cov * H' + R);
@@ -758,7 +878,24 @@ function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
     % Prepare fused output
     fused.position = new_state(1:3)';
     fused.velocity = new_state(4:6)';
-    fused.orientation = []; % Placeholder for actual orientation fusion
+end
+
+%% Helper function for rotation matrix
+function R = rotation_matrix(yaw, pitch, roll)
+    % Create rotation matrix from Euler angles (Z-Y-X order)
+    Rz = [cos(yaw) -sin(yaw) 0;
+          sin(yaw)  cos(yaw) 0;
+          0         0        1];
+    
+    Ry = [cos(pitch)  0  sin(pitch);
+          0           1  0;
+          -sin(pitch) 0  cos(pitch)];
+    
+    Rx = [1  0          0;
+          0  cos(roll) -sin(roll);
+          0  sin(roll)  cos(roll)];
+    
+    R = Rz * Ry * Rx;
 end
 
 function attention = estimate_attention(data_struct)
@@ -1261,4 +1398,49 @@ function [jsonStr, remaining] = extractJSON(buffer)
         jsonStr = buffer(startIdx:endIdx);
         remaining = buffer(endIdx+1:end);
     end
+end
+
+%% ==================== IMAGE FEATURE EXTRACTION ====================
+function features = extractImageFeatures(img, cam_position)
+    % Simplified feature extraction for BBNA
+    % In practice, use computer vision/deep learning methods
+    
+    % Convert to grayscale
+    gray_img = rgb2gray(img);
+    
+    % Edge detection for lane estimation
+    edges = edge(gray_img, 'Canny');
+    
+    % Lane confidence (density of horizontal edges)
+    [h, w] = size(edges);
+    roi = edges(floor(h*0.7):h, :);  % Bottom 30% of image
+    lane_confidence = sum(roi(:)) / numel(roi);
+    
+    % Obstacle detection (crude approximation)
+    diff_img = imabsdiff(gray_img, imopen(gray_img, strel('disk', 15)));
+    obstacle_mask = diff_img > 50;
+    obstacle_density = sum(obstacle_mask(:)) / numel(obstacle_mask);
+    
+    % Camera-specific adjustments
+    switch cam_position
+        case 'front'
+            % Higher weighting for central obstacles
+            center_mask = false(size(obstacle_mask));
+            center_mask(:, floor(w*0.4):floor(w*0.6)) = true;
+            obstacle_density = 0.7*sum(obstacle_mask(center_mask)) / sum(center_mask(:)) + ...
+                               0.3*obstacle_density;
+        case 'back'
+            % Focus on close-range obstacles
+            close_roi = obstacle_mask(floor(h*0.8):h, :);
+            obstacle_density = sum(close_roi(:)) / numel(close_roi);
+    end
+    
+    scaled_lane_confidence = min(1, lane_confidence * 5);       % Scale to [0,1]
+    scaled_obstacle_density = min(1, obstacle_density * 10);    % Scale to [0,1]
+    
+    features = struct(...
+        'lane_confidence', scaled_lane_confidence, ...
+        'obstacle_density', scaled_obstacle_density ...
+    );
+
 end
