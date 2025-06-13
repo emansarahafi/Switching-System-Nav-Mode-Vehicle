@@ -315,7 +315,7 @@ class SensorManager:
 class DisplayManager:
     """Manages the Pygame display and sensor surface rendering."""
     def __init__(self, grid_size: Tuple[int, int]):
-        self.display = pygame.display.set_mode((grid_size[0] * IMAGE_WIDTH, grid_size[1] * IMAGE_HEIGHT))
+        self.display = pygame.display.set_mode((grid_size[0] * IMAGE_WIDTH, grid_size[1] * IMAGE_HEIGHT), pygame.RESIZABLE)
         pygame.display.set_caption("CARLA Sensor Dashboard")
         self.sensors: List[Tuple[SensorManager, Tuple[int, int]]] = []
 
@@ -341,12 +341,17 @@ class UDPDataSender:
 
     def send(self, data: Dict[str, Any]):
         try:
-            json_str = json.dumps(data, ensure_ascii=False)
+            json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
             data['_crc32'] = zlib.crc32(json_str.encode('utf-8'))
-            full_payload_bytes = zlib.compress(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+            
+            final_json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+            full_payload_bytes = zlib.compress(final_json_str.encode('utf-8'))
+            
             frame_id = data.get('frame', -1)
             chunks = [full_payload_bytes[i:i + self.max_data_chunk_size] for i in range(0, len(full_payload_bytes), self.max_data_chunk_size)]
+            
             if not chunks: chunks.append(b'')
+            
             for i, chunk in enumerate(chunks):
                 packet = {'frame': frame_id, 'chunk': i, 'total_chunks': len(chunks), 'data': base64.b64encode(chunk).decode('utf-8')}
                 self.sock.sendto(json.dumps(packet).encode('utf-8'), (self.ip, self.port))
@@ -454,11 +459,6 @@ class CarlaSimulation:
         self._spawn_sensor_with_backups('lane_inv', 'LANE_INVASION', carla.Transform())
 
     def _tick_simulation(self):
-        """
-        Main tick function. Ticks the world, gets the snapshot, processes data,
-        sends data, and renders the display. This is more efficient than
-        getting the snapshot multiple times.
-        """
         self.world.tick()
         snapshot = self.world.get_snapshot()
 
@@ -504,8 +504,10 @@ class CarlaSimulation:
                 self.csv_writers['lane'].writerow([time.time(), event.frame, lane_types])
 
     def _send_udp_data(self, snapshot: carla.WorldSnapshot):
-        t = self.vehicle.get_transform(); v = self.vehicle.get_velocity()
+        t = self.vehicle.get_transform()
+        v = self.vehicle.get_velocity()
         
+        # This remains the same - it's the critical health information
         sensor_health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
 
         data_packet = {
@@ -518,21 +520,44 @@ class CarlaSimulation:
             'fused_state': self.fused_state,
             'sensor_health': sensor_health_data
         }
-
+        
+        # Iterate through sensors but ONLY process and send data from the primary one [0]
         for name, sensor_list in self.sensors.items():
-            if sensor_list[0].sensor_type in ['COLLISION', 'LANE_INVASION']: continue
-            processed_data_list = []
-            for sensor in sensor_list:
-                if sensor.data is None: continue
-                data, processed_data = sensor.data, None
-                if sensor.sensor_type == 'RGB':
-                    _, jpeg_img = cv2.imencode('.jpg', data); processed_data = base64.b64encode(jpeg_img).decode('utf-8')
-                elif sensor.sensor_type == 'LIDAR': processed_data = base64.b64encode(data.raw_data).decode('utf-8')
-                elif sensor.sensor_type == 'IMU': processed_data = {'accelerometer': {'x': data.accelerometer.x, 'y': data.accelerometer.y, 'z': data.accelerometer.z}, 'gyroscope': {'x': data.gyroscope.x, 'y': data.gyroscope.y, 'z': data.gyroscope.z}, 'compass': data.compass}
-                elif sensor.sensor_type == 'GNSS': processed_data = {'latitude': data.latitude, 'longitude': data.longitude, 'altitude': data.altitude}
-                else: processed_data = data
-                if processed_data is not None: processed_data_list.append(processed_data)
-            if processed_data_list: data_packet[name] = processed_data_list
+            if sensor_list[0].sensor_type in ['COLLISION', 'LANE_INVASION']: 
+                continue
+
+            primary_sensor = sensor_list[0]
+            if primary_sensor.data is None:
+                continue
+
+            data = primary_sensor.data
+            processed_data = None
+
+            if primary_sensor.sensor_type == 'RGB':
+                _, jpeg_img = cv2.imencode('.jpg', data)
+                processed_data = base64.b64encode(jpeg_img).decode('utf-8')
+            elif primary_sensor.sensor_type == 'LIDAR': 
+                processed_data = base64.b64encode(data.raw_data).decode('utf-8')
+            elif primary_sensor.sensor_type == 'IMU': 
+                processed_data = {'accelerometer': {'x': data.accelerometer.x, 'y': data.accelerometer.y, 'z': data.accelerometer.z}, 'gyroscope': {'x': data.gyroscope.x, 'y': data.gyroscope.y, 'z': data.gyroscope.z}, 'compass': data.compass}
+            elif primary_sensor.sensor_type == 'GNSS': 
+                processed_data = {'latitude': data.latitude, 'longitude': data.longitude, 'altitude': data.altitude}
+            else: # Catches RADAR, ultrasonic, etc.
+                processed_data = data
+            
+            if processed_data is not None:
+                # Assign the single data point, not a list
+                data_packet[name] = processed_data
+
+        debug_packet = data_packet.copy()
+        for key, value in debug_packet.items():
+            if isinstance(value, str) and len(value) > 100: # Check for single long strings
+                debug_packet[key] = f"<base64 data len:{len(value)}>"
+
+        print("--- Sending JSON Packet (Frame {}) ---".format(data_packet.get('frame', 'N/A')))
+        print(json.dumps(debug_packet, indent=4))
+        print("--------------------------------------")
+
         self.udp_sender.send(data_packet)
 
     def _cleanup(self):
@@ -590,8 +615,30 @@ class CarlaSimulation:
         return state
 
     def _get_environmental_data(self) -> Dict[str, Any]:
+        """Manually constructs the weather dictionary from object properties."""
         weather = self.world.get_weather()
-        return {'map': self.world.get_map().name, 'weather': {k:v for k,v in vars(weather).items() if not k.startswith('_')}, 'timestamp': self.world.get_snapshot().timestamp.elapsed_seconds}
+        
+        weather_dict = {
+            'cloudiness': weather.cloudiness,
+            'precipitation': weather.precipitation,
+            'precipitation_deposits': weather.precipitation_deposits,
+            'wind_intensity': weather.wind_intensity,
+            'sun_azimuth_angle': weather.sun_azimuth_angle,
+            'sun_altitude_angle': weather.sun_altitude_angle,
+            'fog_density': weather.fog_density,
+            'fog_distance': weather.fog_distance,
+            'wetness': weather.wetness,
+            'fog_falloff': weather.fog_falloff,
+            'scattering_intensity': weather.scattering_intensity,
+            'mie_scattering_scale': weather.mie_scattering_scale,
+            'rayleigh_scattering_scale': weather.rayleigh_scattering_scale,
+        }
+        
+        return {
+            'map': self.world.get_map().name, 
+            'weather': weather_dict, 
+            'timestamp': self.world.get_snapshot().timestamp.elapsed_seconds
+        }
 
 # ==============================================================================
 # -- Main Execution ------------------------------------------------------------
