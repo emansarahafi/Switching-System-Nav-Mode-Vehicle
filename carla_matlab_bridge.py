@@ -12,8 +12,7 @@ import socket
 import json
 import base64
 import csv
-import gzip  # Replaced zlib
-import binascii  # Added for crc32 calculation
+import binascii
 from queue import Queue, Empty
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -185,7 +184,6 @@ class HUD:
                     current_x += sep_surface.get_width()
             y_offset += 20
 
-
     def _render_help_text(self, display: pygame.Surface):
         help_text = [
             "W/S: Throttle/Brake", "A/D: Steer Left/Right", "Q: Toggle Reverse", "Space: Hand Brake",
@@ -331,24 +329,24 @@ class DisplayManager:
         return self.display
 
 class UDPDataSender:
-    """Handles data compression, chunking, and sending over UDP."""
+    """Handles data chunking and sending over UDP without compression."""
     def __init__(self, ip: str = '127.0.0.1', port: int = 10000, chunk_size: int = 60000):
         self.ip = ip; self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.max_packet_size = chunk_size
         json_wrapper_overhead = 200
+        # The chunk size for the data must account for base64's overhead (approx 4/3 size)
         self.max_data_chunk_size = int((self.max_packet_size - json_wrapper_overhead) * 3 / 4)
-        print(f"UDP data sender initialized for {ip}:{port}. Max chunk size: {self.max_data_chunk_size} bytes.")
+        print(f"UDP sender initialized. Target packet size: {self.max_packet_size}. Max raw data per chunk: {self.max_data_chunk_size} bytes.")
 
     def send(self, data: Dict[str, Any]):
         try:
             json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-            # Use binascii for crc32 calculation
             data['_crc32'] = binascii.crc32(json_str.encode('utf-8'))
             
             final_json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-            # Use gzip for compression
-            full_payload_bytes = gzip.compress(final_json_str.encode('utf-8'))
+            # The payload is now just the encoded JSON string. No compression.
+            full_payload_bytes = final_json_str.encode('utf-8')
             
             frame_id = data.get('frame', -1)
             chunks = [full_payload_bytes[i:i + self.max_data_chunk_size] for i in range(0, len(full_payload_bytes), self.max_data_chunk_size)]
@@ -356,13 +354,13 @@ class UDPDataSender:
             if not chunks: chunks.append(b'')
             
             for i, chunk in enumerate(chunks):
+                # Data is still base64 encoded for safe transport within the JSON wrapper.
                 packet = {'frame': frame_id, 'chunk': i, 'total_chunks': len(chunks), 'data': base64.b64encode(chunk).decode('utf-8')}
                 self.sock.sendto(json.dumps(packet).encode('utf-8'), (self.ip, self.port))
         except Exception as e:
             print(f"UDP send error: {e}\n{traceback.format_exc()}")
 
     def close(self): self.sock.close()
-
 
 # ==============================================================================
 # -- CarlaSimulation Class -----------------------------------------------------
@@ -406,7 +404,8 @@ class CarlaSimulation:
         self.display_manager = DisplayManager(grid_size=(GRID_COLS, GRID_ROWS))
         self.hud = HUD(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.controller = KeyboardController(self)
-        self.udp_sender = UDPDataSender()
+        # --- THE FIX: Use a smaller, safer chunk size to avoid OS buffer errors ---
+        self.udp_sender = UDPDataSender(chunk_size=32768)  # Using 32KB packets
         self.image_saver = ImageSaver(); self.image_saver.start()
         self._setup_actors_and_sensors()
         self.kalman_filter = KalmanFilterSystem(dt=1.0/TICK_RATE)
@@ -510,7 +509,6 @@ class CarlaSimulation:
         t = self.vehicle.get_transform()
         v = self.vehicle.get_velocity()
         
-        # This remains the same - it's the critical health information
         sensor_health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
 
         data_packet = {
@@ -524,7 +522,6 @@ class CarlaSimulation:
             'sensor_health': sensor_health_data
         }
         
-        # Iterate through sensors but ONLY process and send data from the primary one [0]
         for name, sensor_list in self.sensors.items():
             if sensor_list[0].sensor_type in ['COLLISION', 'LANE_INVASION']: 
                 continue
@@ -545,16 +542,15 @@ class CarlaSimulation:
                 processed_data = {'accelerometer': {'x': data.accelerometer.x, 'y': data.accelerometer.y, 'z': data.accelerometer.z}, 'gyroscope': {'x': data.gyroscope.x, 'y': data.gyroscope.y, 'z': data.gyroscope.z}, 'compass': data.compass}
             elif primary_sensor.sensor_type == 'GNSS': 
                 processed_data = {'latitude': data.latitude, 'longitude': data.longitude, 'altitude': data.altitude}
-            else: # Catches RADAR, ultrasonic, etc.
+            else: 
                 processed_data = data
             
             if processed_data is not None:
-                # Assign the single data point, not a list
                 data_packet[name] = processed_data
 
         debug_packet = data_packet.copy()
         for key, value in debug_packet.items():
-            if isinstance(value, str) and len(value) > 100: # Check for single long strings
+            if isinstance(value, str) and len(value) > 100:
                 debug_packet[key] = f"<base64 data len:{len(value)}>"
 
         print("--- Sending JSON Packet (Frame {}) ---".format(data_packet.get('frame', 'N/A')))
@@ -618,9 +614,7 @@ class CarlaSimulation:
         return state
 
     def _get_environmental_data(self) -> Dict[str, Any]:
-        """Manually constructs the weather dictionary from object properties."""
         weather = self.world.get_weather()
-        
         weather_dict = {
             'cloudiness': weather.cloudiness,
             'precipitation': weather.precipitation,
@@ -636,7 +630,6 @@ class CarlaSimulation:
             'mie_scattering_scale': weather.mie_scattering_scale,
             'rayleigh_scattering_scale': weather.rayleigh_scattering_scale,
         }
-        
         return {
             'map': self.world.get_map().name, 
             'weather': weather_dict, 

@@ -98,8 +98,11 @@ disp('Dashboard closed. Shutting down...');
                 if nnz(~cellfun('isempty', chunkBuffer.chunks)) == chunkBuffer.total_chunks
                     try
                         fullPayload = [chunkBuffer.chunks{:}];
-                        decompressedData = gunzip_matlab(fullPayload);
-                        finalData = jsondecode(char(decompressedData'));
+                        
+                        % --- MODIFIED: Decompression is no longer needed ---
+                        % The fullPayload is now the raw JSON bytes.
+                        finalData = jsondecode(char(fullPayload')); % Directly decode the payload
+                        
                         latestData = finalData;
                         newDataAvailable = true;
                         chunkBuffer = struct('frame', -1, 'chunks', {{}}, 'total_chunks', 0);
@@ -203,7 +206,6 @@ uilabel(g_diag_metrics,'Text','Fallback:'); uiHandles.fuzzyFallbackLabel=uilabel
 uilabel(g_diag_metrics,'Text','Driver Ready:'); uiHandles.fuzzyReadinessLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
 p_ctrl=uipanel(g_diag,'Title',''); p_ctrl.Layout.Row=2;
 g_ctrl=uigridlayout(p_ctrl,[1 2],'Padding',5);
-% --- FINAL FIX: Buttons with text only, no icons ---
 uiHandles.pauseButton=uibutton(g_ctrl,'Text','Pause');
 uiHandles.saveButton=uibutton(g_ctrl,'Text','Save Snapshot');
 uiHandles.pauseButton.ButtonPushedFcn=@(src,~)pauseCallback(src,uiHandles);
@@ -241,44 +243,44 @@ end
 % -- DASHBOARD UPDATE FUNCTION -------------------------------------------------
 % ==============================================================================
 function updateDashboard(uiHandles, data, historyLength, lidarRange, trailLength)
-persistent accelHistory gnssHistory trajHistory;
-if isempty(accelHistory)
-    accelHistory=nan(historyLength,3); gnssHistory=nan(historyLength,2); trajHistory=nan(trailLength,2);
-end
-
-uiHandles.speedGauge.Value = data.speed;
-try_imshow(uiHandles.camFrontAx,data,'cam_front'); try_imshow(uiHandles.camRearAx,data,'cam_rear');
-try_imshow(uiHandles.camLeftAx,data,'cam_left'); try_imshow(uiHandles.camRightAx,data,'cam_right');
-try_imshow(uiHandles.camInteriorAx,data,'cam_interior');
-accelHistory=[accelHistory(2:end,:); [data.imu.accelerometer.x,data.imu.accelerometer.y,data.imu.accelerometer.z]];
-set(uiHandles.accelXPlot,'YData',accelHistory(:,1)); set(uiHandles.accelYPlot,'YData',accelHistory(:,2)); set(uiHandles.accelZPlot,'YData',accelHistory(:,3));
-set(uiHandles.imuAx,'XLim',[0 historyLength]);
-gnssHistory=[gnssHistory(2:end,:); [data.gnss.longitude, data.gnss.latitude]];
-set(uiHandles.gnssPlot,'XData',gnssHistory(:,1),'YData',gnssHistory(:,2));
-uiHandles.frameLabel.Text=num2str(data.frame);
-uiHandles.latencyLabel.Text=sprintf('%.1f ms',data.networkLatency*1000);
-uiHandles.fuzzyFusionLabel.Text=num2str(data.sensorFusionStatus);
-uiHandles.fuzzyFallbackLabel.Text=num2str(data.fallbackInitiation);
-uiHandles.fuzzyReadinessLabel.Text=num2str(data.driverReadiness);
-
-try
-    if isfield(data,'lidar') && ~isempty(data.lidar)
-        raw_points=typecast(base64decode(data.lidar),'single');
-        points=reshape(raw_points,3,[])';
-        set(uiHandles.lidarPlot,'XData',points(:,1),'YData',points(:,2),'ZData',points(:,3),'CData',points(:,3));
-        axis(uiHandles.lidarAx,[-lidarRange lidarRange -lidarRange lidarRange -5 lidarRange/2]);
-        colormap(uiHandles.lidarAx,'jet'); clim(uiHandles.lidarAx,[-2, 5]);
+    persistent accelHistory gnssHistory trajHistory;
+    if isempty(accelHistory)
+        accelHistory=nan(historyLength,3); gnssHistory=nan(historyLength,2); trajHistory=nan(trailLength,2);
     end
-catch ME, logMessage(uiHandles,['LiDAR plot error: ' ME.message],'ERROR',evalin('base','MAX_LOG_LINES')); 
-end
 
-newPos=[data.position.x,data.position.y];
-trajHistory=[trajHistory(2:end,:); newPos];
-set(uiHandles.trajPlot,'XData',trajHistory(:,1),'YData',trajHistory(:,2));
-set(uiHandles.currentPosPlot,'XData',newPos(1),'YData',newPos(2));
-if ~any(isnan(trajHistory(:))), axis(uiHandles.trajAx,[min(trajHistory(:,1))-10,max(trajHistory(:,1))+10,min(trajHistory(:,2))-10,max(trajHistory(:,2))+10]); end
+    uiHandles.speedGauge.Value = data.speed;
+    try_imshow(uiHandles.camFrontAx,data,'cam_front'); try_imshow(uiHandles.camRearAx,data,'cam_rear');
+    try_imshow(uiHandles.camLeftAx,data,'cam_left'); try_imshow(uiHandles.camRightAx,data,'cam_right');
+    try_imshow(uiHandles.camInteriorAx,data,'cam_interior');
+    accelHistory=[accelHistory(2:end,:); [data.imu.accelerometer.x,data.imu.accelerometer.y,data.imu.accelerometer.z]];
+    set(uiHandles.accelXPlot,'YData',accelHistory(:,1)); set(uiHandles.accelYPlot,'YData',accelHistory(:,2)); set(uiHandles.accelZPlot,'YData',accelHistory(:,3));
+    set(uiHandles.imuAx,'XLim',[0 historyLength]);
+    gnssHistory=[gnssHistory(2:end,:); [data.gnss.longitude, data.gnss.latitude]];
+    set(uiHandles.gnssPlot,'XData',gnssHistory(:,1),'YData',gnssHistory(:,2));
+    uiHandles.frameLabel.Text=num2str(data.frame);
+    uiHandles.latencyLabel.Text=sprintf('%.1f ms',data.networkLatency*1000);
+    uiHandles.fuzzyFusionLabel.Text=num2str(data.sensorFusionStatus);
+    uiHandles.fuzzyFallbackLabel.Text=num2str(data.fallbackInitiation);
+    uiHandles.fuzzyReadinessLabel.Text=num2str(data.driverReadiness);
 
-drawnow limitrate;
+    try
+        if isfield(data,'lidar') && ~isempty(data.lidar)
+            raw_points=typecast(base64decode(data.lidar),'single');
+            points=reshape(raw_points,3,[])';
+            set(uiHandles.lidarPlot,'XData',points(:,1),'YData',points(:,2),'ZData',points(:,3),'CData',points(:,3));
+            axis(uiHandles.lidarAx,[-lidarRange lidarRange -lidarRange lidarRange -5 lidarRange/2]);
+            colormap(uiHandles.lidarAx,'jet'); clim(uiHandles.lidarAx,[-2, 5]);
+        end
+    catch ME, logMessage(uiHandles,['LiDAR plot error: ' ME.message],'ERROR',evalin('base','MAX_LOG_LINES')); 
+    end
+
+    newPos=[data.position.x,data.position.y];
+    trajHistory=[trajHistory(2:end,:); newPos];
+    set(uiHandles.trajPlot,'XData',trajHistory(:,1),'YData',trajHistory(:,2));
+    set(uiHandles.currentPosPlot,'XData',newPos(1),'YData',newPos(2));
+    if ~any(isnan(trajHistory(:))), axis(uiHandles.trajAx,[min(trajHistory(:,1))-10,max(trajHistory(:,1))+10,min(trajHistory(:,2))-10,max(trajHistory(:,2))+10]); end
+
+    drawnow limitrate;
 end
 
 % ==============================================================================
@@ -323,12 +325,7 @@ function try_imshow(ax, data, field)
     end
 end
 
-function out=gunzip_matlab(in)
-import java.io.ByteArrayInputStream java.io.ByteArrayOutputStream java.util.zip.GZIPInputStream
-inStream=GZIPInputStream(ByteArrayInputStream(in)); outStream=ByteArrayOutputStream(); buffer=javaArray('int8',1024);
-while true, numRead=inStream.read(buffer); if numRead==-1, break; end, outStream.write(buffer,0,numRead); end
-out=typecast(outStream.toByteArray(),'uint8');
-end
+% --- REMOVED: gunzip_matlab is no longer needed ---
 
 function cleanup(udpPort, uiHandles)
 disp('Cleaning up resources...');
