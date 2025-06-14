@@ -318,7 +318,7 @@ end
 
 function try_imshow(ax, data, field)
     if isfield(data,field) && ~isempty(data.(field))
-        try, imshow(imdecode(base64decode(data.(field)),'jpg'),'Parent',ax); catch, cla(ax); text(ax,0.5,0.5,'Img Error','Color','r','HA','center','FontSize',14); end
+        try imshow(imdecode(base64decode(data.(field)),'jpg'),'Parent',ax); catch, cla(ax); text(ax,0.5,0.5,'Img Error','Color','r','HA','center','FontSize',14); end
     else, cla(ax); text(ax,0.5,0.5,'No Img Data','Color','y','HA','center','FontSize',14); 
     end
 end
