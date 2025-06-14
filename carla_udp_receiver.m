@@ -99,7 +99,6 @@ disp('Dashboard closed. Shutting down...');
                     try
                         fullPayload = [chunkBuffer.chunks{:}];
                         
-                        % --- MODIFIED: Decompression is no longer needed ---
                         % The fullPayload is now the raw JSON bytes.
                         finalData = jsondecode(char(fullPayload')); % Directly decode the payload
                         
@@ -265,11 +264,19 @@ function updateDashboard(uiHandles, data, historyLength, lidarRange, trailLength
 
     try
         if isfield(data,'lidar') && ~isempty(data.lidar)
+            % CORRECTED: LiDAR data is an array of [X, Y, Z, Intensity] floats (4 per point)
             raw_points=typecast(base64decode(data.lidar),'single');
-            points=reshape(raw_points,3,[])';
-            set(uiHandles.lidarPlot,'XData',points(:,1),'YData',points(:,2),'ZData',points(:,3),'CData',points(:,3));
+            % Reshape into an Nx4 matrix instead of Nx3
+            points=reshape(raw_points,4,[])';
+            
+            % CORRECTED: Plot X,Y,Z and use the 4th column (Intensity) for color
+            set(uiHandles.lidarPlot,'XData',points(:,1),'YData',points(:,2),'ZData',points(:,3),'CData',points(:,4));
+            
             axis(uiHandles.lidarAx,[-lidarRange lidarRange -lidarRange lidarRange -5 lidarRange/2]);
-            colormap(uiHandles.lidarAx,'jet'); clim(uiHandles.lidarAx,[-2, 5]);
+            colormap(uiHandles.lidarAx,'jet'); 
+            
+            % CORRECTED: Set color limits based on intensity (typically 0.0 to 1.0)
+            clim(uiHandles.lidarAx,[0, 1.0]);
         end
     catch ME, logMessage(uiHandles,['LiDAR plot error: ' ME.message],'ERROR',evalin('base','MAX_LOG_LINES')); 
     end
@@ -324,8 +331,6 @@ function try_imshow(ax, data, field)
     else, cla(ax); text(ax,0.5,0.5,'No Img Data','Color','y','HA','center','FontSize',14); 
     end
 end
-
-% --- REMOVED: gunzip_matlab is no longer needed ---
 
 function cleanup(udpPort, uiHandles)
 disp('Cleaning up resources...');
