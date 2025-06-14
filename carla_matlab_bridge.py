@@ -12,7 +12,8 @@ import socket
 import json
 import base64
 import csv
-import zlib
+import gzip  # Replaced zlib
+import binascii  # Added for crc32 calculation
 from queue import Queue, Empty
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -342,10 +343,12 @@ class UDPDataSender:
     def send(self, data: Dict[str, Any]):
         try:
             json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-            data['_crc32'] = zlib.crc32(json_str.encode('utf-8'))
+            # Use binascii for crc32 calculation
+            data['_crc32'] = binascii.crc32(json_str.encode('utf-8'))
             
             final_json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-            full_payload_bytes = zlib.compress(final_json_str.encode('utf-8'))
+            # Use gzip for compression
+            full_payload_bytes = gzip.compress(final_json_str.encode('utf-8'))
             
             frame_id = data.get('frame', -1)
             chunks = [full_payload_bytes[i:i + self.max_data_chunk_size] for i in range(0, len(full_payload_bytes), self.max_data_chunk_size)]

@@ -1,1446 +1,342 @@
-function carla_udp_receiver(port)
-    % Global output declaration with enhanced fields for BBNA
-    global carla_outputs;
-    carla_outputs = struct(...
-        'network_status', [], ...
-        'sensor_fusion_status', [], ...
-        'processed_sensor_data', struct(...
-            'fused_state', [], ...
-            'sensor_health', [], ...
-            'environment', [], ...
-            'attention', [], ...
-            'image_features', []), ...
-        'fallback_initiation', false ...
-    );
-    
-    % Enhanced CARLA UDP receiver with Sensor Processing Block
-    if nargin < 1
-        port = 10000;
-    end
-    
-    fprintf('[STATUS] Starting CARLA receiver on port %d...\n', port);
-    
-    % UDP setup with timeout handling
-    try
-        u = udpport("IPV4", "LocalHost", "127.0.0.1", "LocalPort", port, ...
-                    "Timeout", 10, "EnablePortSharing", true);
-        u.InputBufferSize = 1000000;
-    catch ME
-        fprintf('[ERROR] UDP setup failed: %s\n', ME.message);
-        fprintf('>> Check port availability with: netstat -an | findstr :%d\n', port);
-        fprintf('>> Try different port number if necessary\n');
-        return;
-    end
-    
-    % Create main figure with diagnostics panel
-    fig = figure('Name', 'CARLA Diagnostics', 'NumberTitle', 'off', ...
-                 'Position', [100, 100, 1400, 900], 'DeleteFcn', @(src,event)close_receiver(u));
-    
-    % Create diagnostic console
-    diag_panel = uipanel(fig, 'Title', 'Diagnostics', 'Position', [0.01 0.01 0.98 0.20]);
-    diag_text = uicontrol(diag_panel, 'Style', 'edit', 'Max', 10, 'Min', 0, ...
-                          'HorizontalAlignment', 'left', ...
-                          'Position', [10, 10, 1350, 140], 'String', 'Initializing...', ...
-                          'FontName', 'Consolas', 'FontSize', 9);
-    
-    % Create axes for trajectory plot
-    ax_traj = subplot(3,3,1, 'Parent', fig);
-    hold(ax_traj, 'on');
-    grid(ax_traj, 'on');
-    xlabel(ax_traj, 'X Position (m)');
-    ylabel(ax_traj, 'Y Position (m)');
-    title(ax_traj, 'Vehicle Trajectory');
-    
-    % Create axes for camera images
-    ax_front = subplot(3,3,2, 'Parent', fig);
-    title(ax_front, 'Front Camera');
-    axis(ax_front, 'off');
-    
-    ax_back = subplot(3,3,3, 'Parent', fig);
-    title(ax_back, 'Back Camera');
-    axis(ax_back, 'off');
-    
-    ax_left = subplot(3,3,4, 'Parent', fig);
-    title(ax_left, 'Left Camera');
-    axis(ax_left, 'off');
-    
-    ax_right = subplot(3,3,5, 'Parent', fig);
-    title(ax_right, 'Right Camera');
-    axis(ax_right, 'off');
-    
-    % Create axes for LIDAR point cloud
-    ax_lidar = subplot(3,3,6, 'Parent', fig);
-    title(ax_lidar, 'LIDAR Point Cloud');
-    axis(ax_lidar, 'equal');
-    grid(ax_lidar, 'on');
-    xlabel(ax_lidar, 'X (m)');
-    ylabel(ax_lidar, 'Y (m)');
-    zlabel(ax_lidar, 'Z (m)');
-    
-    % Create axes for sensor data plots
-    ax_imu = subplot(3,3,7, 'Parent', fig);
-    title(ax_imu, 'IMU Data');
-    xlabel(ax_imu, 'Time');
-    ylabel(ax_imu, 'Acceleration (m/s²)');
-    grid(ax_imu, 'on');
-    
-    ax_gnss = subplot(3,3,8, 'Parent', fig);
-    title(ax_gnss, 'GNSS Track');
-    xlabel(ax_gnss, 'Longitude');
-    ylabel(ax_gnss, 'Latitude');
-    grid(ax_gnss, 'on');
-    
-    ax_speed = subplot(3,3,9, 'Parent', fig);
-    title(ax_speed, 'Vehicle Speed');
-    xlabel(ax_speed, 'Time (s)');
-    ylabel(ax_speed, 'Speed (km/h)');
-    grid(ax_speed, 'on');
-    
-    % Initialize data storage
-    trajectory = [];
-    gnss_track = [];
-    imu_history = [];
-    speed_history = [];
-    time_history = [];
-    last_plot_update = tic;
-    last_diag_update = tic;
-    buffer = '';
-    frame_data = struct();
-    connection_active = false;
-    bytes_received = 0;
-    messages_received = 0;
-    last_message_time = tic;
-    start_time = tic;
-    
-    % Data buffers for chunked transmission
-    chunkBuffer = containers.Map('KeyType', 'double', 'ValueType', 'any');
-    
-    % Create data directories
-    data_dir = 'matlab_data';
-    frames_dir = fullfile(data_dir, 'frames');
-    if ~exist(data_dir, 'dir')
-        mkdir(data_dir);
-        log_diag(diag_text, sprintf('Created data directory: %s', data_dir));
-    end
-    if ~exist(frames_dir, 'dir')
-        mkdir(frames_dir);
-        log_diag(diag_text, sprintf('Created frames directory: %s', frames_dir));
-    end
-    
-    % Create CSV log file
-    log_file = fullfile(data_dir, 'vehicle_data.csv');
-    log_fid = fopen(log_file, 'w');
-    if log_fid == -1
-        log_diag(diag_text, sprintf('[ERROR] Failed to create log file: %s', log_file));
-    else
-        fprintf(log_fid, 'timestamp,frame,speed,x,y,z,yaw,pitch,roll,throttle,steer,brake,gnss_lat,gnss_lon,gnss_alt\n');
-    end
-    
-    % Initialize Kalman Filter state
-    ekf_state = zeros(6,1); % [x; y; z; vx; vy; vz]
-    ekf_covariance = eye(6)*10;
-    
-    % Main processing loop
-    try
-        log_diag(diag_text, 'Waiting for CARLA data...');
-        log_diag(diag_text, sprintf('Listening on 127.0.0.1:%d', port));
-        log_diag(diag_text, '>> Check CARLA client configuration');
-        log_diag(diag_text, '>> Verify matching port in Python script');
-        
-        while ishandle(fig)
-            % Initialize image_features for this iteration
-            image_features = struct();
+function carla_udp_receiver()
+% CARLA_UDP_RECEIVER - The definitive, feature-complete dashboard for CARLA,
+% with a robust, pixel-perfect layout, 3D plots, dynamic graphs, user controls,
+% and an integrated system log for MATLAB errors and warnings.
 
-            % Check for data
-            if u.NumBytesAvailable > 0
-                % Read as bytes
-                byteData = read(u, u.NumBytesAvailable, "uint8");
-                bytes_received = bytes_received + numel(byteData);
+% ==============================================================================
+% -- Configuration -------------------------------------------------------------
+% ==============================================================================
+UDP_PORT = 10000;
+DATA_FOLDER = 'matlab_data';
+LIDAR_PLOT_RANGE = 50;
+GRAPH_HISTORY_LENGTH = 100;
+TRAIL_LENGTH = 200;
+MAX_LOG_LINES = 100; % Max number of lines to keep in the UI log
+
+% ==============================================================================
+% -- Initialization & Main Loop ------------------------------------------------
+% ==============================================================================
+udpPort = []; uiHandles = [];
+if ~exist(DATA_FOLDER, 'dir'), mkdir(DATA_FOLDER); end
+
+latestData = []; 
+newDataAvailable = false;
+chunkBuffer = struct('frame', -1, 'chunks', {{}}, 'total_chunks', 0);
+
+try
+    [uiHandles] = setupDashboard(GRAPH_HISTORY_LENGTH);
+catch ME
+    fprintf(2, 'FATAL: Error setting up the dashboard: %s\n', ME.message);
+    fprintf(2, 'In file: %s, at line: %d\n', ME.stack(1).file, ME.stack(1).line);
+    return;
+end
+
+fprintf('Starting UDP receiver on port %d...\n', UDP_PORT);
+try
+    udpPort = udpport("LocalPort", UDP_PORT, "Timeout", 1);
+    configureCallback(udpPort, "terminator", @readUDPCb);
+    logMessage(uiHandles, 'UDP receiver started successfully.', 'INFO', MAX_LOG_LINES);
+catch ME
+    logMessage(uiHandles, ['UDP port initialization failed: ' ME.message], 'ERROR', MAX_LOG_LINES);
+    cleanup(udpPort, uiHandles); return;
+end
+
+cleanupObj = onCleanup(@() cleanup(udpPort, uiHandles));
+
+% --- Main Loop ---
+isPaused = false;
+lastWarningMessage = '';
+while ishandle(uiHandles.fig)
+    if newDataAvailable
+        if ~isPaused
+            try
+                processedData = preprocessData(latestData);
+                updateDashboard(uiHandles, processedData, GRAPH_HISTORY_LENGTH, LIDAR_PLOT_RANGE, TRAIL_LENGTH);
                 
-                % Convert to UTF-8 string
-                try
-                    newData = native2unicode(byteData, 'UTF-8');
-                catch
-                    newData = char(byteData);  % Fallback for encoding issues
+                fileName = fullfile(DATA_FOLDER, sprintf('frame_%08d.mat', processedData.frame));
+                save(fileName, 'processedData');
+            catch ME
+                logMessage(uiHandles, ['Error during main update: ' ME.message], 'ERROR', MAX_LOG_LINES);
+            end
+        end
+        newDataAvailable = false;
+    end
+    
+    [msg, ~] = lastwarn;
+    if ~isempty(msg) && ~strcmp(msg, lastWarningMessage)
+        logMessage(uiHandles, msg, 'WARNING', MAX_LOG_LINES);
+        lastWarningMessage = msg;
+    end
+
+    uiHandles.isPaused = isPaused;
+    pause(0.01);
+end
+disp('Dashboard closed. Shutting down...');
+
+% ==============================================================================
+% -- NESTED CALLBACK FUNCTION --------------------------------------------------
+% ==============================================================================
+    function readUDPCb(src, ~)
+        try
+            if src.NumBytesAvailable > 0
+                rawData = read(src, src.NumBytesAvailable, "uint8");
+                packet = jsondecode(char(rawData'));
+                
+                if packet.frame ~= chunkBuffer.frame
+                    chunkBuffer.frame = packet.frame;
+                    chunkBuffer.total_chunks = packet.total_chunks;
+                    chunkBuffer.chunks = cell(1, packet.total_chunks);
                 end
                 
-                buffer = [buffer, newData];
-                connection_active = true;
-                last_message_time = tic;
+                try
+                    chunk_index = packet.chunk + 1;
+                    chunkBuffer.chunks{chunk_index} = base64decode(packet.data);
+                catch
+                    logMessage(uiHandles, 'Base64 decoding failed for a chunk.', 'WARNING', MAX_LOG_LINES); return;
+                end
                 
-                % Process complete JSON messages
-                while ~isempty(buffer)
-                    [jsonStr, buffer] = extractJSON(buffer);
-                    
-                    if isempty(jsonStr)
-                        break;
-                    end
-                    
+                if nnz(~cellfun('isempty', chunkBuffer.chunks)) == chunkBuffer.total_chunks
                     try
-                        packet = jsondecode(jsonStr);
-                        messages_received = messages_received + 1;
-                        
-                        % Debug: Log the structure of received data
-                        if messages_received <= 5  % Only log first few messages
-                            log_diag(diag_text, sprintf('[DEBUG] Packet fields: %s', strjoin(fieldnames(packet), ', ')));
-                            if length(jsonStr) <= 200
-                                log_diag(diag_text, sprintf('[DEBUG] Raw JSON: %s', jsonStr));
-                            else
-                                log_diag(diag_text, sprintf('[DEBUG] Raw JSON preview: %s...', jsonStr(1:200)));
-                            end
-                        end
-                        
-                        % Handle chunked data
-                        if isfield(packet, 'chunk')
-                            % FIXED: Enhanced frame identifier handling
-                            if isfield(packet, 'frame')  % Primary field from Python
-                                frameId = packet.frame;
-                            elseif isfield(packet, 'frame_id')  % Alternative field names
-                                frameId = packet.frame_id;
-                            elseif isfield(packet, 'frameId')
-                                frameId = packet.frameId;
-                            else
-                                % Diagnostic log with available fields
-                                availableFields = fieldnames(packet);
-                                log_diag(diag_text, sprintf(...
-                                    '[ERROR] Chunked packet missing frame identifier. Available fields: %s', ...
-                                    strjoin(availableFields, ', ')...
-                                ));
-                                continue;
-                            end
-                            
-                            % Initialize buffer for new frame
-                            if ~isKey(chunkBuffer, frameId)
-                                chunkBuffer(frameId) = struct(...
-                                    'chunks', {cell(1, packet.total_chunks)}, ...
-                                    'total_chunks', packet.total_chunks, ...
-                                    'received_chunks', 0);
-                            end
-                            
-                            % Store chunk (MATLAB uses 1-based indexing)
-                            chunkData = chunkBuffer(frameId);
-                            if isempty(chunkData.chunks{packet.chunk + 1})
-                                chunkData.chunks{packet.chunk + 1} = packet.data;
-                                chunkData.received_chunks = chunkData.received_chunks + 1;
-                                chunkBuffer(frameId) = chunkData;
-                            end
-                            
-                            % Check if all chunks received
-                            if chunkData.received_chunks == packet.total_chunks
-                                % Reassemble data
-                                fullData = strjoin(chunkData.chunks, '');
-                                try
-                                    reconstructedData = jsondecode(fullData);
-                                    processCompleteFrame(reconstructedData, log_fid, diag_text);
-                                    frame_data = reconstructedData;
-                                catch ME
-                                    log_diag(diag_text, sprintf('[ERROR] Chunk assembly failed: %s', ME.message));
-                                end
-                                remove(chunkBuffer, frameId);
-                            end
-                        else
-                            % Process complete frame directly - handle different field name variations
-                            processCompleteFrame(packet, log_fid, diag_text);
-                            frame_data = packet;
-                        end
-                        
+                        fullPayload = [chunkBuffer.chunks{:}];
+                        decompressedData = gunzip_matlab(fullPayload);
+                        finalData = jsondecode(char(decompressedData'));
+                        latestData = finalData;
+                        newDataAvailable = true;
+                        chunkBuffer = struct('frame', -1, 'chunks', {{}}, 'total_chunks', 0);
                     catch ME
-                        log_diag(diag_text, sprintf('[ERROR] JSON processing: %s', ME.message));
-                        if length(jsonStr) > 100
-                            log_diag(diag_text, sprintf('Message preview: %s...', jsonStr(1:100)));
-                        else
-                            log_diag(diag_text, sprintf('Message: %s', jsonStr));
-                        end
+                        logMessage(uiHandles, ['Frame ' num2str(chunkBuffer.frame) ' Error: ' ME.message], 'ERROR', MAX_LOG_LINES);
+                        chunkBuffer = struct('frame', -1, 'chunks', {{}}, 'total_chunks', 0);
                     end
                 end
             end
-            
-            % Update data histories for plotting
-            if ~isempty(frame_data)
-                current_time = toc(start_time);
-                
-                % Update trajectory (handle different field name patterns)
-                position_data = [];
-                if isfield(frame_data, 'position')
-                    position_data = frame_data.position;
-                elseif isfield(frame_data, 'location')
-                    position_data = frame_data.location;
-                elseif isfield(frame_data, 'transform') && isfield(frame_data.transform, 'location')
-                    position_data = frame_data.transform.location;
-                end
-                
-                if ~isempty(position_data)
-                    trajectory = [trajectory; [position_data.x, position_data.y]];
-                    if size(trajectory, 1) > 1000  % Limit trajectory points
-                        trajectory = trajectory(end-999:end, :);
-                    end
-                end
-                
-                % Update GNSS track
-                if isfield(frame_data, 'gnss')
-                    gnss_track = [gnss_track; [frame_data.gnss.lon, frame_data.gnss.lat]];
-                    if size(gnss_track, 1) > 1000
-                        gnss_track = gnss_track(end-999:end, :);
-                    end
-                end
-                
-                % Update speed history (handle different speed field patterns)
-                speed_val = [];
-                if isfield(frame_data, 'speed')
-                    speed_val = frame_data.speed;
-                elseif isfield(frame_data, 'velocity')
-                    if isstruct(frame_data.velocity)
-                        speed_val = sqrt(frame_data.velocity.x^2 + frame_data.velocity.y^2 + frame_data.velocity.z^2) * 3.6; % m/s to km/h
-                    else
-                        speed_val = frame_data.velocity;
-                    end
-                end
-                
-                if ~isempty(speed_val)
-                    speed_history = [speed_history; speed_val];
-                    time_history = [time_history; current_time];
-                    if length(speed_history) > 1000
-                        speed_history = speed_history(end-999:end);
-                        time_history = time_history(end-999:end);
-                    end
-                end
-            end
-            
-            % ==================== SENSOR PROCESSING ====================
-            if ~isempty(frame_data)
-                [fused_data, health_status, attention, env_cond, ekf_state, ekf_covariance, image_features] = ...
-                    sensorProcessingBlock(frame_data, ekf_state, ekf_covariance, diag_text);
-                
-                % Store processed outputs in frame_data
-                frame_data.fused = fused_data;
-                frame_data.health = health_status;
-                frame_data.driver_attention = attention;
-                frame_data.environment = env_cond;
-                
-                % ==================== OUTPUT GENERATION ====================
-                % 1. Network status
-                network_status = struct(...
-                    'connection_active', connection_active, ...
-                    'time_since_last_message', toc(last_message_time), ...
-                    'bytes_received', bytes_received, ...
-                    'messages_received', messages_received, ...
-                    'buffered_chunks', chunkBuffer.Count ...
-                );
-                
-                % 2. Sensor fusion status
-                sensor_fusion_status = struct(...
-                    'ekf_state', ekf_state, ...
-                    'ekf_covariance', ekf_covariance, ...
-                    'health', health_status ...
-                );
-                
-                % 3. Processed sensor data for BBNA
-                processed_sensor_data = struct(...
-                    'fused_state', fused_data, ...
-                    'sensor_health', health_status, ...
-                    'environment', env_cond, ...
-                    'attention', attention, ...
-                    'image_features', image_features ...
-                );
-                
-                % 4. Fallback initiation (decision logic)
-                fallback_initiation = false;
-                
-                % Condition 1: Network timeout
-                if connection_active && toc(last_message_time) > 5
-                    fallback_initiation = true;
-                    log_diag(diag_text, '[FALLBACK] Network timeout detected');
-                
-                % Condition 2: Critical sensor failures
-                elseif sum(~strcmp(struct2cell(health_status), 'ok')) > numel(fieldnames(health_status))/2
-                    fallback_initiation = true;
-                    log_diag(diag_text, '[FALLBACK] Critical sensor failure');
-                
-                % Condition 3: Environmental risk + low attention
-                elseif attention < 0.3 && ...
-                       (strcmp(env_cond.weather, 'rain') || ...
-                        strcmp(env_cond.weather, 'heavy rain') || ...
-                        strcmp(env_cond.weather, 'fog'))
-                    fallback_initiation = true;
-                    log_diag(diag_text, '[FALLBACK] Risky environment + low attention');
-                
-                % Condition 4: High position uncertainty
-                elseif any(diag(ekf_covariance(1:3,1:3)) > 10) % >10m variance
-                    fallback_initiation = true;
-                    log_diag(diag_text, '[FALLBACK] High position uncertainty');
-                end
-
-                % Update global outputs
-                carla_outputs = struct(...
-                    'network_status', network_status, ...
-                    'sensor_fusion_status', sensor_fusion_status, ...
-                    'processed_sensor_data', processed_sensor_data, ...
-                    'fallback_initiation', fallback_initiation ...
-                );
-            end
-            % ================================================================
-            
-            % Update diagnostics panel
-            if toc(last_diag_update) > 1.0
-                status_msg = sprintf('PORT STATUS: %d\n', port);
-                status_msg = [status_msg sprintf('Bytes received: %d\n', bytes_received)];
-                status_msg = [status_msg sprintf('Messages received: %d\n', messages_received)];
-                status_msg = [status_msg sprintf('Buffered chunks: %d\n', chunkBuffer.Count)];
-                status_msg = [status_msg sprintf('Frames saved: %d\n', messages_received)];
-                
-                if connection_active
-                    if toc(last_message_time) > 5
-                        status_msg = [status_msg 'CONNECTION: ACTIVE (NO RECENT DATA)\n'];
-                        status_msg = [status_msg '>> Check CARLA client is running\n'];
-                        status_msg = [status_msg '>> Verify data streaming in CARLA\n'];
-                    else
-                        status_msg = [status_msg 'CONNECTION: ACTIVE\n'];
-                    end
-                else
-                    status_msg = [status_msg 'CONNECTION: NO DATA RECEIVED\n'];
-                    status_msg = [status_msg '>> Verify Python client configuration\n'];
-                    status_msg = [status_msg '>> Check firewall settings\n'];
-                end
-                
-                if isfield(frame_data, 'frame') || isfield(frame_data, 'frame_id') || isfield(frame_data, 'frameId')
-                    frame_id = 0;
-                    if isfield(frame_data, 'frame')
-                        frame_id = frame_data.frame;
-                    elseif isfield(frame_data, 'frame_id')
-                        frame_id = frame_data.frame_id;
-                    elseif isfield(frame_data, 'frameId')
-                        frame_id = frame_data.frameId;
-                    end
-                    status_msg = [status_msg sprintf('Last frame: %d\n', frame_id)];
-                end
-                
-                % Display attention level if available
-                if isfield(frame_data, 'driver_attention')
-                    status_msg = [status_msg sprintf('Driver Attention: %.2f\n', frame_data.driver_attention)];
-                end
-                
-                set(diag_text, 'String', status_msg);
-                last_diag_update = tic;
-            end
-            
-            % Update plots periodically
-            if toc(last_plot_update) > 0.5
-                try
-                    % Update trajectory plot
-                    if ~isempty(trajectory)
-                        cla(ax_traj);
-                        plot(ax_traj, trajectory(:,1), trajectory(:,2), 'b-', 'LineWidth', 1.5);
-                        plot(ax_traj, trajectory(end,1), trajectory(end,2), 'ro', ...
-                             'MarkerSize', 8, 'MarkerFaceColor', 'r');
-                        xlabel(ax_traj, 'X Position (m)');
-                        ylabel(ax_traj, 'Y Position (m)');
-                        title(ax_traj, 'Vehicle Trajectory');
-                        grid(ax_traj, 'on');
-                    end
-                    
-                    % Update GNSS track
-                    if ~isempty(gnss_track)
-                        cla(ax_gnss);
-                        plot(ax_gnss, gnss_track(:,1), gnss_track(:,2), 'g-', 'LineWidth', 1.5);
-                        plot(ax_gnss, gnss_track(end,1), gnss_track(end,2), 'go', ...
-                             'MarkerSize', 8, 'MarkerFaceColor', 'g');
-                        xlabel(ax_gnss, 'Longitude');
-                        ylabel(ax_gnss, 'Latitude');
-                        title(ax_gnss, 'GNSS Track');
-                        grid(ax_gnss, 'on');
-                    end
-                    
-                    % Update speed plot
-                    if ~isempty(speed_history)
-                        cla(ax_speed);
-                        plot(ax_speed, time_history, speed_history, 'r-', 'LineWidth', 1.5);
-                        xlabel(ax_speed, 'Time (s)');
-                        ylabel(ax_speed, 'Speed (km/h)');
-                        title(ax_speed, 'Vehicle Speed');
-                        grid(ax_speed, 'on');
-                    end
-                    
-                    drawnow limitrate;
-                catch
-                    % Silently handle plot errors
-                end
-                last_plot_update = tic;
-            end
-            
-            % Update images and sensor data
-            if ~isempty(frame_data)
-                updateVisualizations(frame_data, ax_front, ax_back, ax_left, ax_right, ax_lidar, ax_imu, diag_text);
-            end
-            
-            % Check for timeout
-            if connection_active && toc(last_message_time) > 30
-                log_diag(diag_text, '[WARNING] No data for 30 seconds. Connection may be lost.');
-                connection_active = false;
-            end
-            
-            pause(0.01);
-        end
-    catch ME
-        log_diag(diag_text, sprintf('FATAL ERROR: %s', ME.message));
-        for k = 1:length(ME.stack)
-            log_diag(diag_text, sprintf('Line %d in %s', ME.stack(k).line, ME.stack(k).name));
-        end
-    end
-    
-    % Cleanup
-    close_receiver(u, log_fid);
-    log_diag(diag_text, 'Receiver shutdown complete');
-end
-
-%% ==================== SENSOR PROCESSING BLOCK ====================
-function [fused, health, attention, env_cond, new_state, new_cov, image_features] = ...
-         sensorProcessingBlock(frame, state, cov, diag_text)
-    
-    % Initialize outputs
-    fused = struct();
-    health = struct();
-    attention = 1.0; % Default: fully attentive
-    env_cond = struct('lighting', 'unknown', 'weather', 'unknown'); % Initialize to unknown
-    
-    % 1. Sensor health monitoring with field mapping
-    sensor_map = {
-        'lidar',        'lidar';
-        'imu',          'imu';
-        'gnss',         'gnss';
-        'camera_front', 'image_front';
-        'camera_rear',  'image_back';
-        'camera_left',  'image_left';
-        'camera_right', 'image_right'
-    };
-    
-    for i = 1:size(sensor_map, 1)
-        display_name = sensor_map{i,1};
-        field_name = sensor_map{i,2};
-        
-        if isfield(frame, field_name)
-            health.(display_name) = monitor_sensor_health(frame.(field_name), display_name);
-        else
-            health.(display_name) = 'missing';
-        end
-    end
-    
-    % 2. Data synchronization and timestamping
-    synced_data = synchronize_sensor_data(frame);
-    
-    % 3. Noise reduction
-    filtered = apply_noise_reduction(synced_data);
-    
-    % 4. Sensor fusion with Kalman Filter
-    [fused, new_state, new_cov] = kalman_sensor_fusion(filtered, state, cov);
-    
-    % 5. Process orientation data
-    % Initialize with NaN
-    fused.orientation = struct('yaw', NaN, 'pitch', NaN, 'roll', NaN);
-    current_orientation = [];
-
-    if isfield(filtered, 'rotation')
-        % We have a struct with yaw, pitch, roll
-        current_orientation = [filtered.rotation.yaw, filtered.rotation.pitch, filtered.rotation.roll];
-    elseif isfield(filtered, 'orientation')
-        % Similarly for 'orientation' field
-        current_orientation = [filtered.orientation.yaw, filtered.orientation.pitch, filtered.orientation.roll];
-    end
-
-    if ~isempty(current_orientation)
-        persistent prev_orientation;
-        if isempty(prev_orientation)
-            prev_orientation = current_orientation;
-        end
-        alpha = 0.3; % smoothing factor
-        filtered_orientation = alpha * current_orientation + (1-alpha) * prev_orientation;
-        prev_orientation = filtered_orientation;
-        fused.orientation = struct('yaw', filtered_orientation(1), ...
-                                   'pitch', filtered_orientation(2), ...
-                                   'roll', filtered_orientation(3));
-    end
-
-    % 6. Environmental conditions detection using CARLA environmental data
-    if isfield(frame, 'environment') && ~isempty(frame.environment)
-        env_cond = detect_environment(frame.environment);
-    end
-    
-    % 7. Driver attention estimation (if available)
-    if isfield(frame, 'camera_interior') && ~isempty(frame.camera_interior)
-        attention = estimate_attention(frame.camera_interior);
-    end
-
-    % 8. Image feature extraction for BBNA
-    image_features = struct();
-    cameras = {'front', 'back', 'left', 'right'};
-    
-    for cam = cameras
-        field_name = ['image_' cam{1}];
-        if isfield(frame, field_name) && ~isempty(frame.(field_name))
-            try
-                img_data = base64decode(frame.(field_name));
-                temp_file = [tempname '.jpg'];
-                fid = fopen(temp_file, 'wb');
-                fwrite(fid, img_data, 'uint8');
-                fclose(fid);
-                img = imread(temp_file);
-                delete(temp_file);
-                
-                % Extract features for BBNA
-                image_features.(cam{1}) = extractImageFeatures(img, cam{1});
-            catch ME
-                log_diag(diag_text, sprintf('Image processing error (%s): %s', cam{1}, ME.message));
-                image_features.(cam{1}) = struct('lane_confidence', 0, 'obstacle_density', 0);
-            end
-        else
-            image_features.(cam{1}) = struct('lane_confidence', 0, 'obstacle_density', 0);
-        end
-    end
-end
-
-%% ==================== UPDATED ENVIRONMENTAL DETECTION ====================
-function env_cond = detect_environment(env_struct)
-    % Use actual CARLA environmental data structure
-    if ~isfield(env_struct, 'weather')
-        env_cond = struct('lighting', 'unknown', 'weather', 'unknown');
-        return;
-    end
-    
-    weather_data = env_struct.weather;
-    
-    % 1. Determine lighting condition based on sun altitude
-    if isfield(weather_data, 'sun_altitude_angle')
-        if weather_data.sun_altitude_angle > 0
-            lighting_cond = 'day';
-        else
-            lighting_cond = 'night';
-        end
-    else
-        lighting_cond = 'unknown';
-    end
-    
-    % 2. Determine weather condition using CARLA weather parameters
-    if isfield(weather_data, 'precipitation') && weather_data.precipitation > 0.7
-        weather_cond = 'heavy rain';
-    elseif isfield(weather_data, 'precipitation') && weather_data.precipitation > 0.3
-        weather_cond = 'rain';
-    elseif isfield(weather_data, 'fog_density') && weather_data.fog_density > 0.7
-        weather_cond = 'thick fog';
-    elseif isfield(weather_data, 'fog_density') && weather_data.fog_density > 0.3
-        weather_cond = 'fog';
-    elseif isfield(weather_data, 'cloudiness') && weather_data.cloudiness > 0.5
-        weather_cond = 'cloudy';
-    else
-        weather_cond = 'clear';
-    end
-    
-    env_cond = struct('lighting', lighting_cond, 'weather', weather_cond);
-end
-
-%% ==================== UPDATED HEALTH MONITORING ====================
-function health = monitor_sensor_health(data, sensor_type)
-    % Check sensor data validity
-    if isempty(data)
-        health = 'missing';
-        return;
-    end
-    
-    % Extract base sensor type (remove camera position suffix)
-    base_type = regexprep(sensor_type, '^(camera|image)_.*', '$1');
-    
-    switch base_type
-        case 'lidar'
-            try
-                % Check point cloud density
-                point_count = numel(typecast(base64decode(data), 'single'))/4;
-                if point_count > 1000
-                    health = 'ok';
-                else
-                    health = 'low_density';
-                end
-            catch
-                health = 'decode_failed';
-            end
-            
-        case 'imu'
-            try
-                % Check data range validity
-                imu_vals = typecast(base64decode(data), 'single');
-                if any(abs(imu_vals(1:3)) > 20) % Acceleration check
-                    health = 'out_of_range';
-                else
-                    health = 'ok';
-                end
-            catch
-                health = 'decode_failed';
-            end
-            
-        case 'gnss'
-            try
-                % Handle both struct and numeric formats
-                if isstruct(data)
-                    % Structure format
-                    lat = data.lat;
-                    lon = data.lon;
-                elseif isnumeric(data) && numel(data) >= 2
-                    % Array format [lat, lon]
-                    lat = data(1);
-                    lon = data(2);
-                else
-                    health = 'invalid_format';
-                    return;
-                end
-                
-                % Validate coordinates
-                if abs(lat) > 90 || abs(lon) > 180
-                    health = 'invalid';
-                else
-                    health = 'ok';
-                end
-            catch
-                health = 'invalid_structure';
-            end
-            
-        case 'camera'
-            try
-                % Check image data integrity
-                img = base64decode(data);
-                if numel(img) > 1000
-                    health = 'ok';
-                else
-                    health = 'corrupted';
-                end
-            catch
-                health = 'decode_failed';
-            end
-            
-        otherwise
-            health = 'unknown_type';
-    end
-end
-
-%% ==================== HELPER FUNCTIONS ====================
-function synced = synchronize_sensor_data(frame)
-    % Simple synchronization using frame timestamp
-    synced = struct();
-    if isfield(frame, 'timestamp')
-        synced.timestamp = frame.timestamp;
-    else
-        synced.timestamp = now();
-    end
-    
-    % IMU data
-    if isfield(frame, 'imu')
-        synced.imu = frame.imu;
-    end
-    
-    % GPS data
-    if isfield(frame, 'gnss')
-        synced.gnss = [frame.gnss.lat, frame.gnss.lon, frame.gnss.alt];
-    end
-    
-    % Vehicle dynamics
-    if isfield(frame, 'speed')
-        synced.speed = frame.speed;
-    end
-    if isfield(frame, 'position')
-        synced.position = [frame.position.x, frame.position.y, frame.position.z];
-    end
-
-    % Rotation data
-    if isfield(frame, 'rotation')
-        synced.rotation = frame.rotation;
-    elseif isfield(frame, 'orientation')
-        synced.orientation = frame.orientation;
-    end
-end
-
-function filtered = apply_noise_reduction(data)
-    % Apply noise reduction techniques
-    filtered = data;
-    
-    % Low-pass filter for IMU
-    if isfield(data, 'imu')
-        persistent imu_filter_state;
-        if isempty(imu_filter_state)
-            imu_filter_state = zeros(6,1);
-        end
-        
-        try
-            imu_vals = typecast(base64decode(data.imu), 'single');
-            filtered_vals = 0.8*imu_filter_state + 0.2*imu_vals;
-            imu_filter_state = filtered_vals;
-            filtered.imu = filtered_vals;
-        catch
-            % Keep original if decoding fails
-        end
-    end
-    
-    % Moving average for GNSS
-    if isfield(data, 'gnss')
-        persistent gnss_history;
-        if isempty(gnss_history)
-            gnss_history = repmat(data.gnss, 5, 1);
-        end
-        
-        gnss_history = [data.gnss; gnss_history(1:end-1,:)];
-        filtered.gnss = mean(gnss_history, 1);
-    end
-end
-
-function [fused, new_state, new_cov] = kalman_sensor_fusion(data, state, cov)
-    % Enhanced Kalman Filter with IMU integration
-    dt = 0.1; % Time step
-    
-    % State transition matrix
-    F = [1 0 0 dt 0 0;
-         0 1 0 0 dt 0;
-         0 0 1 0 0 dt;
-         0 0 0 1 0 0;
-         0 0 0 0 1 0;
-         0 0 0 0 0 1];
-     
-    % Control input matrix (for acceleration)
-    B = [0.5*dt^2 0 0;
-         0 0.5*dt^2 0;
-         0 0 0.5*dt^2;
-         dt 0 0;
-         0 dt 0;
-         0 0 dt];
-    
-    % Initialize control input (acceleration)
-    u = zeros(3,1);
-    
-    % Use IMU if available and orientation exists
-    if isfield(data, 'imu') && isfield(data, 'orientation')
-        try
-            % Decode IMU data
-            imu_bytes = base64decode(data.imu);
-            imu_vals = typecast(imu_bytes, 'single');
-            
-            % Extract acceleration in vehicle frame (first 3 values)
-            accel_vehicle = imu_vals(1:3)';
-            
-            % Get orientation for rotation matrix
-            yaw = deg2rad(data.orientation.yaw);
-            pitch = deg2rad(data.orientation.pitch);
-            roll = deg2rad(data.orientation.roll);
-            
-            % Create rotation matrix (vehicle to global frame)
-            R = rotation_matrix(yaw, pitch, roll);
-            
-            % Transform acceleration to global frame
-            accel_global = R * accel_vehicle;
-            u = accel_global;
-        catch
-            log_diag(diag_text, 'IMU processing failed - using default');
-        end
-    end
-    
-    % Process noise
-    Q = diag([0.1, 0.1, 0.1, 0.5, 0.5, 0.5]);
-    
-    % Prediction step with IMU
-    pred_state = F * state + B * u;
-    pred_cov = F * cov * F' + Q;
-    
-    % Measurement update
-    if isfield(data, 'position') && isfield(data, 'speed') && ...
-       isfield(data, 'orientation')
-        % Position measurement
-        pos = [data.position.x; data.position.y; data.position.z];
-        
-        % Convert speed to global velocity using orientation
-        yaw = deg2rad(data.orientation.yaw);
-        vx = data.speed * cos(yaw);
-        vy = data.speed * sin(yaw);
-        vel_global = [vx; vy; 0];  % Assume minimal vertical velocity
-        
-        % Measurement vector [x, y, z, vx, vy, vz]
-        z = [pos; vel_global];
-        
-        % Measurement matrix
-        H = eye(6);
-        
-        % Measurement noise
-        R = diag([0.1, 0.1, 0.1, 0.2, 0.2, 0.1]); % Tighter position noise
-        
-        % Kalman gain
-        K = pred_cov * H' / (H * pred_cov * H' + R);
-        
-        % Update state
-        new_state = pred_state + K * (z - H * pred_state);
-        new_cov = (eye(6) - K * H) * pred_cov;
-    else
-        new_state = pred_state;
-        new_cov = pred_cov;
-    end
-    
-    % Prepare fused output
-    fused.position = new_state(1:3)';
-    fused.velocity = new_state(4:6)';
-end
-
-%% Helper function for rotation matrix
-function R = rotation_matrix(yaw, pitch, roll)
-    % Create rotation matrix from Euler angles (Z-Y-X order)
-    Rz = [cos(yaw) -sin(yaw) 0;
-          sin(yaw)  cos(yaw) 0;
-          0         0        1];
-    
-    Ry = [cos(pitch)  0  sin(pitch);
-          0           1  0;
-          -sin(pitch) 0  cos(pitch)];
-    
-    Rx = [1  0          0;
-          0  cos(roll) -sin(roll);
-          0  sin(roll)  cos(roll)];
-    
-    R = Rz * Ry * Rx;
-end
-
-function attention = estimate_attention(data_struct)
-    % Validate input structure
-    if nargin < 1 || isempty(data_struct) || ~isstruct(data_struct)
-        error('Input must be a valid data structure');
-    end
-    
-    % Initialize attention with default value (assume attentive)
-    attention = 1.0;
-    
-    try
-        % Check for required fields
-        if ~isfield(data_struct, 'speed') || ~isfield(data_struct, 'control') || ...
-           ~isfield(data_struct, 'rotation') || ~isfield(data_struct, 'collisions') || ...
-           ~isfield(data_struct, 'lane_invasions') || ~isfield(data_struct, 'environment')
-            return;
-        end
-
-        % Extract relevant data
-        speed = data_struct.speed;
-        control = data_struct.control;
-        rotation = data_struct.rotation;
-        collisions = data_struct.collisions;
-        lane_invasions = data_struct.lane_invasions;
-        weather = data_struct.environment.weather;
-
-        % 1. Control Input Analysis
-        control_active = (control.throttle > 0.1) || ...
-                         (control.brake > 0.1) || ...
-                         (abs(control.steer) > 0.05);
-        
-        % 2. Vehicle Dynamics Analysis
-        yaw_variation = abs(rotation.yaw);
-        unusual_dynamics = (yaw_variation > 15) && (yaw_variation < 345) && (speed > 5);
-        
-        % 3. Safety Events Analysis
-        recent_safety_events = (collisions > 0) || (lane_invasions > 0);
-        
-        % 4. Environmental Factors
-        bad_weather = (weather.precipitation > 30) || ...
-                      (weather.fog_density > 20) || ...
-                      (weather.wetness > 0.5);
-        
-        % Decision Logic
-        if bad_weather
-            % Higher scrutiny in poor conditions
-            if ~control_active || recent_safety_events || unusual_dynamics
-                attention = 0.4;
-            end
-        else
-            % Normal conditions
-            if (speed > 2) && ~control_active
-                attention = 0.6;  % No input while moving
-            end
-            if recent_safety_events
-                attention = max(0.3, attention - 0.3);  % Penalize for safety events
-            end
-            if unusual_dynamics
-                attention = max(0.2, attention - 0.2);  % Penalize for erratic motion
-            end
-        end
-        
-        % Ensure attention stays within [0,1] range
-        attention = min(max(attention, 0), 1);
-        
-    catch ME
-        warning('Attention estimation error: %s', char(ME.message));
-        attention = 1.0;  % Fallback to attentive
-    end
-end
-
-function processCompleteFrame(frameData, log_fid, diag_text)
-    % Process a complete frame with all sensor data - handle flexible field names
-    persistent last_print;
-    
-    if isempty(last_print)
-        last_print = tic;
-    end
-    
-    % Determine frame identifier (handle different field names)
-    frame_id = 0;
-    if isfield(frameData, 'frame')
-        frame_id = frameData.frame;
-    elseif isfield(frameData, 'frame_id')
-        frame_id = frameData.frame_id;
-    elseif isfield(frameData, 'frameId')
-        frame_id = frameData.frameId;
-    end
-    
-    % Determine timestamp
-    timestamp_val = 0;
-    if isfield(frameData, 'timestamp')
-        timestamp_val = frameData.timestamp;
-    elseif isfield(frameData, 'time')
-        timestamp_val = frameData.time;
-    else
-        timestamp_val = now();
-    end
-    
-    % Log data to CSV (only if we have position data)
-    position_data = [];
-    if isfield(frameData, 'position')
-        position_data = frameData.position;
-    elseif isfield(frameData, 'location')
-        position_data = frameData.location;
-    elseif isfield(frameData, 'transform') && isfield(frameData.transform, 'location')
-        position_data = frameData.transform.location;
-    end
-    
-    if log_fid ~= -1 && ~isempty(position_data)
-        % Extract GNSS data
-        gnss_lat = 0; gnss_lon = 0; gnss_alt = 0;
-        if isfield(frameData, 'gnss')
-            gnss_lat = frameData.gnss.lat;
-            gnss_lon = frameData.gnss.lon;
-            gnss_alt = frameData.gnss.alt;
-        end
-        
-        % Extract speed
-        speed_val = 0;
-        if isfield(frameData, 'speed')
-            speed_val = frameData.speed;
-        elseif isfield(frameData, 'velocity')
-            if isstruct(frameData.velocity)
-                speed_val = sqrt(frameData.velocity.x^2 + frameData.velocity.y^2 + frameData.velocity.z^2) * 3.6; % m/s to km/h
-            else
-                speed_val = frameData.velocity;
-            end
-        end
-        
-        % Extract rotation data
-        rotation_data = struct('yaw', 0, 'pitch', 0, 'roll', 0);
-        if isfield(frameData, 'rotation')
-            rotation_data = frameData.rotation;
-        elseif isfield(frameData, 'transform') && isfield(frameData.transform, 'rotation')
-            rotation_data = frameData.transform.rotation;
-        end
-        
-        % Extract control data
-        control_data = struct('throttle', 0, 'steer', 0, 'brake', 0);
-        if isfield(frameData, 'control')
-            control_data = frameData.control;
-        end
-        
-        fprintf(log_fid, '%.6f,%d,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f\n', ...
-            timestamp_val, frame_id, speed_val, ...
-            position_data.x, position_data.y, position_data.z, ...
-            rotation_data.yaw, rotation_data.pitch, rotation_data.roll, ...
-            control_data.throttle, control_data.steer, control_data.brake, ...
-            gnss_lat, gnss_lon, gnss_alt);
-    end
-    
-    % Save ALL raw sensor data to disk
-    try
-        frame_dir = fullfile('matlab_data', 'frames', sprintf('frame_%06d', frame_id));
-        if ~exist(frame_dir, 'dir')
-            mkdir(frame_dir);
-        end
-        saveFrameData(frameData, frame_dir, diag_text);
-    catch ME
-        log_diag(diag_text, sprintf('Frame %d save error: %s', frame_id, ME.message));
-    end
-    
-    % Print detailed update every 2 seconds
-    if toc(last_print) > 2.0
-        % List all available fields for debugging
-        available_fields = fieldnames(frameData);
-        log_diag(diag_text, sprintf('[DEBUG] Available fields: %s', strjoin(available_fields, ', ')));
-        
-        try
-            msg = sprintf('Frame: %d', frame_id);
-            
-            if ~isempty(position_data)
-                msg = [msg sprintf(' | Position: (%.2f, %.2f, %.2f)', ...
-                                   position_data.x, position_data.y, position_data.z)];
-            end
-            
-            if isfield(frameData, 'speed')
-                msg = [msg sprintf(' | Speed: %.2f km/h', frameData.speed)];
-            elseif isfield(frameData, 'velocity')
-                if isstruct(frameData.velocity)
-                    speed_calc = sqrt(frameData.velocity.x^2 + frameData.velocity.y^2 + frameData.velocity.z^2) * 3.6;
-                    msg = [msg sprintf(' | Speed: %.2f km/h (calc)', speed_calc)];
-                end
-            end
-            
-            if isfield(frameData, 'gnss')
-                msg = [msg sprintf(' | GNSS: (%.6f, %.6f)', frameData.gnss.lat, frameData.gnss.lon)];
-            end
-            
-            % Check for different image field patterns
-            image_fields = available_fields(contains(available_fields, 'image', 'IgnoreCase', true) | ...
-                                          contains(available_fields, 'camera', 'IgnoreCase', true));
-            if ~isempty(image_fields)
-                msg = [msg sprintf(' | Images: %s', strjoin(image_fields, ', '))];
-            end
-            
-            if isfield(frameData, 'imu')
-                msg = [msg ' | IMU: Available'];
-            end
-            
-            if isfield(frameData, 'lidar')
-                msg = [msg ' | LIDAR: Available'];
-            end
-            
-            log_diag(diag_text, msg);
-            last_print = tic;
         catch ME
-            log_diag(diag_text, sprintf('Data print error: %s', ME.message));
+            logMessage(uiHandles, ['UDP Read Error: ' ME.message], 'ERROR', MAX_LOG_LINES);
         end
     end
 end
 
-function saveFrameData(frameData, frame_dir, diag_text)
-    % Save all sensor data for a single frame
+% ==============================================================================
+% -- Data Pre-processing Function ----------------------------------------------
+% ==============================================================================
+function processedData = preprocessData(rawData)
+persistent lastTimestamp lastDriverInputTime;
+if isempty(lastTimestamp), lastTimestamp = rawData.timestamp; lastDriverInputTime = rawData.timestamp; end
+INATTENTION_THRESHOLD_S=3.0; CONTROL_INPUT_THRESHOLD=0.05; MIN_SPEED_FOR_CHECK_KPH=5;
+
+timeSinceLastPacket = rawData.timestamp - lastTimestamp;
+if timeSinceLastPacket>0.5, networkStatus=0; elseif timeSinceLastPacket>0.1, networkStatus=0.5; else, networkStatus=1; end
+lastTimestamp = rawData.timestamp;
+
+if isfield(rawData, 'fused_state') && isstruct(rawData.fused_state), sensorFusionStatus=1; else, sensorFusionStatus=0; end
+
+fallbackInitiation=1;
+if isfield(rawData, 'sensor_health')
+    sensorNames=fieldnames(rawData.sensor_health);
+    numWarnings=0; numDead=0;
+    for i=1:length(sensorNames), statuses=rawData.sensor_health.(sensorNames{i}); numWarnings=numWarnings+sum(strcmp(statuses,'NO_DATA')); numDead=numDead+sum(strcmp(statuses,'DEAD')); end
+    if numDead>0, fallbackInitiation=0; elseif numWarnings>0, fallbackInitiation=0.5; end
+else
+    fallbackInitiation = 0;
+end
+
+isDriving=abs(rawData.control.steer)>CONTROL_INPUT_THRESHOLD || rawData.control.throttle>CONTROL_INPUT_THRESHOLD || rawData.control.brake>CONTROL_INPUT_THRESHOLD;
+if isDriving, lastDriverInputTime=rawData.timestamp; end
+driverReadiness=1.0; timeSinceInput=rawData.timestamp-lastDriverInputTime;
+if rawData.speed>MIN_SPEED_FOR_CHECK_KPH && timeSinceInput>INATTENTION_THRESHOLD_S, driverReadiness=0.0; end
+
+processedData.frame = rawData.frame;
+processedData.networkLatency = timeSinceLastPacket;
+processedData.networkStatus = networkStatus;
+processedData.sensorFusionStatus = sensorFusionStatus;
+processedData.fallbackInitiation = fallbackInitiation;
+processedData.driverReadiness = driverReadiness;
+processedData.position = rawData.position_raw;
+processedData.speed = rawData.speed;
+processedData.gnss = rawData.gnss;
+processedData.imu = rawData.imu;
+if isfield(rawData, 'cam_front'), processedData.cam_front = rawData.cam_front; end
+if isfield(rawData, 'cam_rear'), processedData.cam_rear = rawData.cam_rear; end
+if isfield(rawData, 'cam_left'), processedData.cam_left = rawData.cam_left; end
+if isfield(rawData, 'cam_right'), processedData.cam_right = rawData.cam_right; end
+if isfield(rawData, 'cam_interior'), processedData.cam_interior = rawData.cam_interior; end
+if isfield(rawData, 'lidar'), processedData.lidar = rawData.lidar; end
+end
+
+% ==============================================================================
+% -- PERFECTED DASHBOARD SETUP -------------------------------------------------
+% ==============================================================================
+function [uiHandles] = setupDashboard(historyLength)
+fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Color', [0.94 0.94 0.94], 'Position', [50 50, 1600, 950]);
+uiHandles.fig = fig;
+uiHandles.isPaused = false;
+
+gl = uigridlayout(fig, [3, 4]);
+gl.RowHeight = {250, '2x', 200};
+gl.ColumnWidth = {'1x', '1x', '1x', '1x'};
+
+p_speed=uipanel(gl,'Title','Speed (km/h)','FontWeight','bold'); p_speed.Layout.Row=1; p_speed.Layout.Column=1;
+g_speed=uigridlayout(p_speed,[1 1]);
+uiHandles.speedGauge=uigauge(g_speed,'ScaleColors',{[0 .8 .4],[.9 .8 0],[1 .2 .2]},'ScaleColorLimits',[0 60;60 100;100 160]);
+
+p_imu=uipanel(gl,'Title','IMU - Accelerometer','FontWeight','bold'); p_imu.Layout.Row=1; p_imu.Layout.Column=2;
+uiHandles.imuAx=uiaxes(p_imu);
+hold(uiHandles.imuAx,'on'); grid(uiHandles.imuAx,'on');
+uiHandles.accelXPlot=plot(uiHandles.imuAx,NaN(1,historyLength),'r-','DisplayName','X');
+uiHandles.accelYPlot=plot(uiHandles.imuAx,NaN(1,historyLength),'g-','DisplayName','Y');
+uiHandles.accelZPlot=plot(uiHandles.imuAx,NaN(1,historyLength),'b-','DisplayName','Z');
+xlabel(uiHandles.imuAx,'Frames Ago'); ylabel(uiHandles.imuAx,'m/s^2'); legend(uiHandles.imuAx);
+
+p_gnss=uipanel(gl,'Title','GNSS Trajectory','FontWeight','bold'); p_gnss.Layout.Row=1; p_gnss.Layout.Column=3;
+uiHandles.gnssAx=uiaxes(p_gnss);
+hold(uiHandles.gnssAx,'on'); grid(uiHandles.gnssAx,'on'); axis(uiHandles.gnssAx,'equal');
+xlabel(uiHandles.gnssAx,'Longitude'); ylabel(uiHandles.gnssAx,'Latitude');
+uiHandles.gnssPlot=plot(uiHandles.gnssAx,NaN,NaN,'-m','LineWidth',1.5);
+
+p_diag=uipanel(gl,'Title','Diagnostics & Controls','FontWeight','bold'); p_diag.Layout.Row=1; p_diag.Layout.Column=4;
+g_diag=uigridlayout(p_diag,[2 1],'RowHeight',{'2x','fit'});
+p_diag_metrics=uipanel(g_diag,'Title',''); p_diag_metrics.Layout.Row=1;
+g_diag_metrics=uigridlayout(p_diag_metrics,[5,2],'ColumnWidth',{'fit','1x'},'Padding',5);
+uilabel(g_diag_metrics,'Text','Frame:'); uiHandles.frameLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
+uilabel(g_diag_metrics,'Text','Net Latency:'); uiHandles.latencyLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
+uilabel(g_diag_metrics,'Text','Sensor Fusion:'); uiHandles.fuzzyFusionLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
+uilabel(g_diag_metrics,'Text','Fallback:'); uiHandles.fuzzyFallbackLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
+uilabel(g_diag_metrics,'Text','Driver Ready:'); uiHandles.fuzzyReadinessLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
+p_ctrl=uipanel(g_diag,'Title',''); p_ctrl.Layout.Row=2;
+g_ctrl=uigridlayout(p_ctrl,[1 2],'Padding',5);
+% --- FINAL FIX: Buttons with text only, no icons ---
+uiHandles.pauseButton=uibutton(g_ctrl,'Text','Pause');
+uiHandles.saveButton=uibutton(g_ctrl,'Text','Save Snapshot');
+uiHandles.pauseButton.ButtonPushedFcn=@(src,~)pauseCallback(src,uiHandles);
+uiHandles.saveButton.ButtonPushedFcn=@(src,~)saveCallback(uiHandles);
+
+p_cameras=uipanel(gl,'Title','Camera Feeds','FontWeight','bold'); p_cameras.Layout.Row=2; p_cameras.Layout.Column=[1 2];
+g_cameras=uigridlayout(p_cameras,[2 3],'ColumnWidth',{'1x','1x','1x'},'RowHeight',{'1x','1x'});
+uiHandles.camLeftAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); uiHandles.camLeftAx.Layout.Row=1;uiHandles.camLeftAx.Layout.Column=1; title(uiHandles.camLeftAx,'Left');
+uiHandles.camFrontAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); uiHandles.camFrontAx.Layout.Row=1;uiHandles.camFrontAx.Layout.Column=2; title(uiHandles.camFrontAx,'Front');
+uiHandles.camRightAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); uiHandles.camRightAx.Layout.Row=1;uiHandles.camRightAx.Layout.Column=3; title(uiHandles.camRightAx,'Right');
+uiHandles.camInteriorAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); uiHandles.camInteriorAx.Layout.Row=2;uiHandles.camInteriorAx.Layout.Column=1; title(uiHandles.camInteriorAx,'Interior');
+uiHandles.camRearAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); uiHandles.camRearAx.Layout.Row=2;uiHandles.camRearAx.Layout.Column=3; title(uiHandles.camRearAx,'Rear');
+
+p_traj=uipanel(gl,'Title','Vehicle Trajectory','FontWeight','bold'); p_traj.Layout.Row=2; p_traj.Layout.Column=3;
+uiHandles.trajAx=uiaxes(p_traj);
+hold(uiHandles.trajAx,'on'); grid(uiHandles.trajAx,'on'); axis(uiHandles.trajAx,'equal');
+xlabel(uiHandles.trajAx,'X (m)'); ylabel(uiHandles.trajAx,'Y (m)');
+uiHandles.trajPlot=plot(uiHandles.trajAx,NaN,NaN,'-c','LineWidth',2);
+uiHandles.currentPosPlot=plot(uiHandles.trajAx,NaN,NaN,'bo','MarkerFaceColor','b','MarkerSize',8);
+legend(uiHandles.trajAx,'Path','Current','Location','northwest');
+
+p_lidar=uipanel(gl,'Title','3D LiDAR Point Cloud','FontWeight','bold'); p_lidar.Layout.Row=2; p_lidar.Layout.Column=4;
+uiHandles.lidarAx=uiaxes(p_lidar);
+hold(uiHandles.lidarAx,'on'); grid(uiHandles.lidarAx,'on'); axis(uiHandles.lidarAx,'equal');
+xlabel(uiHandles.lidarAx,'X (m)'); ylabel(uiHandles.lidarAx,'Y (m)'); zlabel(uiHandles.lidarAx,'Z (m)');
+view(uiHandles.lidarAx, -45, 30);
+uiHandles.lidarPlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 10, NaN, 'filled');
+
+p_log=uipanel(gl,'Title','System Log','FontWeight','bold'); p_log.Layout.Row=3; p_log.Layout.Column=[1 4];
+g_log=uigridlayout(p_log,[1 1]);
+uiHandles.logArea = uitextarea(g_log, 'Value',{''}, 'Editable','off', 'FontName', 'Monospaced');
+end
+
+% ==============================================================================
+% -- DASHBOARD UPDATE FUNCTION -------------------------------------------------
+% ==============================================================================
+function updateDashboard(uiHandles, data, historyLength, lidarRange, trailLength)
+persistent accelHistory gnssHistory trajHistory;
+if isempty(accelHistory)
+    accelHistory=nan(historyLength,3); gnssHistory=nan(historyLength,2); trajHistory=nan(trailLength,2);
+end
+
+uiHandles.speedGauge.Value = data.speed;
+try_imshow(uiHandles.camFrontAx,data,'cam_front'); try_imshow(uiHandles.camRearAx,data,'cam_rear');
+try_imshow(uiHandles.camLeftAx,data,'cam_left'); try_imshow(uiHandles.camRightAx,data,'cam_right');
+try_imshow(uiHandles.camInteriorAx,data,'cam_interior');
+accelHistory=[accelHistory(2:end,:); [data.imu.accelerometer.x,data.imu.accelerometer.y,data.imu.accelerometer.z]];
+set(uiHandles.accelXPlot,'YData',accelHistory(:,1)); set(uiHandles.accelYPlot,'YData',accelHistory(:,2)); set(uiHandles.accelZPlot,'YData',accelHistory(:,3));
+set(uiHandles.imuAx,'XLim',[0 historyLength]);
+gnssHistory=[gnssHistory(2:end,:); [data.gnss.longitude, data.gnss.latitude]];
+set(uiHandles.gnssPlot,'XData',gnssHistory(:,1),'YData',gnssHistory(:,2));
+uiHandles.frameLabel.Text=num2str(data.frame);
+uiHandles.latencyLabel.Text=sprintf('%.1f ms',data.networkLatency*1000);
+uiHandles.fuzzyFusionLabel.Text=num2str(data.sensorFusionStatus);
+uiHandles.fuzzyFallbackLabel.Text=num2str(data.fallbackInitiation);
+uiHandles.fuzzyReadinessLabel.Text=num2str(data.driverReadiness);
+
+try
+    if isfield(data,'lidar') && ~isempty(data.lidar)
+        raw_points=typecast(base64decode(data.lidar),'single');
+        points=reshape(raw_points,3,[])';
+        set(uiHandles.lidarPlot,'XData',points(:,1),'YData',points(:,2),'ZData',points(:,3),'CData',points(:,3));
+        axis(uiHandles.lidarAx,[-lidarRange lidarRange -lidarRange lidarRange -5 lidarRange/2]);
+        colormap(uiHandles.lidarAx,'jet'); clim(uiHandles.lidarAx,[-2, 5]);
+    end
+catch ME, logMessage(uiHandles,['LiDAR plot error: ' ME.message],'ERROR',evalin('base','MAX_LOG_LINES')); 
+end
+
+newPos=[data.position.x,data.position.y];
+trajHistory=[trajHistory(2:end,:); newPos];
+set(uiHandles.trajPlot,'XData',trajHistory(:,1),'YData',trajHistory(:,2));
+set(uiHandles.currentPosPlot,'XData',newPos(1),'YData',newPos(2));
+if ~any(isnan(trajHistory(:))), axis(uiHandles.trajAx,[min(trajHistory(:,1))-10,max(trajHistory(:,1))+10,min(trajHistory(:,2))-10,max(trajHistory(:,2))+10]); end
+
+drawnow limitrate;
+end
+
+% ==============================================================================
+% -- LOGGING, UI CONTROL, & UTILITIES ------------------------------------------
+% ==============================================================================
+function logMessage(uiHandles, message, level, maxLogLines)
+    timestamp = string(datetime('now'), 'HH:mm:ss.SSS');
+    formattedMsg = sprintf('[%s] [%s] %s', timestamp, upper(level), message);
+    if strcmpi(level, 'ERROR'), fprintf(2, '%s\n', formattedMsg); else, fprintf('%s\n', formattedMsg); end
+    if isfield(uiHandles, 'logArea') && ishandle(uiHandles.logArea)
+        currentLog = uiHandles.logArea.Value;
+        newLog = [currentLog; {formattedMsg}];
+        if numel(newLog) > maxLogLines, newLog = newLog(end-maxLogLines+1:end); end
+        uiHandles.logArea.Value = newLog;
+        scroll(uiHandles.logArea, 'bottom');
+    end
+end
+
+function pauseCallback(src, uiHandles)
+    if uiHandles.isPaused, src.Text='Pause'; else, src.Text='Resume'; end
+    evalin('base', 'isPaused = ~isPaused;');
+end
+
+function saveCallback(uiHandles)
+    maxLogLines = evalin('base', 'MAX_LOG_LINES');
+    logMessage(uiHandles, 'Saving dashboard snapshot...', 'INFO', maxLogLines);
+    d=uiprogressdlg(uiHandles.fig,'Title','Saving Snapshot','Indeterminate','on');
+    drawnow;
     try
-        % Save camera images
-        cameras = {'front', 'back', 'left', 'right'};
-        for i = 1:numel(cameras)
-            field = ['image_' cameras{i}];
-            if isfield(frameData, field)
-                img_bytes = base64decode(frameData.(field));
-                img_path = fullfile(frame_dir, [field '.jpg']);
-                fid = fopen(img_path, 'wb');
-                if fid ~= -1
-                    fwrite(fid, img_bytes, 'uint8');
-                    fclose(fid);
-                else
-                    log_diag(diag_text, sprintf('Failed to write image: %s', img_path));
-                end
-            end
-        end
-        
-        % Save LIDAR data
-        if isfield(frameData, 'lidar')
-            lidar_bytes = base64decode(frameData.lidar);
-            lidar_path = fullfile(frame_dir, 'lidar.bin');
-            fid = fopen(lidar_path, 'wb');
-            if fid ~= -1
-                fwrite(fid, lidar_bytes, 'uint8');
-                fclose(fid);
-            else
-                log_diag(diag_text, sprintf('Failed to write LIDAR: %s', lidar_path));
-            end
-        end
-        
-        % Save IMU data
-        if isfield(frameData, 'imu')
-            imu_bytes = base64decode(frameData.imu);
-            imu_path = fullfile(frame_dir, 'imu.bin');
-            fid = fopen(imu_path, 'wb');
-            if fid ~= -1
-                fwrite(fid, imu_bytes, 'uint8');
-                fclose(fid);
-            else
-                log_diag(diag_text, sprintf('Failed to write IMU: %s', imu_path));
-            end
-        end
-        
-        % Save metadata (excluding large sensor fields)
-        meta = frameData;
-        large_fields = [...
-            arrayfun(@(c) ['image_' c], cameras, 'UniformOutput', false), ...
-            {'lidar', 'imu'}];
-        for i = 1:length(large_fields)
-            if isfield(meta, large_fields{i})
-                meta = rmfield(meta, large_fields{i});
-            end
-        end
-        
-        json_str = jsonencode(meta);
-        json_path = fullfile(frame_dir, 'frame.json');
-        fid = fopen(json_path, 'w');
-        if fid ~= -1
-            fprintf(fid, '%s', json_str);
-            fclose(fid);
-        else
-            log_diag(diag_text, sprintf('Failed to write metadata: %s', json_path));
-        end
-        
-    catch ME
-        log_diag(diag_text, sprintf('Frame save error: %s', ME.message));
+        filename=sprintf('dashboard_snapshot_%s.png',string(datetime('now'),'yyyyMMdd_HHmmss'));
+        exportgraphics(uiHandles.fig, filename, 'Resolution', 150);
+        logMessage(uiHandles, ['Dashboard saved to ' filename], 'INFO', maxLogLines);
+    catch ME, logMessage(uiHandles,['Save failed: ' ME.message],'ERROR', maxLogLines); 
+    end
+    close(d);
+end
+
+function try_imshow(ax, data, field)
+    if isfield(data,field) && ~isempty(data.(field))
+        try, imshow(imdecode(base64decode(data.(field)),'jpg'),'Parent',ax); catch, cla(ax); text(ax,0.5,0.5,'Img Error','Color','r','HA','center','FontSize',14); end
+    else, cla(ax); text(ax,0.5,0.5,'No Img Data','Color','y','HA','center','FontSize',14); 
     end
 end
 
-function updateVisualizations(frameData, ax_front, ax_back, ax_left, ax_right, ax_lidar, ax_imu, diag_text)
-    % Update camera images, LIDAR, and other sensor visualizations
-    try
-        % Process camera images
-        cameras = {'front', 'back', 'left', 'right'};
-        axes_handles = {ax_front, ax_back, ax_left, ax_right};
-        
-        for i = 1:numel(cameras)
-            camName = cameras{i};
-            fieldName = ['image_' camName];
-            ax = axes_handles{i};
-            
-            if isfield(frameData, fieldName) && ~isempty(frameData.(fieldName))
-                try
-                    % Decode base64 image
-                    imgData = base64decode(frameData.(fieldName));
-                    
-                    % Create temporary file for image decoding
-                    temp_file = tempname;
-                    temp_file = [temp_file '.jpg'];
-                    
-                    % Write bytes to file
-                    fid = fopen(temp_file, 'wb');
-                    fwrite(fid, imgData, 'uint8');
-                    fclose(fid);
-                    
-                    % Read image
-                    img = imread(temp_file);
-                    
-                    % Display image
-                    cla(ax);
-                    imshow(img, 'Parent', ax);
-                    title(ax, [camName ' Camera']);
-                    
-                    % Clean up temp file
-                    delete(temp_file);
-                catch ME
-                    log_diag(diag_text, sprintf('Image %s error: %s', camName, ME.message));
-                end
-            end
-        end
-        
-        % Process LIDAR data
-        if isfield(frameData, 'lidar') && ~isempty(frameData.lidar)
-            try
-                % Decode base64 LIDAR data
-                lidarBytes = base64decode(frameData.lidar);
-                
-                % Convert to point cloud (Nx4 float array)
-                pointCloud = typecast(lidarBytes, 'single');
-                if mod(length(pointCloud), 4) == 0
-                    pointCloud = reshape(pointCloud, 4, [])';
-                    
-                    % Extract XYZ coordinates (ignore intensity)
-                    xyz = pointCloud(:,1:3);
-                    
-                    % Filter points (remove ground and distant points)
-                    valid_points = xyz(:,3) > -2 & xyz(:,3) < 5 & ...
-                                   sqrt(xyz(:,1).^2 + xyz(:,2).^2) < 50;
-                    xyz = xyz(valid_points, :);
-                    
-                    % Display point cloud
-                    cla(ax_lidar);
-                    scatter3(ax_lidar, xyz(:,1), xyz(:,2), xyz(:,3), 1, 'b.');
-                    title(ax_lidar, sprintf('LIDAR (%d points)', size(xyz,1)));
-                    xlabel(ax_lidar, 'X (m)');
-                    ylabel(ax_lidar, 'Y (m)');
-                    zlabel(ax_lidar, 'Z (m)');
-                    axis(ax_lidar, 'equal');
-                    grid(ax_lidar, 'on');
-                    view(ax_lidar, 0, 90); % Top-down view
-                end
-            catch ME
-                log_diag(diag_text, sprintf('LIDAR error: %s', ME.message));
-            end
-        end
-        
-        % Process IMU data
-        if isfield(frameData, 'imu') && ~isempty(frameData.imu)
-            try
-                % Decode base64 IMU data
-                imuBytes = base64decode(frameData.imu);
-                
-                % Convert to float array [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
-                if length(imuBytes) >= 24  % 6 floats * 4 bytes each
-                    imuData = typecast(imuBytes(1:24), 'single');
-                    
-                    % Simple IMU visualization (could be enhanced)
-                    cla(ax_imu);
-                    bar(ax_imu, 1:3, imuData(1:3));
-                    set(ax_imu, 'XTickLabel', {'Accel X', 'Accel Y', 'Accel Z'});
-                    ylabel(ax_imu, 'Acceleration (m/s²)');
-                    title(ax_imu, 'IMU Acceleration');
-                    grid(ax_imu, 'on');
-                end
-            catch ME
-                log_diag(diag_text, sprintf('IMU error: %s', ME.message));
-            end
-        end
-        
-    catch ME
-        log_diag(diag_text, sprintf('Visualization error: %s', ME.message));
-    end
+function out=gunzip_matlab(in)
+import java.io.ByteArrayInputStream java.io.ByteArrayOutputStream java.util.zip.GZIPInputStream
+inStream=GZIPInputStream(ByteArrayInputStream(in)); outStream=ByteArrayOutputStream(); buffer=javaArray('int8',1024);
+while true, numRead=inStream.read(buffer); if numRead==-1, break; end, outStream.write(buffer,0,numRead); end
+out=typecast(outStream.toByteArray(),'uint8');
 end
 
-function decoded = base64decode(str)
-    % Simple base64 decoder using MATLAB's built-in functionality
-    try
-        % Remove any whitespace
-        str = strrep(str, ' ', '');
-        str = strrep(str, newline, '');
-        str = strrep(str, char(13), '');
-        str = strrep(str, char(10), '');
-        
-        % Use Java base64 decoder
-        import java.util.Base64
-        decoder = Base64.getDecoder();
-        decoded = typecast(decoder.decode(uint8(str)), 'uint8');
-    catch
-        % Fallback: simple base64 decode (incomplete implementation)
-        decoded = [];
-        warning('Base64 decoding failed - ensure data is properly encoded');
-    end
+function cleanup(udpPort, uiHandles)
+disp('Cleaning up resources...');
+if ~isempty(udpPort)&&isvalid(udpPort), delete(udpPort); disp('UDP port closed.'); end
+if ~isempty(uiHandles)&&isfield(uiHandles,'fig')&&ishandle(uiHandles.fig), delete(uiHandles.fig); end
+disp('Cleanup complete.');
 end
 
-function log_diag(text_handle, message)
-    % Append message to diagnostics console
-    try
-        current_text = get(text_handle, 'String');
-        if ischar(current_text)
-            current_text = {current_text};
-        end
-        new_text = [current_text; {sprintf('%s: %s', datestr(now, 'HH:MM:SS'), message)}];
-        
-        % Keep only last 25 lines
-        if length(new_text) > 25
-            new_text = new_text(end-24:end);
-        end
-        
-        set(text_handle, 'String', new_text);
-        drawnow;
-    catch
-        % Silently handle logging errors
-    end
-end
-
-function close_receiver(u, log_fid)
-    % Cleanup resources
-    if nargin < 2
-        log_fid = -1;
-    end
-    
-    if log_fid > 0
-        fclose(log_fid);
-    end
-    
-    if isvalid(u)
-        try
-            flush(u);
-            delete(u);
-        catch
-            % Ignore cleanup errors
-        end
-    end
-end
-
-function [jsonStr, remaining] = extractJSON(buffer)
-    % Extract first complete JSON object from buffer
-    jsonStr = '';
-    remaining = buffer;
-    
-    % Find first opening brace
-    startIdx = find(buffer == '{', 1);
-    if isempty(startIdx)
-        return;
-    end
-    
-    % Find matching closing brace
-    braceCount = 0;
-    endIdx = 0;
-    inString = false;
-    escaped = false;
-    
-    for i = startIdx:length(buffer)
-        char = buffer(i);
-        
-        if ~inString
-            if char == '{'
-                braceCount = braceCount + 1;
-            elseif char == '}'
-                braceCount = braceCount - 1;
-                if braceCount == 0
-                    endIdx = i;
-                    break;
-                end
-            elseif char == '"'
-                inString = true;
-            end
-        else
-            if ~escaped
-                if char == '"'
-                    inString = false;
-                elseif char == '\'
-                    escaped = true;
-                end
-            else
-                escaped = false;
-            end
-        end
-    end
-    
-    % Extract complete JSON if found
-    if endIdx > 0
-        jsonStr = buffer(startIdx:endIdx);
-        remaining = buffer(endIdx+1:end);
-    end
-end
-
-%% ==================== IMAGE FEATURE EXTRACTION ====================
-function features = extractImageFeatures(img, cam_position)
-    % Simplified feature extraction for BBNA
-    % In practice, use computer vision/deep learning methods
-    
-    % Convert to grayscale
-    gray_img = rgb2gray(img);
-    
-    % Edge detection for lane estimation
-    edges = edge(gray_img, 'Canny');
-    
-    % Lane confidence (density of horizontal edges)
-    [h, w] = size(edges);
-    roi = edges(floor(h*0.7):h, :);  % Bottom 30% of image
-    lane_confidence = sum(roi(:)) / numel(roi);
-    
-    % Obstacle detection (crude approximation)
-    diff_img = imabsdiff(gray_img, imopen(gray_img, strel('disk', 15)));
-    obstacle_mask = diff_img > 50;
-    obstacle_density = sum(obstacle_mask(:)) / numel(obstacle_mask);
-    
-    % Camera-specific adjustments
-    switch cam_position
-        case 'front'
-            % Higher weighting for central obstacles
-            center_mask = false(size(obstacle_mask));
-            center_mask(:, floor(w*0.4):floor(w*0.6)) = true;
-            obstacle_density = 0.7*sum(obstacle_mask(center_mask)) / sum(center_mask(:)) + ...
-                               0.3*obstacle_density;
-        case 'back'
-            % Focus on close-range obstacles
-            close_roi = obstacle_mask(floor(h*0.8):h, :);
-            obstacle_density = sum(close_roi(:)) / numel(close_roi);
-    end
-    
-    scaled_lane_confidence = min(1, lane_confidence * 5);       % Scale to [0,1]
-    scaled_obstacle_density = min(1, obstacle_density * 10);    % Scale to [0,1]
-    
-    features = struct(...
-        'lane_confidence', scaled_lane_confidence, ...
-        'obstacle_density', scaled_obstacle_density ...
-    );
-
+function decoded=base64decode(encoded)
+decoded=typecast(org.apache.commons.codec.binary.Base64.decodeBase64(encoded),'uint8');
 end
