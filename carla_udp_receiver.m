@@ -13,8 +13,12 @@ function carla_udp_receiver(port)
     global carla_outputs;
     carla_outputs = struct();
 
+    % <<< MODIFIED: Add a flag to control the main loop for graceful exit >>>
+    is_running = true;
+
     % --- Setup UI and UDP ---
-    [uiHandles] = setupDashboard(HISTORY_LENGTH);
+    % <<< MODIFIED: Pass the handle to the close request callback to the UI setup >>>
+    [uiHandles] = setupDashboard(HISTORY_LENGTH, @onCloseRequest);
     logToDashboard(uiHandles, 'Dashboard initialized. Starting UDP receiver...');
     
     try
@@ -24,7 +28,7 @@ function carla_udp_receiver(port)
     catch ME
         logToDashboard(uiHandles, sprintf('[FATAL] UDP setup failed: %s', ME.message));
         errordlg(sprintf('UDP setup on port %d failed. Is it in use?', port), 'UDP Error');
-        return;
+        is_running = false; % Prevent loop from starting if UDP fails
     end
 
     % --- Data Storage and State Initialization ---
@@ -38,7 +42,12 @@ function carla_udp_receiver(port)
     
     % --- Main Loop ---
     logToDashboard(uiHandles, 'Waiting for data from CARLA...');
-    while ishandle(uiHandles.fig)
+    % <<< MODIFIED: Main loop now controlled by our flag >>>
+    while is_running
+        if ~ishandle(uiHandles.fig) % Additional safety check
+            break;
+        end
+
         if uiHandles.isPaused
             pause(0.2);
             continue;
@@ -78,15 +87,26 @@ function carla_udp_receiver(port)
         pause(0.01);
     end
     
+    logToDashboard(uiHandles, 'Shutdown sequence initiated...');
     if isvalid(u), delete(u); end
+    if ishandle(uiHandles.fig), delete(uiHandles.fig); end
+    disp('CARLA UDP Receiver has shut down gracefully.');
+
+    % --- Nested Callback Function for UI Close ---
+    function onCloseRequest(~, ~)
+        is_running = false;
+    end
 end
 
 %% =======================================================================
 %                      UI SETUP AND CALLBACKS
 % ========================================================================
 
-function [uiHandles] = setupDashboard(historyLength)
+function [uiHandles] = setupDashboard(historyLength, closeCallback)
     fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Position', [50 50, 1600, 950]);
+    % <<< MODIFIED: Assign the custom close function >>>
+    fig.CloseRequestFcn = closeCallback;
+
     uiHandles.fig = fig;
     uiHandles.isPaused = false;
     
@@ -114,12 +134,23 @@ function [uiHandles] = setupDashboard(historyLength)
     p_diag = uipanel(gl,'Title','Diagnostics & Controls','FontWeight','bold'); p_diag.Layout.Row=1; p_diag.Layout.Column=4;
     g_diag = uigridlayout(p_diag,[2 1],'RowHeight',{'2x','fit'});
     p_diag_metrics = uipanel(g_diag,'Title',''); p_diag_metrics.Layout.Row=1;
-    g_diag_metrics = uigridlayout(p_diag_metrics,[5,2],'ColumnWidth',{'fit','1x'});
-    uilabel(g_diag_metrics,'Text','Frame:'); uiHandles.frameLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
-    uilabel(g_diag_metrics,'Text','Net Latency:'); uiHandles.latencyLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
-    uilabel(g_diag_metrics,'Text','Sensor Health:'); uiHandles.healthLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
-    uilabel(g_diag_metrics,'Text','Fallback Status:'); uiHandles.fallbackLabel=uilabel(g_diag_metrics,'Text','IDLE','FontWeight','bold','FontColor','g');
-    uilabel(g_diag_metrics,'Text','Environment:'); uiHandles.envLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold');
+    g_diag_metrics = uigridlayout(p_diag_metrics,[7,2],'ColumnWidth',{'fit','1x'});
+    
+    uilabel(g_diag_metrics,'Text','Frame:', 'FontSize', 10); 
+    uiHandles.frameLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'FontSize', 10);
+    uilabel(g_diag_metrics,'Text','Net Latency:', 'FontSize', 10); 
+    uiHandles.latencyLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'FontSize', 10);
+    uilabel(g_diag_metrics,'Text','Mode:', 'FontSize', 10); 
+    uiHandles.modeLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
+    uilabel(g_diag_metrics,'Text','Map:', 'FontSize', 10); 
+    uiHandles.mapLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
+    uilabel(g_diag_metrics,'Text','Weather:', 'FontSize', 10); 
+    uiHandles.weatherLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
+    uilabel(g_diag_metrics,'Text','Sensor Health:', 'FontSize', 10); 
+    uiHandles.healthLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
+    uilabel(g_diag_metrics,'Text','Fallback Status:', 'FontSize', 10); 
+    uiHandles.fallbackLabel=uilabel(g_diag_metrics,'Text','IDLE','FontWeight','bold','FontColor','g', 'HorizontalAlignment', 'left', 'FontSize', 10);
+    
     p_ctrl = uipanel(g_diag,'Title',''); p_ctrl.Layout.Row=2;
     g_ctrl = uigridlayout(p_ctrl,[1 2]);
     uiHandles.pauseButton=uibutton(g_ctrl,'Text','Pause', 'ButtonPushedFcn',@(s,e)pauseCallback(uiHandles));
@@ -137,7 +168,7 @@ function [uiHandles] = setupDashboard(historyLength)
     uiHandles.trajAx=uiaxes(p_traj); hold(uiHandles.trajAx,'on'); grid(uiHandles.trajAx,'on'); axis(uiHandles.trajAx,'equal'); xlabel(uiHandles.trajAx,'X (m)'); ylabel(uiHandles.trajAx,'Y (m)');
     uiHandles.trajPlot=plot(uiHandles.trajAx,NaN,NaN,'-c','LineWidth',2); uiHandles.currentPosPlot=plot(uiHandles.trajAx,NaN,NaN,'bo','MarkerFaceColor','b','MarkerSize',8); legend(uiHandles.trajAx,'Path','Current','Location','northwest');
 
-    p_lidar = uipanel(gl,'Title','3D LiDAR Point Cloud','FontWeight','bold'); p_lidar.Layout.Row=2; p_lidar.Layout.Column=4;
+    p_lidar = uipanel(gl,'Title','3D LiDAR Point Cloud (Roof)','FontWeight','bold'); p_lidar.Layout.Row=2; p_lidar.Layout.Column=4;
     uiHandles.lidarAx=uiaxes(p_lidar); hold(uiHandles.lidarAx,'on'); grid(uiHandles.lidarAx,'on'); axis(uiHandles.lidarAx,'equal'); xlabel(uiHandles.lidarAx,'X (m)'); ylabel(uiHandles.lidarAx,'Y (m)'); zlabel(uiHandles.lidarAx,'Z (m)'); view(uiHandles.lidarAx, -45, 30);
     uiHandles.lidarPlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 10, NaN, 'filled');
 
@@ -153,10 +184,10 @@ function saveCallback(uiHandles), filename = ['CARLA_Snapshot_' datestr(now, 'yy
 % ========================================================================
 
 function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, outputs)
+    if ~isvalid(uiHandles.fig), return; end
     if isfield(data, 'speed'), uiHandles.speedGauge.Value = data.speed; end
     set(uiHandles.accelXPlot, 'YData', imu_history.x); set(uiHandles.accelYPlot, 'YData', imu_history.y); set(uiHandles.accelZPlot, 'YData', imu_history.z);
     set(uiHandles.gnssPlot, 'XData', gnss_track(:,2), 'YData', gnss_track(:,1));
-    % --- This is the CORRECTED line ---
     set(uiHandles.trajPlot, 'XData', trajectory(:,1), 'YData', trajectory(:,2));
     set(uiHandles.currentPosPlot, 'XData', trajectory(end,1), 'YData', trajectory(end,2));
     if isfield(data, 'frame'), uiHandles.frameLabel.Text = num2str(data.frame); end
@@ -170,7 +201,10 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     end
     
     if outputs.fallback_initiation, uiHandles.fallbackLabel.Text = 'TRIGGERED'; uiHandles.fallbackLabel.FontColor = 'r'; else, uiHandles.fallbackLabel.Text = 'IDLE'; uiHandles.fallbackLabel.FontColor = 'g'; end
-    if isfield(outputs.processed_sensor_data.environment, 'lighting'), uiHandles.envLabel.Text = sprintf('%s, %s', outputs.processed_sensor_data.environment.lighting, outputs.processed_sensor_data.environment.weather); end
+    
+    if isfield(data, 'mode'), uiHandles.modeLabel.Text = data.mode; end
+    if isfield(data, 'map'), uiHandles.mapLabel.Text = data.map; end
+    if isfield(data, 'weather'), uiHandles.weatherLabel.Text = data.weather; end
     
     updateCamera(uiHandles.camFrontAx, data, 'image_front'); updateCamera(uiHandles.camRearAx, data, 'image_back'); updateCamera(uiHandles.camLeftAx, data, 'image_left'); updateCamera(uiHandles.camRightAx, data, 'image_right'); updateCamera(uiHandles.camInteriorAx, data, 'image_interior');
     if isfield(data, 'lidar_roof') && ~isempty(data.lidar_roof), try, points = typecast(base64decode(data.lidar_roof), 'single'); if mod(numel(points), 4) == 0, points = reshape(points, 4, [])'; xyz = points(1:20:end, 1:3); set(uiHandles.lidarPlot, 'XData', xyz(:,1), 'YData', xyz(:,2), 'ZData', xyz(:,3), 'CData', xyz(:,3)); end; catch, end; end
@@ -191,14 +225,14 @@ function outputs = processAndAnalyzeFrame(frame, latency, uiHandles)
     outputs.network_status = struct('latency', latency);
     health = struct(); if isfield(frame, 'sensor_health'), health = frame.sensor_health; end
     covariance = []; if isfield(frame, 'ekf_covariance') && iscell(frame.ekf_covariance), try, rows = cellfun(@cell2mat, frame.ekf_covariance, 'UniformOutput', false); covariance = cell2mat(rows); catch ME, logToDashboard(uiHandles, sprintf('[WARN] Covariance matrix invalid: %s', ME.message)); end; end
-    env = struct(); if isfield(frame, 'environment'), env = detect_environment(frame.environment); end
     
     outputs.sensor_fusion_status = struct('fused_state', [], 'covariance', covariance, 'health', health);
     if isfield(frame, 'fused_state'), outputs.sensor_fusion_status.fused_state = frame.fused_state; end
-    outputs.processed_sensor_data = struct('environment', env);
+    outputs.processed_sensor_data = struct(); 
     
     fallback = false; reason = {};
-    if latency > 2, fallback = true; reason{end+1} = 'High Latency'; end
+    % <<< FIXED: Latency check updated to 200ms (0.2s) >>>
+    if latency > 0.2, fallback = true; reason{end+1} = 'High Latency (>200ms)'; end
     if isstruct(health), all_groups = struct2cell(health); total_fail = 0; total_sens = 0; for i=1:numel(all_groups), status_list=all_groups{i}; total_sens=total_sens+numel(status_list); total_fail=total_fail+sum(~strcmp(status_list,'OK')); end; if total_fail > total_sens/2, fallback=true; reason{end+1} = 'Critical Sensor Failure'; end; end
     if ~isempty(covariance) && any(diag(covariance(1:2,1:2)) > 10), fallback = true; reason{end+1} = 'High Position Uncertainty'; end
     outputs.fallback_initiation = fallback;
@@ -213,16 +247,44 @@ end
 
 function full_data = processPacket(packet)
     persistent chunkBuffer;
-    if isempty(chunkBuffer), chunkBuffer = containers.Map('KeyType', 'double', 'ValueType', 'any'); end
+    if isempty(chunkBuffer)
+        chunkBuffer = containers.Map('KeyType', 'double', 'ValueType', 'any');
+    end
+    
     full_data = [];
+    
     if isfield(packet, 'chunk')
         frameId = packet.frame;
-        if ~isKey(chunkBuffer, frameId), chunkBuffer(frameId) = struct('chunks', {cell(1, packet.total_chunks)}, 'received_chunks', 0); end
+        
+        if ~isKey(chunkBuffer, frameId)
+            chunkBuffer(frameId) = struct('chunks', {cell(1, packet.total_chunks)}, 'received_chunks', 0);
+        end
+        
         chunkData = chunkBuffer(frameId);
-        if isempty(chunkData.chunks{packet.chunk + 1}), chunkData.chunks{packet.chunk + 1} = packet.data; chunkData.received_chunks = chunkData.received_chunks + 1; chunkBuffer(frameId) = chunkData; end
-        if chunkData.received_chunks == packet.total_chunks, full_json = strjoin(chunkData.chunks, ''); full_data = jsondecode(full_json); remove(chunkBuffer, frameId); end
-    else, full_data = packet; end
+        
+        if isempty(chunkData.chunks{packet.chunk + 1})
+            chunkData.chunks{packet.chunk + 1} = packet.data;
+            chunkData.received_chunks = chunkData.received_chunks + 1;
+            chunkBuffer(frameId) = chunkData;
+        end
+        
+        currentChunkData = chunkBuffer(frameId);
+
+        if currentChunkData.received_chunks == packet.total_chunks
+            full_json_string = strjoin(currentChunkData.chunks, '');
+            try
+                full_data = jsondecode(full_json_string);
+            catch ME
+                disp(['JSON decode failed for frame ' num2str(frameId) ': ' ME.message]);
+                full_data = [];
+            end
+            remove(chunkBuffer, frameId);
+        end
+    else
+        full_data = packet;
+    end
 end
+
 
 function [jsonStr, remaining] = extractJSON(buffer)
     jsonStr = ''; remaining = buffer; startIdx = find(buffer == '{', 1);
@@ -248,14 +310,4 @@ end
 function decoded = base64decode(str)
     try, import java.util.Base64; decoder = Base64.getDecoder(); decoded = typecast(decoder.decode(uint8(strrep(str, newline, ''))), 'uint8');
     catch, decoded = []; end
-end
-
-function env_cond = detect_environment(env_struct)
-    if ~isfield(env_struct, 'weather'), env_cond = struct('lighting', 'unknown', 'weather', 'unknown'); return; end
-    weather_data = env_struct.weather;
-    if isfield(weather_data, 'sun_altitude_angle'), if weather_data.sun_altitude_angle > 0, lighting_cond = 'day'; else, lighting_cond = 'night'; end; else, lighting_cond = 'unknown'; end
-    if isfield(weather_data, 'precipitation') && weather_data.precipitation > 70, weather_cond = 'heavy rain';
-    elseif isfield(weather_data, 'precipitation') && weather_data.precipitation > 30, weather_cond = 'rain';
-    else, weather_cond = 'clear'; end
-    env_cond = struct('lighting', lighting_cond, 'weather', weather_cond);
 end
