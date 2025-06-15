@@ -13,6 +13,8 @@ import json
 import base64
 import csv
 import binascii
+import gzip  # <--- MODIFIED: Added for GZIP compression
+import argparse # <--- NEW: For selecting sender/receiver mode
 from queue import Queue, Empty
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -42,6 +44,8 @@ TICK_RATE = 20  # Hz
 DATA_DIR = 'data'
 IMAGE_DIR = os.path.join(DATA_DIR, 'images')
 LOG_DIR = os.path.join(DATA_DIR, 'logs')
+# NEW: Directory for decoded data from the receiver
+DECODED_DATA_DIR = 'received_and_decoded_data'
 CAMERA_DIRS = {
     'front': os.path.join(IMAGE_DIR, 'front'), 'back': os.path.join(IMAGE_DIR, 'back'),
     'left': os.path.join(IMAGE_DIR, 'left'), 'right': os.path.join(IMAGE_DIR, 'right'),
@@ -200,7 +204,7 @@ class HUD:
             y_offset += 22
 
 # ==============================================================================
-# -- Controller, Sensor, Display, and Networking Classes -----------------------
+# -- Controller, Sensor, and Display Classes -----------------------------------
 # ==============================================================================
 class KeyboardController:
     """Handles keyboard input for vehicle control and simulation commands."""
@@ -328,42 +332,59 @@ class DisplayManager:
                 self.display.blit(sensor.surface, (pos[0] * IMAGE_WIDTH, pos[1] * IMAGE_HEIGHT))
         return self.display
 
+# ==============================================================================
+# -- UDPDataSender Class -------------------------------------------------------
+# ==============================================================================
 class UDPDataSender:
-    """Handles data chunking and sending over UDP without compression."""
+    """Handles data compression, chunking, and sending over UDP."""
     def __init__(self, ip: str = '127.0.0.1', port: int = 10000, chunk_size: int = 60000):
-        self.ip = ip; self.port = port
+        self.ip = ip
+        self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.max_packet_size = chunk_size
         json_wrapper_overhead = 200
-        # The chunk size for the data must account for base64's overhead (approx 4/3 size)
-        self.max_data_chunk_size = int((self.max_packet_size - json_wrapper_overhead) * 3 / 4)
-        print(f"UDP sender initialized. Target packet size: {self.max_packet_size}. Max raw data per chunk: {self.max_data_chunk_size} bytes.")
+        # The chunk size for the compressed data payload must account for base64's overhead (approx 4/3 size)
+        self.max_payload_chunk_size = int((self.max_packet_size - json_wrapper_overhead) * 3 / 4)
+        print(f"UDP sender initialized. Target packet size: {self.max_packet_size}. Max compressed payload per chunk: {self.max_payload_chunk_size} bytes.")
 
     def send(self, data: Dict[str, Any]):
         try:
-            json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-            data['_crc32'] = binascii.crc32(json_str.encode('utf-8'))
+            # First, create a version of the JSON string just to calculate the CRC checksum.
+            # This ensures the checksum is for the data *before* the checksum key is added.
+            json_str_for_crc = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+            data['_crc32'] = binascii.crc32(json_str_for_crc.encode('utf-8'))
             
+            # Now create the final JSON string, which includes the checksum.
             final_json_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-            # The payload is now just the encoded JSON string. No compression.
-            full_payload_bytes = final_json_str.encode('utf-8')
+
+            # MODIFIED: Compress the final JSON string using GZIP.
+            compressed_payload = gzip.compress(final_json_str.encode('utf-8'))
             
             frame_id = data.get('frame', -1)
-            chunks = [full_payload_bytes[i:i + self.max_data_chunk_size] for i in range(0, len(full_payload_bytes), self.max_data_chunk_size)]
+            # Chunk the *compressed* payload.
+            chunks = [compressed_payload[i:i + self.max_payload_chunk_size] for i in range(0, len(compressed_payload), self.max_payload_chunk_size)]
             
-            if not chunks: chunks.append(b'')
+            if not chunks:
+                chunks.append(b'') # Send one empty chunk if payload is empty
             
             for i, chunk in enumerate(chunks):
-                # Data is still base64 encoded for safe transport within the JSON wrapper.
-                packet = {'frame': frame_id, 'chunk': i, 'total_chunks': len(chunks), 'data': base64.b64encode(chunk).decode('utf-8')}
+                # The packet wrapper contains the base64 encoded chunk of the gzipped payload.
+                packet = {
+                    'frame': frame_id, 
+                    'chunk': i, 
+                    'total_chunks': len(chunks), 
+                    'data': base64.b64encode(chunk).decode('utf-8')
+                }
                 self.sock.sendto(json.dumps(packet).encode('utf-8'), (self.ip, self.port))
         except Exception as e:
             print(f"UDP send error: {e}\n{traceback.format_exc()}")
 
-    def close(self): self.sock.close()
+    def close(self):
+        self.sock.close()
+
 
 # ==============================================================================
-# -- CarlaSimulation Class -----------------------------------------------------
+# -- CarlaSimulation Class (The Sender) ----------------------------------------
 # ==============================================================================
 class CarlaSimulation:
     """The main class that orchestrates the entire simulation."""
@@ -404,8 +425,7 @@ class CarlaSimulation:
         self.display_manager = DisplayManager(grid_size=(GRID_COLS, GRID_ROWS))
         self.hud = HUD(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.controller = KeyboardController(self)
-        # --- THE FIX: Use a smaller, safer chunk size to avoid OS buffer errors ---
-        self.udp_sender = UDPDataSender(chunk_size=32768)  # Using 32KB packets
+        self.udp_sender = UDPDataSender(chunk_size=32768)
         self.image_saver = ImageSaver(); self.image_saver.start()
         self._setup_actors_and_sensors()
         self.kalman_filter = KalmanFilterSystem(dt=1.0/TICK_RATE)
@@ -547,16 +567,16 @@ class CarlaSimulation:
             
             if processed_data is not None:
                 data_packet[name] = processed_data
-
+        
+        # Omit large data blobs from console printout for readability
         debug_packet = data_packet.copy()
         for key, value in debug_packet.items():
             if isinstance(value, str) and len(value) > 100:
                 debug_packet[key] = f"<base64 data len:{len(value)}>"
 
-        print("--- Sending JSON Packet (Frame {}) ---".format(data_packet.get('frame', 'N/A')))
-        print(json.dumps(debug_packet, indent=4))
-        print("--------------------------------------")
-
+        # print("--- Sending JSON Packet (Frame {}) ---".format(data_packet.get('frame', 'N/A')))
+        # print(json.dumps(debug_packet, indent=2))
+        # print("--------------------------------------")
         self.udp_sender.send(data_packet)
 
     def _cleanup(self):
@@ -637,8 +657,171 @@ class CarlaSimulation:
         }
 
 # ==============================================================================
+# -- NEW: UDPDataReceiver Class (The Decoder/Saver) ----------------------------
+# ==============================================================================
+class UDPDataReceiver:
+    """Receives, reassembles, decompresses, and saves data from the UDP sender."""
+
+    def __init__(self, ip: str = '127.0.0.1', port: int = 10000, output_dir: str = DECODED_DATA_DIR):
+        self.ip = ip
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.output_dir = output_dir
+        self.reassembly_buffer: Dict[int, Dict[str, Any]] = {}
+        self.running = True
+
+    def run(self):
+        """Main loop to listen for and process UDP packets."""
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.sock.bind((self.ip, self.port))
+        print(f"Receiver listening on {self.ip}:{self.port}")
+        print(f"Decoded data will be saved in '{self.output_dir}/'")
+
+        try:
+            while self.running:
+                try:
+                    data, addr = self.sock.recvfrom(65535) # Max UDP packet size
+                    packet = json.loads(data.decode('utf-8'))
+                    self._process_packet(packet)
+                except json.JSONDecodeError:
+                    print("Received malformed JSON packet. Discarding.", file=sys.stderr)
+                except UnicodeDecodeError:
+                    print("Received packet with invalid UTF-8 data. Discarding.", file=sys.stderr)
+                except socket.timeout:
+                    continue # No data received, just loop again
+        except KeyboardInterrupt:
+            print("\nReceiver stopped by user.")
+        finally:
+            self.close()
+
+    def _process_packet(self, packet: Dict):
+        """Handles incoming packets and reassembles them by frame."""
+        frame_id = packet.get('frame')
+        if frame_id is None: return
+
+        if frame_id not in self.reassembly_buffer:
+            total_chunks = packet.get('total_chunks', 0)
+            if total_chunks == 0: return
+            self.reassembly_buffer[frame_id] = {
+                "chunks": [None] * total_chunks,
+                "received_count": 0,
+                "total_chunks": total_chunks
+            }
+        
+        buffer_entry = self.reassembly_buffer[frame_id]
+        chunk_index = packet.get('chunk')
+        if chunk_index is None or chunk_index >= buffer_entry['total_chunks']: return
+
+        # Store chunk only if it hasn't been received yet
+        if buffer_entry['chunks'][chunk_index] is None:
+            buffer_entry['chunks'][chunk_index] = packet.get('data')
+            buffer_entry['received_count'] += 1
+
+        # If all chunks are received, process the full frame
+        if buffer_entry['received_count'] == buffer_entry['total_chunks']:
+            self._process_frame(frame_id)
+
+    def _process_frame(self, frame_id: int):
+        """Decompresses, validates, and saves the data for a completed frame."""
+        print(f"Frame {frame_id}: All chunks received. Processing...")
+        buffer_entry = self.reassembly_buffer.pop(frame_id)
+        
+        try:
+            # 1. Reassemble and decode from base64
+            b64_decoded_chunks = [base64.b64decode(c) for c in buffer_entry['chunks']]
+            compressed_data = b"".join(b64_decoded_chunks)
+            
+            # 2. Decompress the GZIP data
+            json_str = gzip.decompress(compressed_data).decode('utf-8')
+            
+            # 3. Load the JSON data into a dictionary
+            data_packet = json.loads(json_str)
+
+            # 4. Verify data integrity with CRC32
+            received_crc = data_packet.pop('_crc32', None)
+            if received_crc is None:
+                print(f"Frame {frame_id}: CRC validation failed. No checksum found.", file=sys.stderr)
+                return
+
+            # Re-create the JSON string *without* the CRC key to calculate our own checksum
+            json_for_crc = json.dumps(data_packet, ensure_ascii=False, separators=(',', ':'))
+            calculated_crc = binascii.crc32(json_for_crc.encode('utf-8'))
+            
+            if received_crc != calculated_crc:
+                print(f"Frame {frame_id}: CRC validation FAILED! Data may be corrupt. Received={received_crc}, Calculated={calculated_crc}", file=sys.stderr)
+                # We can still try to save it for debugging
+            else:
+                print(f"Frame {frame_id}: CRC validation successful.")
+
+            # 5. Save the data to disk
+            self._save_data(frame_id, data_packet)
+
+        except gzip.BadGzipFile:
+            print(f"Frame {frame_id}: GZIP decompression failed. Data is corrupt.", file=sys.stderr)
+        except Exception as e:
+            print(f"Frame {frame_id}: An error occurred during processing: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+
+    def _save_data(self, frame_id: int, data: Dict):
+        """Saves the decoded packet data into a structured folder."""
+        frame_dir = os.path.join(self.output_dir, f"frame_{frame_id:06d}")
+        os.makedirs(frame_dir, exist_ok=True)
+        
+        metadata = {}
+        
+        for key, value in data.items():
+            # Check for keys that contain large binary data (images, lidar)
+            if key.startswith('cam_') and isinstance(value, str):
+                try:
+                    img_data = base64.b64decode(value)
+                    with open(os.path.join(frame_dir, f"{key}.jpg"), 'wb') as f:
+                        f.write(img_data)
+                except Exception as e:
+                    print(f"Could not save image {key} for frame {frame_id}: {e}")
+            elif key == 'lidar' and isinstance(value, str):
+                 try:
+                    lidar_data = base64.b64decode(value)
+                    with open(os.path.join(frame_dir, f"{key}.bin"), 'wb') as f:
+                        f.write(lidar_data)
+                 except Exception as e:
+                    print(f"Could not save LiDAR data for frame {frame_id}: {e}")
+            else:
+                # Add all other data to the metadata file
+                metadata[key] = value
+        
+        # Save the rest of the data as a JSON file
+        with open(os.path.join(frame_dir, 'metadata.json'), 'w') as f:
+            json.dump(metadata, f, indent=4)
+        
+        print(f"Frame {frame_id}: Successfully saved data to {frame_dir}")
+
+
+    def close(self):
+        """Shuts down the receiver."""
+        self.running = False
+        self.sock.close()
+        print("Receiver socket closed.")
+
+
+# ==============================================================================
 # -- Main Execution ------------------------------------------------------------
 # ==============================================================================
 if __name__ == '__main__':
-    simulation = CarlaSimulation()
-    simulation.run()
+    parser = argparse.ArgumentParser(description="Run the CARLA Simulation Sender or the UDP Data Receiver.")
+    parser.add_argument('mode', choices=['sender', 'receiver'], help="Choose 'sender' to run the simulation or 'receiver' to run the data decoder.")
+    args = parser.parse_args()
+
+    if args.mode == 'sender':
+        print("Starting in SENDER mode (CARLA Simulation)...")
+        simulation = CarlaSimulation()
+        simulation.run()
+    elif args.mode == 'receiver':
+        print("Starting in RECEIVER mode...")
+        receiver = UDPDataReceiver()
+        try:
+            receiver.run()
+        except Exception as e:
+            print(f"An error occurred in the receiver: {e}")
+        finally:
+            receiver.close()
