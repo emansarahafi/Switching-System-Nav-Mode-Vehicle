@@ -1,28 +1,6 @@
 # ==============================================================================
-# -- System Configuration Summary ----------------------------------------------
-# ==============================================================================
-#
-# This script implements a teleoperated vehicle with a full sensor suite where
-# each primary sensor is accompanied by two redundant backups.
-#
-# Sensor Suite & Positioning:
-# 1.  Cameras: Provide visual feedback.
-#     - Front, Rear, Sides, and Interior.
-# 2.  LiDAR: High-res 3D mapping.
-#     - Roof (360-degree) and Front/Rear Bumpers.
-# 3.  GPS (GNSS): Global positioning.
-#     - Roof.
-# 4.  IMU: Measures acceleration/orientation.
-#     - Center of Gravity.
-# 5.  Radar: Detects objects/speed.
-#     - Front/Rear Bumpers and Corners.
-# 6.  Ultrasonic Sensors: Short-range detection.
-#     - Front/Rear Bumpers.
-# 7.  Kalman Filtering: Fuses primary sensor data (GPS, IMU) for robust positioning.
-# 8.  Redundancy: Each sensor has 2 backups for health monitoring and fault tolerance.
-#
-# ==============================================================================
-# -- Imports -------------------------------------------------------------------
+# -- Imports, etc. (No changes here)
+# ...
 # ==============================================================================
 import glob
 import os
@@ -65,13 +43,21 @@ CAMERA_DIRS = {
     'left': os.path.join(DATA_DIR, 'images/left'), 'right': os.path.join(DATA_DIR, 'images/right'),
     'interior': os.path.join(DATA_DIR, 'images/interior')
 }
-WEATHER_PRESETS = [carla.WeatherParameters.ClearNoon, carla.WeatherParameters.CloudyNoon, carla.WeatherParameters.WetNoon, carla.WeatherParameters.HardRainNoon]
+
+# <<< MODIFIED (1/4): Changed WEATHER_PRESETS from a list to a dictionary >>>
+WEATHER_PRESETS = {
+    'ClearNoon': carla.WeatherParameters.ClearNoon,
+    'CloudyNoon': carla.WeatherParameters.CloudyNoon,
+    'WetNoon': carla.WeatherParameters.WetNoon,
+    'HardRainNoon': carla.WeatherParameters.HardRainNoon
+}
+
 MAP_LAYERS = [carla.MapLayer.NONE, carla.MapLayer.Buildings, carla.MapLayer.Decals, carla.MapLayer.Foliage, carla.MapLayer.Ground, carla.MapLayer.ParkedVehicles, carla.MapLayer.Particles, carla.MapLayer.Props, carla.MapLayer.StreetLights, carla.MapLayer.Walls, carla.MapLayer.All]
 
 # ==============================================================================
-# -- Helper Classes ------------------------------------------------------------
+# -- Helper Classes (No changes here)
+# ...
 # ==============================================================================
-
 class ImageSaver(threading.Thread):
     def __init__(self): super().__init__(); self.daemon=True; self.queue=Queue(); self.running=True
     def run(self):
@@ -117,7 +103,6 @@ class HUD:
     def _render_sensor_health(self, display: pygame.Surface, health_data: Dict[str, List[str]]):
         x_offset = WINDOW_WIDTH - 280; y_offset = 10
         display.blit(self.font.render("--- Sensor Health ---", True, (255, 255, 255)), (x_offset, y_offset)); y_offset += 20
-        # <<< MODIFIED: Sort sensor names for consistent display order >>>
         for name in sorted(health_data.keys()):
             statuses = health_data[name]
             name_surface = self.font.render(f"{name.replace('_', ' ').title()}: ", True, (255, 255, 255)); display.blit(name_surface, (x_offset, y_offset))
@@ -228,7 +213,11 @@ class CarlaSimulation:
         self.controller=None; self.udp_sender=None; self.image_saver=None; self.sensors={}; self.log_files={}; self.csv_writers={}
         self.kalman_filter=None; self.fused_state=None; self.autopilot=False; self.running=True
         self.recording_images=False; self.recording_sim=False; self.show_hud=True; self.collision_count=0; self.lane_invasion_count=0
-        self.current_weather_index=0; self.current_layer_index=0
+        
+        # <<< MODIFIED (2/4): Create an ordered list of weather names for cycling through them >>>
+        self.weather_names = list(WEATHER_PRESETS.keys())
+        self.current_weather_index = 0
+        self.current_layer_index = 0
 
     def run(self):
         try:
@@ -241,6 +230,8 @@ class CarlaSimulation:
                 self._tick_simulation()
         finally: self._cleanup()
 
+    # ... other methods like _initialize, _setup_logging, _spawn_sensor_with_backups, _setup_actors_and_sensors ...
+    # No changes in these methods, they are omitted for brevity
     def _initialize(self):
         pygame.init(); pygame.font.init(); self._setup_logging()
         self.client=carla.Client('localhost',2000); self.client.set_timeout(20.0)
@@ -275,38 +266,24 @@ class CarlaSimulation:
         vehicle_bp = self.world.get_blueprint_library().find(VEHICLE_MODEL)
         spawn_point = random.choice(self.world.get_map().get_spawn_points())
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
-
-        # === Camera Suite ===
         self._spawn_sensor_with_backups('cam_front', 'RGB', carla.Transform(carla.Location(x=1.5,z=2.4)), display_pos=(1,0), camera_name='front')
-        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(2,1), camera_name='back')
+        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(1,2), camera_name='back') # Corrected display pos
         self._spawn_sensor_with_backups('cam_left', 'RGB', carla.Transform(carla.Location(x=1.3,y=-0.9,z=1.2),carla.Rotation(yaw=-110)), display_pos=(0,0), camera_name='left')
-        self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right')
+        self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right') # Corrected display pos
         self._spawn_sensor_with_backups('cam_interior', 'RGB', carla.Transform(carla.Location(x=0.5,y=-0.3,z=1.4),carla.Rotation(pitch=-15,yaw=180)), display_pos=(1,1), camera_name='interior')
-
-        # === Core Positioning & Inertial Sensors ===
         self._spawn_sensor_with_backups('gnss', 'GNSS', carla.Transform(carla.Location(z=2.6)))
         self._spawn_sensor_with_backups('imu', 'IMU', carla.Transform(carla.Location(x=0,z=0.5)))
-
-        # === LiDAR Suite ===
         self._spawn_sensor_with_backups('lidar_roof', 'LIDAR', carla.Transform(carla.Location(z=2.5)), {'range':'100', 'points_per_second':'100000'})
-        # <<< ADDED: Front and rear bumper LiDARs >>>
         self._spawn_sensor_with_backups('lidar_front', 'LIDAR', carla.Transform(carla.Location(x=2.5, z=0.5)), {'range': '50', 'points_per_second':'60000'})
         self._spawn_sensor_with_backups('lidar_back', 'LIDAR', carla.Transform(carla.Location(x=-2.5, z=0.5), carla.Rotation(yaw=180)), {'range': '50', 'points_per_second':'60000'})
-
-        # === Radar & Ultrasonic Suite ===
-        # <<< ADDED: Full radar and ultrasonic sensor suite >>>
-        # Front/Rear Bumper
         self._spawn_sensor_with_backups('radar_front', 'RADAR', carla.Transform(carla.Location(x=2.5,z=0.7)), {'range':'150'})
         self._spawn_sensor_with_backups('radar_back', 'RADAR', carla.Transform(carla.Location(x=-2.5,z=0.7), carla.Rotation(yaw=180)), {'range':'150'})
         self._spawn_sensor_with_backups('ultrasonic_front', 'ULTRASONIC', carla.Transform(carla.Location(x=2.2,z=0.5)))
         self._spawn_sensor_with_backups('ultrasonic_back', 'ULTRASONIC', carla.Transform(carla.Location(x=-2.2,z=0.5), carla.Rotation(yaw=180)))
-        # Corner Radars
         self._spawn_sensor_with_backups('radar_front_left', 'RADAR', carla.Transform(carla.Location(x=2.0, y=-0.9, z=0.7), carla.Rotation(yaw=-45)), {'range':'75'})
         self._spawn_sensor_with_backups('radar_front_right', 'RADAR', carla.Transform(carla.Location(x=2.0, y=0.9, z=0.7), carla.Rotation(yaw=45)), {'range':'75'})
         self._spawn_sensor_with_backups('radar_rear_left', 'RADAR', carla.Transform(carla.Location(x=-2.0, y=-0.9, z=0.7), carla.Rotation(yaw=-135)), {'range':'75'})
         self._spawn_sensor_with_backups('radar_rear_right', 'RADAR', carla.Transform(carla.Location(x=-2.0, y=0.9, z=0.7), carla.Rotation(yaw=135)), {'range':'75'})
-
-        # === Event Sensors ===
         self._spawn_sensor_with_backups('collision', 'COLLISION', carla.Transform())
         self._spawn_sensor_with_backups('lane_invasion', 'LANE_INVASION', carla.Transform())
         print("All sensors spawned.")
@@ -320,7 +297,7 @@ class CarlaSimulation:
         display = self.display_manager.render()
         if self.show_hud: self.hud.render(display, self._get_simulation_state(snapshot))
         pygame.display.flip()
-
+        
     def _process_sensor_data(self, snapshot):
         if self.recording_images:
             for sensor_list in self.sensors.values():
@@ -342,13 +319,15 @@ class CarlaSimulation:
     def _send_udp_data(self, snapshot):
         t=self.vehicle.get_transform(); v=self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
-        # <<< MODIFIED: Added mode, map, and weather to the data packet >>>
-        weather_name = WEATHER_PRESETS[self.current_weather_index].__class__.__name__
+
+        # <<< MODIFIED (3/4): Get the weather name correctly from the list of names >>>
+        current_weather_name = self.weather_names[self.current_weather_index]
+
         data_packet = {
             'timestamp':snapshot.timestamp.elapsed_seconds, 'frame':snapshot.frame,
             'mode': 'autopilot' if self.autopilot else 'manual',
             'map': self.world.get_map().name.split('/')[-1],
-            'weather': weather_name,
+            'weather': current_weather_name,
             'speed':np.linalg.norm([v.x,v.y,v.z])*3.6, 'position':{'x':t.location.x,'y':t.location.y,'z':t.location.z},
             'rotation':{'pitch':t.rotation.pitch,'yaw':t.rotation.yaw,'roll':t.rotation.roll},
             'control':self.controller.get_control_state(), 'fused_state':self.fused_state,
@@ -386,7 +365,14 @@ class CarlaSimulation:
         self.recording_sim=not self.recording_sim
         if self.recording_sim: self.client.start_recorder(os.path.join(LOG_DIR,f"sim_rec_{time.time()}.log"))
         else: self.client.stop_recorder()
-    def change_weather(self, d): self.current_weather_index=(self.current_weather_index+d)%len(WEATHER_PRESETS); self.world.set_weather(WEATHER_PRESETS[self.current_weather_index])
+    
+    def change_weather(self, d):
+        # <<< MODIFIED (4/4): Cycle the index and use it to get the name and object correctly >>>
+        self.current_weather_index = (self.current_weather_index + d) % len(self.weather_names)
+        weather_name = self.weather_names[self.current_weather_index]
+        self.world.set_weather(WEATHER_PRESETS[weather_name])
+        print(f"Weather changed to: {weather_name}")
+
     def change_map_layer(self, d): self.current_layer_index=(self.current_layer_index+d)%len(MAP_LAYERS)
     def toggle_current_map_layer(self, unload):
         if unload: self.world.unload_map_layer(MAP_LAYERS[self.current_layer_index])
@@ -400,7 +386,7 @@ class CarlaSimulation:
         self.world = self.client.load_world(map_name)
         settings=self.world.get_settings(); settings.synchronous_mode=True; settings.fixed_delta_seconds=1.0/TICK_RATE
         self.world.apply_settings(settings); self._setup_actors_and_sensors()
-
+        
     def _get_simulation_state(self, snapshot):
         v = self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
