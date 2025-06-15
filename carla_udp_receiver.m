@@ -13,11 +13,9 @@ function carla_udp_receiver(port)
     global carla_outputs;
     carla_outputs = struct();
 
-    % <<< MODIFIED: Add a flag to control the main loop for graceful exit >>>
     is_running = true;
 
     % --- Setup UI and UDP ---
-    % <<< MODIFIED: Pass the handle to the close request callback to the UI setup >>>
     [uiHandles] = setupDashboard(HISTORY_LENGTH, @onCloseRequest);
     logToDashboard(uiHandles, 'Dashboard initialized. Starting UDP receiver...');
     
@@ -28,7 +26,7 @@ function carla_udp_receiver(port)
     catch ME
         logToDashboard(uiHandles, sprintf('[FATAL] UDP setup failed: %s', ME.message));
         errordlg(sprintf('UDP setup on port %d failed. Is it in use?', port), 'UDP Error');
-        is_running = false; % Prevent loop from starting if UDP fails
+        is_running = false; 
     end
 
     % --- Data Storage and State Initialization ---
@@ -42,17 +40,13 @@ function carla_udp_receiver(port)
     
     % --- Main Loop ---
     logToDashboard(uiHandles, 'Waiting for data from CARLA...');
-    % <<< MODIFIED: Main loop now controlled by our flag >>>
     while is_running
-        if ~ishandle(uiHandles.fig) % Additional safety check
+        if ~ishandle(uiHandles.fig) 
             break;
         end
 
-        if uiHandles.isPaused
-            pause(0.2);
-            continue;
-        end
-
+        % <<< REMOVED: Pause logic is no longer needed >>>
+        
         % Read and process data from UDP
         if u.NumBytesAvailable > 0
             byteData = read(u, u.NumBytesAvailable, "uint8");
@@ -92,7 +86,6 @@ function carla_udp_receiver(port)
     if ishandle(uiHandles.fig), delete(uiHandles.fig); end
     disp('CARLA UDP Receiver has shut down gracefully.');
 
-    % --- Nested Callback Function for UI Close ---
     function onCloseRequest(~, ~)
         is_running = false;
     end
@@ -104,12 +97,11 @@ end
 
 function [uiHandles] = setupDashboard(historyLength, closeCallback)
     fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Position', [50 50, 1600, 950]);
-    % <<< MODIFIED: Assign the custom close function >>>
     fig.CloseRequestFcn = closeCallback;
 
     uiHandles.fig = fig;
-    uiHandles.isPaused = false;
-    
+    % <<< REMOVED: isPaused flag is no longer needed >>>
+
     gl = uigridlayout(fig, [3, 4]);
     gl.RowHeight = {250, '2x', 200};
     gl.ColumnWidth = {'1x', '1x', '1x', '1x'};
@@ -131,9 +123,10 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     xlabel(uiHandles.gnssAx,'Longitude'); ylabel(uiHandles.gnssAx,'Latitude');
     uiHandles.gnssPlot = plot(uiHandles.gnssAx,NaN,NaN,'-m','LineWidth',1.5);
 
-    p_diag = uipanel(gl,'Title','Diagnostics & Controls','FontWeight','bold'); p_diag.Layout.Row=1; p_diag.Layout.Column=4;
-    g_diag = uigridlayout(p_diag,[2 1],'RowHeight',{'2x','fit'});
-    p_diag_metrics = uipanel(g_diag,'Title',''); p_diag_metrics.Layout.Row=1;
+    p_diag = uipanel(gl,'Title','Diagnostics','FontWeight','bold'); p_diag.Layout.Row=1; p_diag.Layout.Column=4; % Title updated
+    % <<< REMOVED: The sub-grid for controls has been removed. >>>
+    g_diag = uigridlayout(p_diag,[1 1]);
+    p_diag_metrics = uipanel(g_diag,'Title','');
     g_diag_metrics = uigridlayout(p_diag_metrics,[7,2],'ColumnWidth',{'fit','1x'});
     
     uilabel(g_diag_metrics,'Text','Frame:', 'FontSize', 10); 
@@ -151,11 +144,8 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uilabel(g_diag_metrics,'Text','Fallback Status:', 'FontSize', 10); 
     uiHandles.fallbackLabel=uilabel(g_diag_metrics,'Text','IDLE','FontWeight','bold','FontColor','g', 'HorizontalAlignment', 'left', 'FontSize', 10);
     
-    p_ctrl = uipanel(g_diag,'Title',''); p_ctrl.Layout.Row=2;
-    g_ctrl = uigridlayout(p_ctrl,[1 2]);
-    uiHandles.pauseButton=uibutton(g_ctrl,'Text','Pause', 'ButtonPushedFcn',@(s,e)pauseCallback(uiHandles));
-    uiHandles.saveButton=uibutton(g_ctrl,'Text','Save Snapshot', 'ButtonPushedFcn',@(s,e)saveCallback(uiHandles));
-
+    % <<< REMOVED: Code block for creating the buttons. >>>
+    
     p_cameras = uipanel(gl,'Title','Camera Feeds','FontWeight','bold'); p_cameras.Layout.Row=2; p_cameras.Layout.Column=[1 2];
     g_cameras = uigridlayout(p_cameras,[2 3]);
     uiHandles.camLeftAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); title(uiHandles.camLeftAx,'Left');
@@ -176,8 +166,7 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.logArea = uitextarea(uigridlayout(p_log,[1 1]), 'Value',{''}, 'Editable','off', 'FontName', 'Monospaced', 'BackgroundColor', [0.1 0.1 0.1], 'FontColor', [0.9 0.9 0.9]);
 end
 
-function pauseCallback(uiHandles), uiHandles.isPaused = ~uiHandles.isPaused; if uiHandles.isPaused, uiHandles.pauseButton.Text = 'Resume'; else, uiHandles.pauseButton.Text = 'Pause'; end, end
-function saveCallback(uiHandles), filename = ['CARLA_Snapshot_' datestr(now, 'yyyymmdd_HHMMSS') '.png']; exportgraphics(uiHandles.fig, filename); logToDashboard(uiHandles, sprintf('Dashboard saved to %s', filename)); end
+% <<< REMOVED: Unused callback functions. >>>
 
 %% =======================================================================
 %                      DATA PROCESSING AND UPDATING
@@ -231,7 +220,6 @@ function outputs = processAndAnalyzeFrame(frame, latency, uiHandles)
     outputs.processed_sensor_data = struct(); 
     
     fallback = false; reason = {};
-    % <<< FIXED: Latency check updated to 200ms (0.2s) >>>
     if latency > 0.2, fallback = true; reason{end+1} = 'High Latency (>200ms)'; end
     if isstruct(health), all_groups = struct2cell(health); total_fail = 0; total_sens = 0; for i=1:numel(all_groups), status_list=all_groups{i}; total_sens=total_sens+numel(status_list); total_fail=total_fail+sum(~strcmp(status_list,'OK')); end; if total_fail > total_sens/2, fallback=true; reason{end+1} = 'Critical Sensor Failure'; end; end
     if ~isempty(covariance) && any(diag(covariance(1:2,1:2)) > 10), fallback = true; reason{end+1} = 'High Position Uncertainty'; end
