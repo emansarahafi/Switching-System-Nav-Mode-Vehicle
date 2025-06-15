@@ -156,7 +156,9 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     if isfield(data, 'speed'), uiHandles.speedGauge.Value = data.speed; end
     set(uiHandles.accelXPlot, 'YData', imu_history.x); set(uiHandles.accelYPlot, 'YData', imu_history.y); set(uiHandles.accelZPlot, 'YData', imu_history.z);
     set(uiHandles.gnssPlot, 'XData', gnss_track(:,2), 'YData', gnss_track(:,1));
-    if ~any(isnan(trajectory), 'all'), set(uiHandles.trajPlot, 'XData', trajectory(:,1), 'YData', trajectory(:,2)); set(uiHandles.currentPosPlot, 'XData', trajectory(end,1), 'YData', trajectory(end,2)); end
+    % --- This is the CORRECTED line ---
+    set(uiHandles.trajPlot, 'XData', trajectory(:,1), 'YData', trajectory(:,2));
+    set(uiHandles.currentPosPlot, 'XData', trajectory(end,1), 'YData', trajectory(end,2));
     if isfield(data, 'frame'), uiHandles.frameLabel.Text = num2str(data.frame); end
     uiHandles.latencyLabel.Text = sprintf('%.2f ms', outputs.network_status.latency * 1000);
     
