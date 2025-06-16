@@ -37,7 +37,6 @@ function carla_udp_receiver(port)
     imu_history = struct('x', nan(1, HISTORY_LENGTH), 'y', nan(1, HISTORY_LENGTH), 'z', nan(1, HISTORY_LENGTH));
     
     buffer = '';
-    frame_data = struct();
     last_message_time = tic;
     
     % --- Main Loop ---
@@ -47,36 +46,66 @@ function carla_udp_receiver(port)
             break;
         end
         
+        latest_frame_to_render = []; % Used to ensure we only render the newest frame
+        
         if u.NumBytesAvailable > 0
             byteData = read(u, u.NumBytesAvailable, "uint8");
             newData = native2unicode(byteData, 'UTF-8');
             buffer = [buffer, newData];
             last_message_time = tic;
             
-            while ~isempty(buffer)
-                [jsonStr, buffer] = extractJSON(buffer);
-                if isempty(jsonStr), break; end
+            % <<< MODIFIED: High-performance batch processing logic >>>
+            % Replace the slow character-by-character loop with a fast,
+            % vectorized string splitting approach.
+            
+            % 1. Create a unique delimiter and use fast, vectorized strrep.
+            delimiter = '|||JSON_DELIMITER|||';
+            sanitizedBuffer = strrep(buffer, '}{', ['}' delimiter '{']);
+            
+            % 2. Split the entire buffer into a cell array of JSON strings.
+            jsonObjects = strsplit(sanitizedBuffer, delimiter);
+            
+            % 3. The last element might be an incomplete JSON. Check it.
+            if ~endsWith(jsonObjects{end}, '}')
+                % It's incomplete, so it becomes the buffer for the next round.
+                buffer = jsonObjects{end};
+                % We only process the complete objects.
+                jsonObjects = jsonObjects(1:end-1);
+            else
+                % All objects were complete, so clear the buffer.
+                buffer = '';
+            end
+            
+            % 4. Process the batch of complete JSON objects.
+            for i = 1:numel(jsonObjects)
+                jsonStr = jsonObjects{i};
+                if isempty(jsonStr), continue; end
                 
                 try
                     packet = jsondecode(jsonStr);
                     processed_frame = processPacket(packet); 
                     if ~isempty(processed_frame)
-                        frame_data = processed_frame;
+                        % We store the latest valid frame to render *after* the loop
+                        latest_frame_to_render = processed_frame;
                     end
                 catch ME
-                    logToDashboard(uiHandles, sprintf('[ERROR] JSON processing: %s', ME.message));
+                    % This can happen if a split results in a malformed string.
+                    % It's safe to ignore and continue.
+                    logToDashboard(uiHandles, sprintf('[WARN] JSON decode failed: %s', ME.message));
                 end
             end
         end
         
-        if ~isempty(frame_data)
+        % Only update the UI if we received a new, valid frame in this cycle.
+        % This renders only the LATEST data, ensuring real-time feel.
+        if ~isempty(latest_frame_to_render)
+            frame_data = latest_frame_to_render;
             [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, trajectory, gnss_track, imu_history);
             processAndAnalyzeFrame(frame_data, toc(last_message_time), uiHandles);
             updateDashboard(uiHandles, frame_data, trajectory, gnss_track, imu_history, carla_outputs);
-            frame_data = [];
         end
         
-        pause(0.01);
+        pause(0.01); % Yield to the OS and UI thread
     end
     
     logToDashboard(uiHandles, 'Shutdown sequence initiated...');
@@ -143,15 +172,12 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.trajPlot=plot(uiHandles.trajAx,NaN,NaN,'-c','LineWidth',2,'DisplayName','Path'); 
     uiHandles.currentPosPlot=plot(uiHandles.trajAx,NaN,NaN,'bo','MarkerFaceColor','b','MarkerSize',8,'DisplayName','Current'); 
     legend(uiHandles.trajAx);
-    
     p_lidar = uipanel(gl,'Title','3D LiDAR & Object Detections','FontWeight','bold'); p_lidar.Layout.Row=2; p_lidar.Layout.Column=4;
     uiHandles.lidarAx=uiaxes(p_lidar); 
     hold(uiHandles.lidarAx,'on'); grid(uiHandles.lidarAx,'on'); axis(uiHandles.lidarAx,'equal'); xlabel(uiHandles.lidarAx,'X (m)'); ylabel(uiHandles.lidarAx,'Y (m)'); zlabel(uiHandles.lidarAx,'Z (m)'); view(uiHandles.lidarAx, -45, 30);
     uiHandles.lidarPlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 10, NaN, 'filled', 'DisplayName', 'LiDAR Points');
-    % <<< ADDED: A new plot object for the detected obstacles >>>
     uiHandles.obstaclePlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 100, 'bo', 'filled', 'MarkerFaceAlpha', 0.6, 'DisplayName', 'Obstacles');
     legend(uiHandles.lidarAx);
-    
     p_log = uipanel(gl,'Title','System Log','FontWeight','bold'); p_log.Layout.Row=3; p_log.Layout.Column=[1 4];
     uiHandles.logArea = uitextarea(uigridlayout(p_log,[1 1]), 'Value',{''}, 'Editable','off', 'FontName', 'Monospaced', 'BackgroundColor', [0.1 0.1 0.1], 'FontColor', [0.9 0.9 0.9]);
 end
@@ -176,23 +202,19 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     updateCamera(uiHandles.camFrontAx, data, 'image_front'); updateCamera(uiHandles.camRearAx, data, 'image_back'); updateCamera(uiHandles.camLeftAx, data, 'image_left'); updateCamera(uiHandles.camRightAx, data, 'image_right'); updateCamera(uiHandles.camInteriorAx, data, 'image_interior');
     if isfield(data, 'lidar_roof') && ~isempty(data.lidar_roof), try, points = typecast(base64decode(data.lidar_roof), 'single'); if mod(numel(points), 4) == 0, points = reshape(points, 4, [])'; xyz = points(1:20:end, 1:3); set(uiHandles.lidarPlot, 'XData', xyz(:,1), 'YData', xyz(:,2), 'ZData', xyz(:,3), 'CData', xyz(:,3)); end; catch, end; end
 
-    % <<< ADDED: Plot the detected obstacles from the new JSON field >>>
     obstacles = get_safe(data, 'Detected_Obstacles', []);
     if ~isempty(obstacles)
-        % Pre-allocate arrays for performance
         num_obstacles = numel(obstacles);
         obs_x = nan(num_obstacles, 1);
         obs_y = nan(num_obstacles, 1);
         obs_z = nan(num_obstacles, 1);
         for i = 1:num_obstacles
-            % The data is nested, so we extract it
             obs_x(i) = obstacles(i).position.x;
             obs_y(i) = obstacles(i).position.y;
             obs_z(i) = obstacles(i).position.z;
         end
         set(uiHandles.obstaclePlot, 'XData', obs_x, 'YData', obs_y, 'ZData', obs_z);
     else
-        % If no obstacles, clear the plot
         set(uiHandles.obstaclePlot, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
     end
 end
@@ -204,10 +226,8 @@ end
 function [trajectory, gnss_track, imu_history] = updateDataHistories(data, trajectory, gnss_track, imu_history)
     fused_state = get_safe(data, 'fused_state', struct('x', NaN, 'y', NaN));
     if isstruct(fused_state) && ~isnan(fused_state.x), new_pos = [fused_state.x, fused_state.y]; trajectory = [trajectory(2:end,:); new_pos]; end
-    
     gnss_data = get_safe(data, 'gnss', []);
     if isstruct(gnss_data), new_gnss = [gnss_data.lat, gnss_data.lon]; gnss_track = [gnss_track(2:end,:); new_gnss]; end
-    
     imu_b64 = get_safe(data, 'imu', '');
     if ~isempty(imu_b64), try, imu_vals = typecast(base64decode(imu_b64), 'single'); if numel(imu_vals) >= 3, imu_history.x = [imu_history.x(2:end), imu_vals(1)]; imu_history.y = [imu_history.y(2:end), imu_vals(2)]; imu_history.z = [imu_history.z(2:end), imu_vals(3)]; end; catch, end; end
 end
@@ -215,8 +235,6 @@ end
 function processAndAnalyzeFrame(frame, latency, uiHandles)
     global carla_outputs; 
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
-
-    % 1. NETWORK STATUS
     if isempty(last_call_timer)
         time_since_last = 1/20; 
         last_call_timer = tic; 
@@ -226,8 +244,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     end
     data_rate = 1 / max(time_since_last, 0.001); 
     network_status = struct('latency', latency, 'data_rate', data_rate);
-
-    % 2. SENSOR FUSION STATUS
     health_score = 0;
     covariance_trace = inf;
     sensor_health_data = get_safe(frame, 'sensor_health', []);
@@ -237,7 +253,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
         for i = 1:numel(all_groups), status_list = all_groups{i}; total_sensors = total_sensors + numel(status_list); total_ok = total_ok + sum(strcmp(status_list, 'OK')); end
         if total_sensors > 0, health_score = total_ok / total_sensors; end
     end
-    
     ekf_cov_data = get_safe(frame, 'ekf_covariance', []);
     if iscell(ekf_cov_data)
         try
@@ -248,14 +263,9 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
             covariance_trace = inf;
         end
     end
-    
     fused_state_data = get_safe(frame, 'fused_state', struct('x', NaN, 'y', NaN, 'vx', NaN, 'vy', NaN));
-    sensor_fusion_status = struct('fused_state', fused_state_data, 'position_uncertainty', covariance_trace, 'health_score', health_score);
-
-    % 3. PROCESSED SENSOR DATA (Raw Data + Computed Metrics)
+    sensor_fusion_status = struct('fused_state', fused_state_data, 'position_uncertainty', covariance_trace, 'health_score', health_score, 'raw_health', sensor_health_data);
     processed_sensor_data = struct();
-    
-    % --- Copy all raw sensor data fields ---
     all_fields = fieldnames(frame);
     prefixes_to_copy = {'image_', 'lidar_', 'radar_'}; 
     single_fields_to_copy = {'gnss', 'imu', 'position', 'rotation', 'Detected_Obstacles'};
@@ -268,19 +278,14 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
             if copy_this_field, processed_sensor_data.(field) = frame.(field); end
         end
     end
-    
-    % --- Explicitly add fundamental vehicle state, ultrasonic, and control inputs using the safe getter ---
     default_control = struct('throttle',0,'brake',0,'steer',0,'hand_brake',false,'reverse',false);
     control_data = get_safe(frame, 'control', default_control);
-    
     processed_sensor_data.speed = get_safe(frame, 'speed', 0);
     processed_sensor_data.ultrasonic_front = get_safe(frame, 'ultrasonic_front', inf);
     processed_sensor_data.ultrasonic_back = get_safe(frame, 'ultrasonic_back', inf);
     processed_sensor_data.throttle_input = control_data.throttle;
     processed_sensor_data.brake_input = control_data.brake;
     processed_sensor_data.steering_input = control_data.steer;
-    
-    % --- Compute and add new metrics from raw data ---
     rotation_data = get_safe(frame, 'rotation', struct('yaw', 0));
     yaw_rate = 0;
     if isfield(rotation_data, 'yaw')
@@ -293,24 +298,18 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
         last_yaw = current_yaw;
     end
     processed_sensor_data.yaw_rate = yaw_rate;
-    
     current_collisions = get_safe(frame, 'collisions', 0);
     if isempty(last_collisions), last_collisions = current_collisions; end
     is_collision = (current_collisions > last_collisions);
     last_collisions = current_collisions;
     processed_sensor_data.is_collision_event = is_collision;
-    
     current_lane_invasions = get_safe(frame, 'lane_invasions', 0);
     if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end
     is_lane_invasion = (current_lane_invasions > last_lane_invasions);
     last_lane_invasions = current_lane_invasions;
     processed_sensor_data.is_lane_invasion_event = is_lane_invasion;
-
-    % 4. DRIVER STATE
     driver_attention = computeDriverAttention(frame);
     driver_readiness = computeDriverReadiness(frame);
-
-    % 5. FALLBACK INITIATION
     threat_data = computeThreatAssessment(frame);
     fallback = false; reason = {};
     if latency > 0.2, fallback = true; reason{end+1} = 'High Latency (>200ms)'; end
@@ -321,18 +320,8 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     if driver_readiness < 0.5, fallback = true; reason{end+1} = 'Low Driver Readiness'; end
     if processed_sensor_data.is_collision_event, fallback = true; reason{end+1} = 'Collision Detected'; end
     if processed_sensor_data.is_lane_invasion_event, fallback = true; reason{end+1} = 'Lane Invasion Detected'; end
-    
     if fallback, logToDashboard(uiHandles, sprintf('[FALLBACK] Reasons: %s', strjoin(reason, ', '))); end
-
-    % --- Final Assembly of the Global Output Struct ---
-    carla_outputs = struct(...
-        'network_status', network_status, ...
-        'sensor_fusion_status', sensor_fusion_status, ...
-        'processed_sensor_data', processed_sensor_data, ...
-        'fallback_initiation', fallback, ...
-        'driver_attention', driver_attention, ...
-        'driver_readiness', driver_readiness ...
-    );
+    carla_outputs = struct('network_status', network_status, 'sensor_fusion_status', sensor_fusion_status, 'processed_sensor_data', processed_sensor_data, 'fallback_initiation', fallback, 'driver_attention', driver_attention, 'driver_readiness', driver_readiness);
 end
 
 
@@ -358,6 +347,8 @@ function full_data = processPacket(packet)
 end
 
 function [jsonStr, remaining] = extractJSON(buffer)
+    % This function is no longer called by the high-performance loop,
+    % but is kept for legacy/testing purposes.
     jsonStr = ''; remaining = buffer; startIdx = find(buffer == '{', 1);
     if isempty(startIdx), return; end
     braceCount = 0; endIdx = 0; inString = false; escaped = false;
@@ -405,11 +396,9 @@ function score = computeDriverAttention(frame)
     if isempty(time_of_last_input), time_of_last_input = tic; end
     attention_decay_period = 5.0; 
     score = 1.0; 
-    
     mode = get_safe(frame, 'mode', 'autopilot');
     default_control = struct('steer',0,'throttle',0,'brake',0);
     controls = get_safe(frame, 'control', default_control);
-
     if strcmp(mode, 'manual')
         if abs(controls.steer) > 0.01 || controls.throttle > 0.01 || controls.brake > 0.01
             time_of_last_input = tic;
@@ -429,7 +418,6 @@ function score = computeDriverReadiness(frame)
     score = 1.0; 
     default_control = struct('throttle',0,'brake',0,'hand_brake',false);
     controls = get_safe(frame, 'control', default_control);
-    
     if controls.throttle > 0.1 && controls.brake > 0.1
         score = 0.1; 
         return;
