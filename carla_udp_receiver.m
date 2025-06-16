@@ -46,7 +46,7 @@ function carla_udp_receiver(port)
             break;
         end
         
-        latest_frame_to_render = []; % Used to ensure we only render the newest frame
+        latest_frame_to_render = [];
         
         if u.NumBytesAvailable > 0
             byteData = read(u, u.NumBytesAvailable, "uint8");
@@ -54,29 +54,17 @@ function carla_udp_receiver(port)
             buffer = [buffer, newData];
             last_message_time = tic;
             
-            % <<< MODIFIED: High-performance batch processing logic >>>
-            % Replace the slow character-by-character loop with a fast,
-            % vectorized string splitting approach.
-            
-            % 1. Create a unique delimiter and use fast, vectorized strrep.
             delimiter = '|||JSON_DELIMITER|||';
             sanitizedBuffer = strrep(buffer, '}{', ['}' delimiter '{']);
-            
-            % 2. Split the entire buffer into a cell array of JSON strings.
             jsonObjects = strsplit(sanitizedBuffer, delimiter);
             
-            % 3. The last element might be an incomplete JSON. Check it.
             if ~endsWith(jsonObjects{end}, '}')
-                % It's incomplete, so it becomes the buffer for the next round.
                 buffer = jsonObjects{end};
-                % We only process the complete objects.
                 jsonObjects = jsonObjects(1:end-1);
             else
-                % All objects were complete, so clear the buffer.
                 buffer = '';
             end
             
-            % 4. Process the batch of complete JSON objects.
             for i = 1:numel(jsonObjects)
                 jsonStr = jsonObjects{i};
                 if isempty(jsonStr), continue; end
@@ -85,19 +73,14 @@ function carla_udp_receiver(port)
                     packet = jsondecode(jsonStr);
                     processed_frame = processPacket(packet); 
                     if ~isempty(processed_frame)
-                        % We store the latest valid frame to render *after* the loop
                         latest_frame_to_render = processed_frame;
                     end
                 catch ME
-                    % This can happen if a split results in a malformed string.
-                    % It's safe to ignore and continue.
                     logToDashboard(uiHandles, sprintf('[WARN] JSON decode failed: %s', ME.message));
                 end
             end
         end
         
-        % Only update the UI if we received a new, valid frame in this cycle.
-        % This renders only the LATEST data, ensuring real-time feel.
         if ~isempty(latest_frame_to_render)
             frame_data = latest_frame_to_render;
             [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, trajectory, gnss_track, imu_history);
@@ -105,7 +88,7 @@ function carla_udp_receiver(port)
             updateDashboard(uiHandles, frame_data, trajectory, gnss_track, imu_history, carla_outputs);
         end
         
-        pause(0.01); % Yield to the OS and UI thread
+        pause(0.01); 
     end
     
     logToDashboard(uiHandles, 'Shutdown sequence initiated...');
@@ -235,6 +218,7 @@ end
 function processAndAnalyzeFrame(frame, latency, uiHandles)
     global carla_outputs; 
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
+
     if isempty(last_call_timer)
         time_since_last = 1/20; 
         last_call_timer = tic; 
@@ -244,6 +228,7 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     end
     data_rate = 1 / max(time_since_last, 0.001); 
     network_status = struct('latency', latency, 'data_rate', data_rate);
+
     health_score = 0;
     covariance_trace = inf;
     sensor_health_data = get_safe(frame, 'sensor_health', []);
@@ -253,6 +238,7 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
         for i = 1:numel(all_groups), status_list = all_groups{i}; total_sensors = total_sensors + numel(status_list); total_ok = total_ok + sum(strcmp(status_list, 'OK')); end
         if total_sensors > 0, health_score = total_ok / total_sensors; end
     end
+    
     ekf_cov_data = get_safe(frame, 'ekf_covariance', []);
     if iscell(ekf_cov_data)
         try
@@ -263,8 +249,15 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
             covariance_trace = inf;
         end
     end
+    
     fused_state_data = get_safe(frame, 'fused_state', struct('x', NaN, 'y', NaN, 'vx', NaN, 'vy', NaN));
-    sensor_fusion_status = struct('fused_state', fused_state_data, 'position_uncertainty', covariance_trace, 'health_score', health_score, 'raw_health', sensor_health_data);
+    sensor_fusion_status = struct(...
+        'fused_state', fused_state_data, ...
+        'position_uncertainty', covariance_trace, ...
+        'health_score', health_score, ...
+        'raw_health', sensor_health_data ...  % <<< ADD THIS LINE
+    );
+    
     processed_sensor_data = struct();
     all_fields = fieldnames(frame);
     prefixes_to_copy = {'image_', 'lidar_', 'radar_'}; 
@@ -278,6 +271,7 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
             if copy_this_field, processed_sensor_data.(field) = frame.(field); end
         end
     end
+    
     default_control = struct('throttle',0,'brake',0,'steer',0,'hand_brake',false,'reverse',false);
     control_data = get_safe(frame, 'control', default_control);
     processed_sensor_data.speed = get_safe(frame, 'speed', 0);
@@ -286,6 +280,7 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     processed_sensor_data.throttle_input = control_data.throttle;
     processed_sensor_data.brake_input = control_data.brake;
     processed_sensor_data.steering_input = control_data.steer;
+    
     rotation_data = get_safe(frame, 'rotation', struct('yaw', 0));
     yaw_rate = 0;
     if isfield(rotation_data, 'yaw')
@@ -298,29 +293,36 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
         last_yaw = current_yaw;
     end
     processed_sensor_data.yaw_rate = yaw_rate;
+    
     current_collisions = get_safe(frame, 'collisions', 0);
     if isempty(last_collisions), last_collisions = current_collisions; end
     is_collision = (current_collisions > last_collisions);
     last_collisions = current_collisions;
     processed_sensor_data.is_collision_event = is_collision;
+    
     current_lane_invasions = get_safe(frame, 'lane_invasions', 0);
     if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end
     is_lane_invasion = (current_lane_invasions > last_lane_invasions);
     last_lane_invasions = current_lane_invasions;
     processed_sensor_data.is_lane_invasion_event = is_lane_invasion;
+
     driver_attention = computeDriverAttention(frame);
     driver_readiness = computeDriverReadiness(frame);
+
     threat_data = computeThreatAssessment(frame);
     fallback = false; reason = {};
     if latency > 0.2, fallback = true; reason{end+1} = 'High Latency (>200ms)'; end
     if health_score < 0.75, fallback = true; reason{end+1} = 'Low Sensor Health'; end
-    if covariance_trace > 10, fallback = true; reason{end+1} = 'High Position Uncertainty'; end
+    % <<< MODIFIED: This check has been removed as requested >>>
+    % if covariance_trace > 10, fallback = true; reason{end+1} = 'High Position Uncertainty'; end
     if threat_data.min_front_distance < 10 && threat_data.closing_velocity < -5, fallback = true; reason{end+1} = 'Imminent Collision Risk'; end
     if driver_attention < 0.2, fallback = true; reason{end+1} = 'Low Driver Attention'; end
     if driver_readiness < 0.5, fallback = true; reason{end+1} = 'Low Driver Readiness'; end
     if processed_sensor_data.is_collision_event, fallback = true; reason{end+1} = 'Collision Detected'; end
     if processed_sensor_data.is_lane_invasion_event, fallback = true; reason{end+1} = 'Lane Invasion Detected'; end
+    
     if fallback, logToDashboard(uiHandles, sprintf('[FALLBACK] Reasons: %s', strjoin(reason, ', '))); end
+
     carla_outputs = struct('network_status', network_status, 'sensor_fusion_status', sensor_fusion_status, 'processed_sensor_data', processed_sensor_data, 'fallback_initiation', fallback, 'driver_attention', driver_attention, 'driver_readiness', driver_readiness);
 end
 
@@ -347,8 +349,6 @@ function full_data = processPacket(packet)
 end
 
 function [jsonStr, remaining] = extractJSON(buffer)
-    % This function is no longer called by the high-performance loop,
-    % but is kept for legacy/testing purposes.
     jsonStr = ''; remaining = buffer; startIdx = find(buffer == '{', 1);
     if isempty(startIdx), return; end
     braceCount = 0; endIdx = 0; inString = false; escaped = false;
