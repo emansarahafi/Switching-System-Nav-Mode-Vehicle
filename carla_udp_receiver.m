@@ -140,10 +140,18 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.camRearAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); title(uiHandles.camRearAx,'Back');
     p_traj = uipanel(gl,'Title','Vehicle Trajectory (Fused)','FontWeight','bold'); p_traj.Layout.Row=2; p_traj.Layout.Column=3;
     uiHandles.trajAx=uiaxes(p_traj); hold(uiHandles.trajAx,'on'); grid(uiHandles.trajAx,'on'); axis(uiHandles.trajAx,'equal'); xlabel(uiHandles.trajAx,'X (m)'); ylabel(uiHandles.trajAx,'Y (m)');
-    uiHandles.trajPlot=plot(uiHandles.trajAx,NaN,NaN,'-c','LineWidth',2); uiHandles.currentPosPlot=plot(uiHandles.trajAx,NaN,NaN,'bo','MarkerFaceColor','b','MarkerSize',8); legend(uiHandles.trajAx,'Path','Current','Location','northwest');
-    p_lidar = uipanel(gl,'Title','3D LiDAR Point Cloud (Roof)','FontWeight','bold'); p_lidar.Layout.Row=2; p_lidar.Layout.Column=4;
-    uiHandles.lidarAx=uiaxes(p_lidar); hold(uiHandles.lidarAx,'on'); grid(uiHandles.lidarAx,'on'); axis(uiHandles.lidarAx,'equal'); xlabel(uiHandles.lidarAx,'X (m)'); ylabel(uiHandles.lidarAx,'Y (m)'); zlabel(uiHandles.lidarAx,'Z (m)'); view(uiHandles.lidarAx, -45, 30);
-    uiHandles.lidarPlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 10, NaN, 'filled');
+    uiHandles.trajPlot=plot(uiHandles.trajAx,NaN,NaN,'-c','LineWidth',2,'DisplayName','Path'); 
+    uiHandles.currentPosPlot=plot(uiHandles.trajAx,NaN,NaN,'bo','MarkerFaceColor','b','MarkerSize',8,'DisplayName','Current'); 
+    legend(uiHandles.trajAx);
+    
+    p_lidar = uipanel(gl,'Title','3D LiDAR & Object Detections','FontWeight','bold'); p_lidar.Layout.Row=2; p_lidar.Layout.Column=4;
+    uiHandles.lidarAx=uiaxes(p_lidar); 
+    hold(uiHandles.lidarAx,'on'); grid(uiHandles.lidarAx,'on'); axis(uiHandles.lidarAx,'equal'); xlabel(uiHandles.lidarAx,'X (m)'); ylabel(uiHandles.lidarAx,'Y (m)'); zlabel(uiHandles.lidarAx,'Z (m)'); view(uiHandles.lidarAx, -45, 30);
+    uiHandles.lidarPlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 10, NaN, 'filled', 'DisplayName', 'LiDAR Points');
+    % <<< ADDED: A new plot object for the detected obstacles >>>
+    uiHandles.obstaclePlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 100, 'bo', 'filled', 'MarkerFaceAlpha', 0.6, 'DisplayName', 'Obstacles');
+    legend(uiHandles.lidarAx);
+    
     p_log = uipanel(gl,'Title','System Log','FontWeight','bold'); p_log.Layout.Row=3; p_log.Layout.Column=[1 4];
     uiHandles.logArea = uitextarea(uigridlayout(p_log,[1 1]), 'Value',{''}, 'Editable','off', 'FontName', 'Monospaced', 'BackgroundColor', [0.1 0.1 0.1], 'FontColor', [0.9 0.9 0.9]);
 end
@@ -167,6 +175,26 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     if isfield(data, 'weather'), uiHandles.weatherLabel.Text = data.weather; end
     updateCamera(uiHandles.camFrontAx, data, 'image_front'); updateCamera(uiHandles.camRearAx, data, 'image_back'); updateCamera(uiHandles.camLeftAx, data, 'image_left'); updateCamera(uiHandles.camRightAx, data, 'image_right'); updateCamera(uiHandles.camInteriorAx, data, 'image_interior');
     if isfield(data, 'lidar_roof') && ~isempty(data.lidar_roof), try, points = typecast(base64decode(data.lidar_roof), 'single'); if mod(numel(points), 4) == 0, points = reshape(points, 4, [])'; xyz = points(1:20:end, 1:3); set(uiHandles.lidarPlot, 'XData', xyz(:,1), 'YData', xyz(:,2), 'ZData', xyz(:,3), 'CData', xyz(:,3)); end; catch, end; end
+
+    % <<< ADDED: Plot the detected obstacles from the new JSON field >>>
+    obstacles = get_safe(data, 'Detected_Obstacles', []);
+    if ~isempty(obstacles)
+        % Pre-allocate arrays for performance
+        num_obstacles = numel(obstacles);
+        obs_x = nan(num_obstacles, 1);
+        obs_y = nan(num_obstacles, 1);
+        obs_z = nan(num_obstacles, 1);
+        for i = 1:num_obstacles
+            % The data is nested, so we extract it
+            obs_x(i) = obstacles(i).position.x;
+            obs_y(i) = obstacles(i).position.y;
+            obs_z(i) = obstacles(i).position.z;
+        end
+        set(uiHandles.obstaclePlot, 'XData', obs_x, 'YData', obs_y, 'ZData', obs_z);
+    else
+        % If no obstacles, clear the plot
+        set(uiHandles.obstaclePlot, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
+    end
 end
 
 function updateCamera(ax, data, fieldName)
@@ -230,7 +258,7 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     % --- Copy all raw sensor data fields ---
     all_fields = fieldnames(frame);
     prefixes_to_copy = {'image_', 'lidar_', 'radar_'}; 
-    single_fields_to_copy = {'gnss', 'imu', 'position', 'rotation'};
+    single_fields_to_copy = {'gnss', 'imu', 'position', 'rotation', 'Detected_Obstacles'};
     for i = 1:numel(all_fields)
         field = all_fields{i};
         if isfield(frame, field)
@@ -412,10 +440,7 @@ function score = computeDriverReadiness(frame)
     end
 end
 
-% <<< ADDED: A robust helper function to prevent crashes from missing fields >>>
 function value = get_safe(s, field, default_value)
-    % Safely gets a field from a struct. If the field does not exist,
-    % it returns the provided default value instead of erroring.
     if isfield(s, field)
         value = s.(field);
     else

@@ -1,6 +1,5 @@
 # ==============================================================================
-# -- Imports, etc. (No changes here)
-# ...
+# -- Imports -------------------------------------------------------------------
 # ==============================================================================
 import glob
 import os
@@ -26,6 +25,8 @@ import cv2
 from filterpy.kalman import KalmanFilter
 from filterpy.common import Q_discrete_white_noise
 from scipy.linalg import block_diag
+# <<< ADDED: Import for DBSCAN clustering >>>
+from sklearn.cluster import DBSCAN
 
 # ==============================================================================
 # -- Constants -----------------------------------------------------------------
@@ -43,21 +44,18 @@ CAMERA_DIRS = {
     'left': os.path.join(DATA_DIR, 'images/left'), 'right': os.path.join(DATA_DIR, 'images/right'),
     'interior': os.path.join(DATA_DIR, 'images/interior')
 }
-
-# <<< MODIFIED (1/4): Changed WEATHER_PRESETS from a list to a dictionary >>>
 WEATHER_PRESETS = {
     'ClearNoon': carla.WeatherParameters.ClearNoon,
     'CloudyNoon': carla.WeatherParameters.CloudyNoon,
     'WetNoon': carla.WeatherParameters.WetNoon,
     'HardRainNoon': carla.WeatherParameters.HardRainNoon
 }
-
 MAP_LAYERS = [carla.MapLayer.NONE, carla.MapLayer.Buildings, carla.MapLayer.Decals, carla.MapLayer.Foliage, carla.MapLayer.Ground, carla.MapLayer.ParkedVehicles, carla.MapLayer.Particles, carla.MapLayer.Props, carla.MapLayer.StreetLights, carla.MapLayer.Walls, carla.MapLayer.All]
 
 # ==============================================================================
-# -- Helper Classes (No changes here)
-# ...
+# -- Helper Classes ------------------------------------------------------------
 # ==============================================================================
+
 class ImageSaver(threading.Thread):
     def __init__(self): super().__init__(); self.daemon=True; self.queue=Queue(); self.running=True
     def run(self):
@@ -69,7 +67,7 @@ class ImageSaver(threading.Thread):
 
 class KalmanFilterSystem:
     def __init__(self, dt):
-        self.dt=dt; self.kf=KalmanFilter(dim_x=6, dim_z=2); self.kf.F=np.array([[1,0,dt,0,0.5*dt**2,0],[0,1,0,dt,0,0.5*dt**2],[0,0,1,0,dt,0],[0,0,0,1,0,dt],[0,0,0,0,1,0],[0,0,0,0,0,1]]); self.kf.H=np.array([[1,0,0,0,0,0],[0,1,0,0,0,0]]); self.kf.P*=1000.; self.kf.R=np.diag([0.5**2, 0.5**2]); q_3d=Q_discrete_white_noise(dim=3,dt=dt,var=0.1); self.kf.Q=block_diag(q_3d,q_3d); self.initialized=False; print("Kalman Filter initialized.")
+        self.dt=dt; self.kf=KalmanFilter(dim_x=6, dim_z=2); self.kf.F=np.array([[1,0,dt,0,0.5*dt**2,0],[0,1,0,dt,0,0.5*dt**2],[0,0,1,0,dt,0],[0,0,0,1,0,dt],[0,0,0,0,1,0],[0,0,0,0,0,1]]); self.kf.H=np.array([[1,0,0,0,0,0],[0,1,0,0,0,0]]); self.kf.P*=1000.; self.kf.R=np.diag([0.5**2, 0.5**2]); q_3d=Q_discrete_white_noise(dim=3,dt=dt,var=0.1); self.kf.Q=block_diag(q_3d,q_3d); self.initialized=False; print("Kalman Filter (Ego-Motion) initialized.")
     def initialize(self, pos): self.kf.x[0,0]=pos[0]; self.kf.x[1,0]=pos[1]; self.initialized=True
     def update(self, gps, imu):
         if not self.initialized and gps is not None: self.initialize(gps)
@@ -80,7 +78,92 @@ class KalmanFilterSystem:
         if not self.initialized: return None
         return {'x':float(self.kf.x[0,0]), 'y':float(self.kf.x[1,0]), 'vx':float(self.kf.x[2,0]), 'vy':float(self.kf.x[3,0])}
 
-class HUD:
+# <<< ADDED: New class for LiDAR-based object detection >>>
+class ObjectTracker:
+    def __init__(self):
+        self.detected_obstacles = []
+        print("Object Tracker initialized.")
+
+    def process_lidar_to_obstacles(self, point_cloud, vehicle_transform):
+        """
+        Processes a raw LiDAR point cloud to detect object clusters.
+        Returns a list of dictionaries, each representing a detected obstacle.
+        """
+        try:
+            # Reshape the point cloud to (N, 4) and get x, y, z
+            points = np.frombuffer(point_cloud.raw_data, dtype=np.float32).reshape(-1, 4)
+            points_xyz = points[:, :3]
+
+            # Simple ground plane removal: filter points that are not on the road
+            # Assumes the car is mostly level and the ground is near z=0 in the sensor's frame
+            # This height threshold might need tuning depending on the sensor's mounting position.
+            ground_height_threshold = -1.4 
+            non_ground_indices = points_xyz[:, 2] > ground_height_threshold
+            points_xyz = points_xyz[non_ground_indices]
+            
+            if len(points_xyz) < 10: # Not enough points to form meaningful clusters
+                return []
+
+            # Use DBSCAN to cluster the points based on their X and Y coordinates
+            # eps: The maximum distance between two samples for one to be considered as in the neighborhood of the other.
+            # min_samples: The number of samples in a neighborhood for a point to be considered as a core point.
+            db = DBSCAN(eps=0.8, min_samples=15).fit(points_xyz[:, :2])
+            labels = db.labels_
+            
+            obstacles = []
+            unique_labels = set(labels)
+            
+            for label in unique_labels:
+                if label == -1: # -1 is the label for noise points in DBSCAN
+                    continue
+
+                cluster_points = points_xyz[labels == label]
+                
+                # Calculate the centroid of the cluster
+                centroid = np.mean(cluster_points, axis=0)
+                
+                # Calculate the bounding box dimensions
+                min_coords = np.min(cluster_points, axis=0)
+                max_coords = np.max(cluster_points, axis=0)
+                dimensions = max_coords - min_coords
+                
+                # The obstacle's position is relative to the sensor. We need to convert it to world coordinates.
+                # Create a Carla.Location for the relative centroid
+                relative_location = carla.Location(x=float(centroid[0]), y=float(centroid[1]), z=float(centroid[2]))
+                # Transform the relative location to a world location
+                world_location = vehicle_transform.transform(relative_location)
+                
+                obstacles.append({
+                    'id': int(label),
+                    'position': {
+                        'x': world_location.x,
+                        'y': world_location.y,
+                        'z': world_location.z
+                    },
+                    'dimensions': {
+                        'length': float(dimensions[0]), # x-axis
+                        'width': float(dimensions[1]),  # y-axis
+                        'height': float(dimensions[2]) # z-axis
+                    }
+                })
+            return obstacles
+        except Exception as e:
+            print(f"Error in LiDAR processing: {e}")
+            return []
+
+    def update(self, lidar_point_cloud, vehicle_transform):
+        """
+        Main update loop for the tracker.
+        """
+        if lidar_point_cloud:
+            self.detected_obstacles = self.process_lidar_to_obstacles(lidar_point_cloud, vehicle_transform)
+        else:
+            self.detected_obstacles = []
+
+    def get_obstacles(self):
+        return self.detected_obstacles
+
+class HUD: # ... No changes ...
     def __init__(self, width: int, height: int):
         self.dim = (width, height); self.font = pygame.font.SysFont('Arial', 14); self.help_font = pygame.font.SysFont('Monospace', 14); self.show_help = False
         self.HEALTH_COLORS = {"OK": (0, 255, 0), "NO_DATA": (255, 255, 0), "DEAD": (255, 0, 0)}
@@ -118,7 +201,7 @@ class HUD:
         s = pygame.Surface((300, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
         for i, text in enumerate(help_text): display.blit(self.help_font.render(text, True, (255, 255, 255)), (60, 60 + i * 22))
 
-class KeyboardController:
+class KeyboardController: # ... No changes ...
     def __init__(self, sim):
         self.simulation = sim
         self._control_state = {'throttle': 0.0, 'steer': 0.0, 'brake': 0.0, 'hand_brake': False, 'reverse': False}
@@ -151,7 +234,7 @@ class KeyboardController:
         elif key == K_0: self.simulation.change_map('Town10HD')
         elif key == K_ESCAPE: self.simulation.running = False
 
-class SensorManager:
+class SensorManager: # ... No changes ...
     def __init__(self, world, display_manager, sensor_type, transform, attached_vehicle, attributes=None, display_pos=None, camera_name=''):
         self.stype=sensor_type; self.cname=camera_name; self.surface=None; self.data=None; self.event_list=[]; self.lock=threading.Lock(); self.last_updated_frame=0
         bp_map={'RGB':'sensor.camera.rgb','LIDAR':'sensor.lidar.ray_cast','IMU':'sensor.other.imu','GNSS':'sensor.other.gnss','RADAR':'sensor.other.radar','ULTRASONIC':'sensor.other.obstacle','COLLISION':'sensor.other.collision','LANE_INVASION':'sensor.other.lane_invasion'}
@@ -179,7 +262,7 @@ class SensorManager:
     def destroy(self):
         if self.sensor and self.sensor.is_alive: self.sensor.destroy()
 
-class DisplayManager:
+class DisplayManager: # ... No changes ...
     def __init__(self, grid_size):
         self.display=pygame.display.set_mode((grid_size[0]*IMAGE_WIDTH, grid_size[1]*IMAGE_HEIGHT), pygame.RESIZABLE)
         self.sensors=[]
@@ -191,7 +274,7 @@ class DisplayManager:
             if sensor.surface: self.display.blit(sensor.surface, (pos[0]*IMAGE_WIDTH, pos[1]*IMAGE_HEIGHT))
         return self.display
 
-class UDPDataSender:
+class UDPDataSender: # ... No changes ...
     def __init__(self, ip='127.0.0.1', port=10000, chunk_size=4096):
         self.ip=ip; self.port=port; self.sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); self.chunk_size=chunk_size; print(f"UDP sender initialized for MATLAB. Target: {ip}:{port}.")
     def send_string_chunks(self, payload, frame_id):
@@ -213,11 +296,12 @@ class CarlaSimulation:
         self.controller=None; self.udp_sender=None; self.image_saver=None; self.sensors={}; self.log_files={}; self.csv_writers={}
         self.kalman_filter=None; self.fused_state=None; self.autopilot=False; self.running=True
         self.recording_images=False; self.recording_sim=False; self.show_hud=True; self.collision_count=0; self.lane_invasion_count=0
-        
-        # <<< MODIFIED (2/4): Create an ordered list of weather names for cycling through them >>>
         self.weather_names = list(WEATHER_PRESETS.keys())
         self.current_weather_index = 0
         self.current_layer_index = 0
+        # <<< ADDED: Initialize the object tracker and a place to store its results >>>
+        self.object_tracker = None
+        self.detected_obstacles = []
 
     def run(self):
         try:
@@ -230,8 +314,6 @@ class CarlaSimulation:
                 self._tick_simulation()
         finally: self._cleanup()
 
-    # ... other methods like _initialize, _setup_logging, _spawn_sensor_with_backups, _setup_actors_and_sensors ...
-    # No changes in these methods, they are omitted for brevity
     def _initialize(self):
         pygame.init(); pygame.font.init(); self._setup_logging()
         self.client=carla.Client('localhost',2000); self.client.set_timeout(20.0)
@@ -240,16 +322,19 @@ class CarlaSimulation:
         self.world.apply_settings(settings)
         self.display_manager=DisplayManager((GRID_COLS,GRID_ROWS)); self.hud=HUD(WINDOW_WIDTH,WINDOW_HEIGHT); self.controller=KeyboardController(self)
         self.udp_sender=UDPDataSender(); self.image_saver=ImageSaver(); self.image_saver.start()
-        self._setup_actors_and_sensors(); self.kalman_filter=KalmanFilterSystem(1.0/TICK_RATE)
+        self._setup_actors_and_sensors()
+        self.kalman_filter=KalmanFilterSystem(1.0/TICK_RATE)
+        # <<< ADDED: Create an instance of the object tracker >>>
+        self.object_tracker = ObjectTracker()
 
-    def _setup_logging(self):
+    def _setup_logging(self): # ... No changes ...
         os.makedirs(LOG_DIR, exist_ok=True); [os.makedirs(d, exist_ok=True) for d in CAMERA_DIRS.values()]
         log_paths={'collision':os.path.join(LOG_DIR,'collision_log.csv'), 'lane':os.path.join(LOG_DIR,'lane_invasion_log.csv')}
         headers={'collision':['ts','frame','intensity','actor_type'], 'lane':['ts','frame','lane_types']}
         for name, path in log_paths.items():
             self.log_files[name]=open(path, 'w', newline=''); self.csv_writers[name]=csv.writer(self.log_files[name]); self.csv_writers[name].writerow(headers[name])
 
-    def _spawn_sensor_with_backups(self, name, s_type, transform, attributes=None, display_pos=None, camera_name=''):
+    def _spawn_sensor_with_backups(self, name, s_type, transform, attributes=None, display_pos=None, camera_name=''): # ... No changes ...
         sensor_list = []
         primary_sensor = SensorManager(self.world, self.display_manager, s_type, transform, self.vehicle, attributes, display_pos, camera_name)
         sensor_list.append(primary_sensor)
@@ -261,15 +346,15 @@ class CarlaSimulation:
         self.sensors[name] = sensor_list
         print(f"  - Spawned {name} with {NUM_BACKUPS} backups.")
 
-    def _setup_actors_and_sensors(self):
+    def _setup_actors_and_sensors(self): # ... No changes ...
         print("Spawning vehicle and full sensor suite with backups...")
         vehicle_bp = self.world.get_blueprint_library().find(VEHICLE_MODEL)
         spawn_point = random.choice(self.world.get_map().get_spawn_points())
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
         self._spawn_sensor_with_backups('cam_front', 'RGB', carla.Transform(carla.Location(x=1.5,z=2.4)), display_pos=(1,0), camera_name='front')
-        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(1,2), camera_name='back') # Corrected display pos
+        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(1,2), camera_name='back') 
         self._spawn_sensor_with_backups('cam_left', 'RGB', carla.Transform(carla.Location(x=1.3,y=-0.9,z=1.2),carla.Rotation(yaw=-110)), display_pos=(0,0), camera_name='left')
-        self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right') # Corrected display pos
+        self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right') 
         self._spawn_sensor_with_backups('cam_interior', 'RGB', carla.Transform(carla.Location(x=0.5,y=-0.3,z=1.4),carla.Rotation(pitch=-15,yaw=180)), display_pos=(1,1), camera_name='interior')
         self._spawn_sensor_with_backups('gnss', 'GNSS', carla.Transform(carla.Location(z=2.6)))
         self._spawn_sensor_with_backups('imu', 'IMU', carla.Transform(carla.Location(x=0,z=0.5)))
@@ -293,12 +378,14 @@ class CarlaSimulation:
         snapshot = self.world.get_snapshot()
         self._process_sensor_data(snapshot)
         self._run_sensor_fusion()
+        # <<< ADDED: Call the new object detection step >>>
+        self._run_object_detection()
         self._send_udp_data(snapshot)
         display = self.display_manager.render()
         if self.show_hud: self.hud.render(display, self._get_simulation_state(snapshot))
         pygame.display.flip()
         
-    def _process_sensor_data(self, snapshot):
+    def _process_sensor_data(self, snapshot): # ... No changes ...
         if self.recording_images:
             for sensor_list in self.sensors.values():
                 primary_sensor = sensor_list[0]
@@ -308,7 +395,7 @@ class CarlaSimulation:
         for sensor_group in self.sensors.get('lane_invasion',[]):
             for event in sensor_group.get_events(): self.lane_invasion_count+=1; lane_types=','.join([str(m.type) for m in event.crossed_lane_markings]); self.csv_writers['lane'].writerow([time.time(), event.frame, lane_types])
 
-    def _run_sensor_fusion(self):
+    def _run_sensor_fusion(self): # ... No changes ...
         gnss_primary = self.sensors.get('gnss',[None])[0]; imu_primary = self.sensors.get('imu',[None])[0]
         loc = self.vehicle.get_transform().location
         gps_pos = np.array([loc.x, loc.y]) if gnss_primary and gnss_primary.data else None
@@ -316,11 +403,23 @@ class CarlaSimulation:
         self.kalman_filter.update(gps_pos, imu_accel)
         self.fused_state = self.kalman_filter.get_fused_state()
 
+    # <<< ADDED: New method to run the object detection logic >>>
+    def _run_object_detection(self):
+        """
+        Processes LiDAR data to detect obstacles in the environment.
+        """
+        lidar_sensor = self.sensors.get('lidar_roof', [None])[0]
+        if lidar_sensor and lidar_sensor.data:
+            # We need the vehicle's current transform to convert relative points to world coordinates
+            vehicle_transform = self.vehicle.get_transform()
+            self.object_tracker.update(lidar_sensor.data, vehicle_transform)
+            self.detected_obstacles = self.object_tracker.get_obstacles()
+        else:
+            self.detected_obstacles = []
+
     def _send_udp_data(self, snapshot):
         t=self.vehicle.get_transform(); v=self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
-
-        # <<< MODIFIED (3/4): Get the weather name correctly from the list of names >>>
         current_weather_name = self.weather_names[self.current_weather_index]
 
         data_packet = {
@@ -332,8 +431,11 @@ class CarlaSimulation:
             'rotation':{'pitch':t.rotation.pitch,'yaw':t.rotation.yaw,'roll':t.rotation.roll},
             'control':self.controller.get_control_state(), 'fused_state':self.fused_state,
             'ekf_covariance':self.kalman_filter.kf.P.tolist() if self.kalman_filter else None,
-            'sensor_health': health_data, 'collisions': self.collision_count, 'lane_invasions': self.lane_invasion_count
+            'sensor_health': health_data, 'collisions': self.collision_count, 'lane_invasions': self.lane_invasion_count,
+            # <<< ADDED: The new list of detected obstacles >>>
+            'Detected_Obstacles': self.detected_obstacles
         }
+        
         for name, sensor_list in self.sensors.items():
             primary_sensor = sensor_list[0]
             if primary_sensor.data is None or primary_sensor.stype in ['COLLISION','LANE_INVASION']: continue
@@ -347,7 +449,7 @@ class CarlaSimulation:
             if processed_data is not None: data_packet[key_name] = processed_data
         self.udp_sender.send_string_chunks(json.dumps(data_packet,separators=(',',':')), snapshot.frame)
 
-    def _cleanup(self):
+    def _cleanup(self): # ... No changes ...
         print("Cleaning up resources...")
         if self.image_saver: self.image_saver.stop()
         if self.udp_sender: self.udp_sender.close()
@@ -366,8 +468,7 @@ class CarlaSimulation:
         if self.recording_sim: self.client.start_recorder(os.path.join(LOG_DIR,f"sim_rec_{time.time()}.log"))
         else: self.client.stop_recorder()
     
-    def change_weather(self, d):
-        # <<< MODIFIED (4/4): Cycle the index and use it to get the name and object correctly >>>
+    def change_weather(self, d): # ... No changes ...
         self.current_weather_index = (self.current_weather_index + d) % len(self.weather_names)
         weather_name = self.weather_names[self.current_weather_index]
         self.world.set_weather(WEATHER_PRESETS[weather_name])
@@ -387,7 +488,7 @@ class CarlaSimulation:
         settings=self.world.get_settings(); settings.synchronous_mode=True; settings.fixed_delta_seconds=1.0/TICK_RATE
         self.world.apply_settings(settings); self._setup_actors_and_sensors()
         
-    def _get_simulation_state(self, snapshot):
+    def _get_simulation_state(self, snapshot): # ... No changes ...
         v = self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
         return {
