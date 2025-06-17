@@ -10,12 +10,14 @@ function carla_udp_receiver(port)
         port = 10000;
     end
     HISTORY_LENGTH = 100; % Number of historical data points for plots
+    FDIR_RATE_HZ = 5;     % How often the FDIR system checks for faults
 
     % --- Global Outputs for External Access ---
     global carla_outputs;
     carla_outputs = struct(); 
 
     is_running = true;
+    fdirTimer = []; % Initialize timer handle
 
     % --- Setup UI and UDP ---
     [uiHandles] = setupDashboard(HISTORY_LENGTH, @onCloseRequest);
@@ -31,6 +33,22 @@ function carla_udp_receiver(port)
         is_running = false; 
     end
 
+    % --- SETUP FDIR SYSTEM (TIMER) ---
+    try
+        fdirTimer = timer(...
+            'ExecutionMode', 'fixedRate', ...         % Run repeatedly
+            'Period', 1/FDIR_RATE_HZ, ...              % Time between checks
+            'TimerFcn', @(~,~) run_fdir_cycle(), ...   % Function to call
+            'StartDelay', 2, ...                      % Wait 2s for first data
+            'Tag', 'FDIR_Timer', ...                  % Easy to find later
+            'StopFcn', @(~,~) disp('FDIR Timer has been stopped.'));
+        start(fdirTimer);
+        logToDashboard(uiHandles, sprintf('FDIR background monitoring system started at %d Hz.', FDIR_RATE_HZ));
+    catch ME
+        logToDashboard(uiHandles, sprintf('[FATAL] FDIR Timer setup failed: %s', ME.message));
+        is_running = false;
+    end
+    
     % --- Data Storage and State Initialization ---
     trajectory = nan(HISTORY_LENGTH * 5, 2);
     gnss_track = nan(HISTORY_LENGTH * 5, 2);
@@ -92,13 +110,24 @@ function carla_udp_receiver(port)
     end
     
     logToDashboard(uiHandles, 'Shutdown sequence initiated...');
-    if isvalid(u), delete(u); end
+    
+    % --- CLEANUP ---
+    if ~isempty(fdirTimer) && isvalid(fdirTimer)
+        stop(fdirTimer);
+        delete(fdirTimer);
+        disp('FDIR Timer cleaned up.');
+    end
+    if exist('u','var') && isvalid(u), delete(u); end
     if ishandle(uiHandles.fig), delete(uiHandles.fig); end
     disp('CARLA UDP Receiver has shut down gracefully.');
 
     function onCloseRequest(~, ~)
         is_running = false;
     end
+
+% ... (rest of the functions: setupDashboard, updateDashboard, etc. remain unchanged) ...
+% ... (PASTING THE REST OF THE FUNCTIONS FROM CODE 1 FOR COMPLETENESS) ...
+
 end
 
 %% =======================================================================
@@ -218,7 +247,6 @@ end
 function processAndAnalyzeFrame(frame, latency, uiHandles)
     global carla_outputs; 
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
-
     if isempty(last_call_timer)
         time_since_last = 1/20; 
         last_call_timer = tic; 
@@ -228,7 +256,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     end
     data_rate = 1 / max(time_since_last, 0.001); 
     network_status = struct('latency', latency, 'data_rate', data_rate);
-
     health_score = 0;
     covariance_trace = inf;
     sensor_health_data = get_safe(frame, 'sensor_health', []);
@@ -238,7 +265,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
         for i = 1:numel(all_groups), status_list = all_groups{i}; total_sensors = total_sensors + numel(status_list); total_ok = total_ok + sum(strcmp(status_list, 'OK')); end
         if total_sensors > 0, health_score = total_ok / total_sensors; end
     end
-    
     ekf_cov_data = get_safe(frame, 'ekf_covariance', []);
     if iscell(ekf_cov_data)
         try
@@ -249,15 +275,8 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
             covariance_trace = inf;
         end
     end
-    
     fused_state_data = get_safe(frame, 'fused_state', struct('x', NaN, 'y', NaN, 'vx', NaN, 'vy', NaN));
-    sensor_fusion_status = struct(...
-        'fused_state', fused_state_data, ...
-        'position_uncertainty', covariance_trace, ...
-        'health_score', health_score, ...
-        'raw_health', sensor_health_data ...  % <<< ADD THIS LINE
-    );
-    
+    sensor_fusion_status = struct('fused_state', fused_state_data, 'position_uncertainty', covariance_trace, 'health_score', health_score, 'raw_health', sensor_health_data);
     processed_sensor_data = struct();
     all_fields = fieldnames(frame);
     prefixes_to_copy = {'image_', 'lidar_', 'radar_'}; 
@@ -271,7 +290,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
             if copy_this_field, processed_sensor_data.(field) = frame.(field); end
         end
     end
-    
     default_control = struct('throttle',0,'brake',0,'steer',0,'hand_brake',false,'reverse',false);
     control_data = get_safe(frame, 'control', default_control);
     processed_sensor_data.speed = get_safe(frame, 'speed', 0);
@@ -280,7 +298,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     processed_sensor_data.throttle_input = control_data.throttle;
     processed_sensor_data.brake_input = control_data.brake;
     processed_sensor_data.steering_input = control_data.steer;
-    
     rotation_data = get_safe(frame, 'rotation', struct('yaw', 0));
     yaw_rate = 0;
     if isfield(rotation_data, 'yaw')
@@ -293,28 +310,26 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
         last_yaw = current_yaw;
     end
     processed_sensor_data.yaw_rate = yaw_rate;
-    
     current_collisions = get_safe(frame, 'collisions', 0);
     if isempty(last_collisions), last_collisions = current_collisions; end
     is_collision = (current_collisions > last_collisions);
     last_collisions = current_collisions;
     processed_sensor_data.is_collision_event = is_collision;
-    
     current_lane_invasions = get_safe(frame, 'lane_invasions', 0);
     if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end
     is_lane_invasion = (current_lane_invasions > last_lane_invasions);
     last_lane_invasions = current_lane_invasions;
     processed_sensor_data.is_lane_invasion_event = is_lane_invasion;
+    
+    processed_sensor_data.Weather_Severity = computeWeatherSeverity(frame);
+    processed_sensor_data.Obstacle_Density = computeObstacleDensity(frame);
 
     driver_attention = computeDriverAttention(frame);
     driver_readiness = computeDriverReadiness(frame);
-
     threat_data = computeThreatAssessment(frame);
     fallback = false; reason = {};
     if latency > 0.2, fallback = true; reason{end+1} = 'High Latency (>200ms)'; end
     if health_score < 0.75, fallback = true; reason{end+1} = 'Low Sensor Health'; end
-    % <<< MODIFIED: This check has been removed as requested >>>
-    % if covariance_trace > 10, fallback = true; reason{end+1} = 'High Position Uncertainty'; end
     if threat_data.min_front_distance < 10 && threat_data.closing_velocity < -5, fallback = true; reason{end+1} = 'Imminent Collision Risk'; end
     if driver_attention < 0.2, fallback = true; reason{end+1} = 'Low Driver Attention'; end
     if driver_readiness < 0.5, fallback = true; reason{end+1} = 'Low Driver Readiness'; end
@@ -322,7 +337,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     if processed_sensor_data.is_lane_invasion_event, fallback = true; reason{end+1} = 'Lane Invasion Detected'; end
     
     if fallback, logToDashboard(uiHandles, sprintf('[FALLBACK] Reasons: %s', strjoin(reason, ', '))); end
-
     carla_outputs = struct('network_status', network_status, 'sensor_fusion_status', sensor_fusion_status, 'processed_sensor_data', processed_sensor_data, 'fallback_initiation', fallback, 'driver_attention', driver_attention, 'driver_readiness', driver_readiness);
 end
 
@@ -433,5 +447,39 @@ function value = get_safe(s, field, default_value)
         value = s.(field);
     else
         value = default_value;
+    end
+end
+
+function severity = computeWeatherSeverity(frame)
+    weather_str = get_safe(frame, 'weather', 'ClearNoon');
+    switch weather_str
+        case 'ClearNoon'
+            severity = 0.1;
+        case 'CloudyNoon'
+            severity = 0.3;
+        case 'WetNoon'
+            severity = 0.6;
+        case 'HardRainNoon'
+            severity = 0.9;
+        otherwise
+            severity = 0.1; % Default to benign
+    end
+end
+
+function density = computeObstacleDensity(frame)
+    density = 0;
+    detection_radius = 50; % meters
+    
+    obstacles = get_safe(frame, 'Detected_Obstacles', []);
+    ego_pos = get_safe(frame, 'position', struct('x', 0, 'y', 0, 'z', 0));
+    
+    if isempty(obstacles), return; end
+    
+    for i = 1:numel(obstacles)
+        obs_pos = obstacles(i).position;
+        distance = sqrt((obs_pos.x - ego_pos.x)^2 + (obs_pos.y - ego_pos.y)^2);
+        if distance < detection_radius
+            density = density + 1;
+        end
     end
 end
