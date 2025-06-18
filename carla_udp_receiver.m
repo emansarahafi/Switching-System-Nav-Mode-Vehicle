@@ -72,6 +72,7 @@ function carla_udp_receiver(port)
             buffer = [buffer, newData];
             last_message_time = tic;
             
+            % This approach handles concatenated JSON objects from the UDP stream
             delimiter = '|||JSON_DELIMITER|||';
             sanitizedBuffer = strrep(buffer, '}{', ['}' delimiter '{']);
             jsonObjects = strsplit(sanitizedBuffer, delimiter);
@@ -124,10 +125,6 @@ function carla_udp_receiver(port)
     function onCloseRequest(~, ~)
         is_running = false;
     end
-
-% ... (rest of the functions: setupDashboard, updateDashboard, etc. remain unchanged) ...
-% ... (PASTING THE REST OF THE FUNCTIONS FROM CODE 1 FOR COMPLETENESS) ...
-
 end
 
 %% =======================================================================
@@ -157,7 +154,8 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     p_diag = uipanel(gl,'Title','Diagnostics','FontWeight','bold'); p_diag.Layout.Row=1; p_diag.Layout.Column=4;
     g_diag = uigridlayout(p_diag,[1 1]);
     p_diag_metrics = uipanel(g_diag,'Title','');
-    g_diag_metrics = uigridlayout(p_diag_metrics,[7,2],'ColumnWidth',{'fit','1x'});
+    % <<< MODIFIED: Increased grid layout rows from 7 to 8 for V2I data >>>
+    g_diag_metrics = uigridlayout(p_diag_metrics,[8,2],'ColumnWidth',{'fit','1x'});
     uilabel(g_diag_metrics,'Text','Frame:', 'FontSize', 10); 
     uiHandles.frameLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'FontSize', 10);
     uilabel(g_diag_metrics,'Text','Net Latency:', 'FontSize', 10); 
@@ -172,6 +170,10 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.healthLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
     uilabel(g_diag_metrics,'Text','Fallback Status:', 'FontSize', 10); 
     uiHandles.fallbackLabel=uilabel(g_diag_metrics,'Text','IDLE','FontWeight','bold','FontColor','g', 'HorizontalAlignment', 'left', 'FontSize', 10);
+    % <<< ADDED: UI element for V2I Traffic Light state >>>
+    uilabel(g_diag_metrics,'Text','Traffic Light:', 'FontSize', 10, 'FontColor', [0.9 0.9 0.9]); 
+    uiHandles.trafficLightLabel = uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
+
     p_cameras = uipanel(gl,'Title','Camera Feeds','FontWeight','bold'); p_cameras.Layout.Row=2; p_cameras.Layout.Column=[1 2];
     g_cameras = uigridlayout(p_cameras,[2 3]);
     uiHandles.camLeftAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); title(uiHandles.camLeftAx,'Left');
@@ -181,9 +183,12 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.camRearAx=uiaxes(g_cameras,'XTick',[],'YTick',[]); title(uiHandles.camRearAx,'Back');
     p_traj = uipanel(gl,'Title','Vehicle Trajectory (Fused)','FontWeight','bold'); p_traj.Layout.Row=2; p_traj.Layout.Column=3;
     uiHandles.trajAx=uiaxes(p_traj); hold(uiHandles.trajAx,'on'); grid(uiHandles.trajAx,'on'); axis(uiHandles.trajAx,'equal'); xlabel(uiHandles.trajAx,'X (m)'); ylabel(uiHandles.trajAx,'Y (m)');
-    uiHandles.trajPlot=plot(uiHandles.trajAx,NaN,NaN,'-c','LineWidth',2,'DisplayName','Path'); 
-    uiHandles.currentPosPlot=plot(uiHandles.trajAx,NaN,NaN,'bo','MarkerFaceColor','b','MarkerSize',8,'DisplayName','Current'); 
+    uiHandles.trajPlot=plot(uiHandles.trajAx,NaN,NaN,'-c','LineWidth',2,'DisplayName','Ego Path'); 
+    uiHandles.currentPosPlot=plot(uiHandles.trajAx,NaN,NaN,'bo','MarkerFaceColor','b','MarkerSize',8,'DisplayName','Ego Vehicle'); 
+    % <<< ADDED: Plot handle for other vehicles from V2V data >>>
+    uiHandles.v2vPlot = plot(uiHandles.trajAx, NaN, NaN, 'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 5, 'DisplayName', 'Other Vehicles');
     legend(uiHandles.trajAx);
+
     p_lidar = uipanel(gl,'Title','3D LiDAR & Object Detections','FontWeight','bold'); p_lidar.Layout.Row=2; p_lidar.Layout.Column=4;
     uiHandles.lidarAx=uiaxes(p_lidar); 
     hold(uiHandles.lidarAx,'on'); grid(uiHandles.lidarAx,'on'); axis(uiHandles.lidarAx,'equal'); xlabel(uiHandles.lidarAx,'X (m)'); ylabel(uiHandles.lidarAx,'Y (m)'); zlabel(uiHandles.lidarAx,'Z (m)'); view(uiHandles.lidarAx, -45, 30);
@@ -217,17 +222,38 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     obstacles = get_safe(data, 'Detected_Obstacles', []);
     if ~isempty(obstacles)
         num_obstacles = numel(obstacles);
-        obs_x = nan(num_obstacles, 1);
-        obs_y = nan(num_obstacles, 1);
-        obs_z = nan(num_obstacles, 1);
-        for i = 1:num_obstacles
-            obs_x(i) = obstacles(i).position.x;
-            obs_y(i) = obstacles(i).position.y;
-            obs_z(i) = obstacles(i).position.z;
-        end
+        obs_x = nan(num_obstacles, 1); obs_y = nan(num_obstacles, 1); obs_z = nan(num_obstacles, 1);
+        for i = 1:num_obstacles, obs_x(i) = obstacles(i).position.x; obs_y(i) = obstacles(i).position.y; obs_z(i) = obstacles(i).position.z; end
         set(uiHandles.obstaclePlot, 'XData', obs_x, 'YData', obs_y, 'ZData', obs_z);
     else
         set(uiHandles.obstaclePlot, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
+    end
+
+    % <<< ADDED: V2V Data Visualization >>>
+    v2v_data = get_safe(data, 'V2V_Data', []);
+    if ~isempty(v2v_data)
+        num_vehicles = numel(v2v_data);
+        v2v_x = nan(num_vehicles, 1); v2v_y = nan(num_vehicles, 1);
+        for i = 1:num_vehicles, v2v_x(i) = v2v_data(i).position.x; v2v_y(i) = v2v_data(i).position.y; end
+        set(uiHandles.v2vPlot, 'XData', v2v_x, 'YData', v2v_y);
+    else
+        set(uiHandles.v2vPlot, 'XData', NaN, 'YData', NaN);
+    end
+
+    % <<< ADDED: V2I Data Visualization >>>
+    v2i_data = get_safe(data, 'V2I_Data', struct());
+    if isfield(v2i_data, 'traffic_light_state') && ~isempty(v2i_data.traffic_light_state)
+        state = v2i_data.traffic_light_state;
+        uiHandles.trafficLightLabel.Text = state;
+        switch upper(state)
+            case 'RED',    uiHandles.trafficLightLabel.FontColor = [1, 0.2, 0.2];
+            case 'YELLOW', uiHandles.trafficLightLabel.FontColor = [1, 0.9, 0];
+            case 'GREEN',  uiHandles.trafficLightLabel.FontColor = [0.2, 1, 0.2];
+            otherwise,     uiHandles.trafficLightLabel.FontColor = [0.8, 0.8, 0.8];
+        end
+    else
+        uiHandles.trafficLightLabel.Text = 'N/A';
+        uiHandles.trafficLightLabel.FontColor = [0.9, 0.9, 0.9];
     end
 end
 
@@ -247,95 +273,36 @@ end
 function processAndAnalyzeFrame(frame, latency, uiHandles)
     global carla_outputs; 
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
-    if isempty(last_call_timer)
-        time_since_last = 1/20; 
-        last_call_timer = tic; 
-    else
-        time_since_last = toc(last_call_timer);
-        last_call_timer = tic;
-    end
-    data_rate = 1 / max(time_since_last, 0.001); 
-    network_status = struct('latency', latency, 'data_rate', data_rate);
-    health_score = 0;
-    covariance_trace = inf;
+    if isempty(last_call_timer), time_since_last = 1/20; last_call_timer = tic; else, time_since_last = toc(last_call_timer); last_call_timer = tic; end
+    network_status = struct('latency', latency, 'data_rate', 1 / max(time_since_last, 0.001));
+    health_score = 0; covariance_trace = inf;
     sensor_health_data = get_safe(frame, 'sensor_health', []);
-    if isstruct(sensor_health_data)
-        all_groups = struct2cell(sensor_health_data); 
-        total_ok = 0; total_sensors = 0;
-        for i = 1:numel(all_groups), status_list = all_groups{i}; total_sensors = total_sensors + numel(status_list); total_ok = total_ok + sum(strcmp(status_list, 'OK')); end
-        if total_sensors > 0, health_score = total_ok / total_sensors; end
-    end
+    if isstruct(sensor_health_data), all_groups = struct2cell(sensor_health_data); total_ok = 0; total_sensors = 0; for i = 1:numel(all_groups), status_list = all_groups{i}; total_sensors = total_sensors + numel(status_list); total_ok = total_ok + sum(strcmp(status_list, 'OK')); end; if total_sensors > 0, health_score = total_ok / total_sensors; end; end
     ekf_cov_data = get_safe(frame, 'ekf_covariance', []);
-    if iscell(ekf_cov_data)
-        try
-            rows = cellfun(@cell2mat, ekf_cov_data, 'UniformOutput', false); 
-            covariance_matrix = cell2mat(rows);
-            covariance_trace = trace(covariance_matrix(1:2, 1:2));
-        catch
-            covariance_trace = inf;
-        end
-    end
-    fused_state_data = get_safe(frame, 'fused_state', struct('x', NaN, 'y', NaN, 'vx', NaN, 'vy', NaN));
-    sensor_fusion_status = struct('fused_state', fused_state_data, 'position_uncertainty', covariance_trace, 'health_score', health_score, 'raw_health', sensor_health_data);
-    processed_sensor_data = struct();
-    all_fields = fieldnames(frame);
-    prefixes_to_copy = {'image_', 'lidar_', 'radar_'}; 
-    single_fields_to_copy = {'gnss', 'imu', 'position', 'rotation', 'Detected_Obstacles'};
-    for i = 1:numel(all_fields)
-        field = all_fields{i};
-        if isfield(frame, field)
-            copy_this_field = false;
-            for j = 1:numel(prefixes_to_copy), if startsWith(field, prefixes_to_copy{j}), copy_this_field = true; break; end, end
-            if ~copy_this_field && ismember(field, single_fields_to_copy), copy_this_field = true; end
-            if copy_this_field, processed_sensor_data.(field) = frame.(field); end
-        end
-    end
-    default_control = struct('throttle',0,'brake',0,'steer',0,'hand_brake',false,'reverse',false);
-    control_data = get_safe(frame, 'control', default_control);
-    processed_sensor_data.speed = get_safe(frame, 'speed', 0);
-    processed_sensor_data.ultrasonic_front = get_safe(frame, 'ultrasonic_front', inf);
-    processed_sensor_data.ultrasonic_back = get_safe(frame, 'ultrasonic_back', inf);
-    processed_sensor_data.throttle_input = control_data.throttle;
-    processed_sensor_data.brake_input = control_data.brake;
-    processed_sensor_data.steering_input = control_data.steer;
-    rotation_data = get_safe(frame, 'rotation', struct('yaw', 0));
-    yaw_rate = 0;
-    if isfield(rotation_data, 'yaw')
-        current_yaw = rotation_data.yaw;
-        if isempty(last_yaw), last_yaw = current_yaw; end
-        yaw_delta = current_yaw - last_yaw;
-        if yaw_delta > 180, yaw_delta = yaw_delta - 360; end
-        if yaw_delta < -180, yaw_delta = yaw_delta + 360; end
-        yaw_rate = yaw_delta / max(time_since_last, 0.001);
-        last_yaw = current_yaw;
-    end
-    processed_sensor_data.yaw_rate = yaw_rate;
-    current_collisions = get_safe(frame, 'collisions', 0);
-    if isempty(last_collisions), last_collisions = current_collisions; end
-    is_collision = (current_collisions > last_collisions);
-    last_collisions = current_collisions;
-    processed_sensor_data.is_collision_event = is_collision;
-    current_lane_invasions = get_safe(frame, 'lane_invasions', 0);
-    if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end
-    is_lane_invasion = (current_lane_invasions > last_lane_invasions);
-    last_lane_invasions = current_lane_invasions;
-    processed_sensor_data.is_lane_invasion_event = is_lane_invasion;
+    if iscell(ekf_cov_data), try, covariance_matrix = cell2mat(cellfun(@cell2mat, ekf_cov_data, 'UniformOutput', false)); covariance_trace = trace(covariance_matrix(1:2, 1:2)); catch, covariance_trace = inf; end; end
+    sensor_fusion_status = struct('fused_state', get_safe(frame, 'fused_state', struct('x', NaN, 'y', NaN, 'vx', NaN, 'vy', NaN)), 'position_uncertainty', covariance_trace, 'health_score', health_score, 'raw_health', sensor_health_data);
     
-    processed_sensor_data.Weather_Severity = computeWeatherSeverity(frame);
-    processed_sensor_data.Obstacle_Density = computeObstacleDensity(frame);
-
-    driver_attention = computeDriverAttention(frame);
-    driver_readiness = computeDriverReadiness(frame);
-    threat_data = computeThreatAssessment(frame);
+    processed_sensor_data = struct();
+    all_fields = fieldnames(frame); prefixes_to_copy = {'image_', 'lidar_', 'radar_'}; single_fields_to_copy = {'gnss', 'imu', 'position', 'rotation', 'Detected_Obstacles', 'V2V_Data', 'V2I_Data'};
+    for i = 1:numel(all_fields), field = all_fields{i}; if isfield(frame, field), copy_this_field = false; for j = 1:numel(prefixes_to_copy), if startsWith(field, prefixes_to_copy{j}), copy_this_field = true; break; end, end; if ~copy_this_field && ismember(field, single_fields_to_copy), copy_this_field = true; end; if copy_this_field, processed_sensor_data.(field) = frame.(field); end; end; end
+    
+    control_data = get_safe(frame, 'control', struct('throttle',0,'brake',0,'steer',0,'hand_brake',false,'reverse',false));
+    processed_sensor_data.speed = get_safe(frame, 'speed', 0);
+    processed_sensor_data.ultrasonic_front = get_safe(frame, 'ultrasonic_front', inf); processed_sensor_data.ultrasonic_back = get_safe(frame, 'ultrasonic_back', inf);
+    processed_sensor_data.throttle_input = control_data.throttle; processed_sensor_data.brake_input = control_data.brake; processed_sensor_data.steering_input = control_data.steer;
+    rotation_data = get_safe(frame, 'rotation', struct('yaw', 0)); yaw_rate = 0;
+    if isfield(rotation_data, 'yaw'), current_yaw = rotation_data.yaw; if isempty(last_yaw), last_yaw = current_yaw; end; yaw_delta = current_yaw - last_yaw; if yaw_delta > 180, yaw_delta = yaw_delta - 360; end; if yaw_delta < -180, yaw_delta = yaw_delta + 360; end; yaw_rate = yaw_delta / max(time_since_last, 0.001); last_yaw = current_yaw; end
+    processed_sensor_data.yaw_rate = yaw_rate;
+    current_collisions = get_safe(frame, 'collisions', 0); if isempty(last_collisions), last_collisions = current_collisions; end; processed_sensor_data.is_collision_event = (current_collisions > last_collisions); last_collisions = current_collisions;
+    current_lane_invasions = get_safe(frame, 'lane_invasions', 0); if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end; processed_sensor_data.is_lane_invasion_event = (current_lane_invasions > last_lane_invasions); last_lane_invasions = current_lane_invasions;
+    processed_sensor_data.Weather_Severity = computeWeatherSeverity(frame); processed_sensor_data.Obstacle_Density = computeObstacleDensity(frame);
+    
+    driver_attention = computeDriverAttention(frame); driver_readiness = computeDriverReadiness(frame); threat_data = computeThreatAssessment(frame);
     fallback = false; reason = {};
     if latency > 0.2, fallback = true; reason{end+1} = 'High Latency (>200ms)'; end
     if health_score < 0.75, fallback = true; reason{end+1} = 'Low Sensor Health'; end
     if threat_data.min_front_distance < 10 && threat_data.closing_velocity < -5, fallback = true; reason{end+1} = 'Imminent Collision Risk'; end
     if driver_attention < 0.2, fallback = true; reason{end+1} = 'Low Driver Attention'; end
-    if driver_readiness < 0.5, fallback = true; reason{end+1} = 'Low Driver Readiness'; end
-    if processed_sensor_data.is_collision_event, fallback = true; reason{end+1} = 'Collision Detected'; end
-    if processed_sensor_data.is_lane_invasion_event, fallback = true; reason{end+1} = 'Lane Invasion Detected'; end
-    
     if fallback, logToDashboard(uiHandles, sprintf('[FALLBACK] Reasons: %s', strjoin(reason, ', '))); end
     carla_outputs = struct('network_status', network_status, 'sensor_fusion_status', sensor_fusion_status, 'processed_sensor_data', processed_sensor_data, 'fallback_initiation', fallback, 'driver_attention', driver_attention, 'driver_readiness', driver_readiness);
 end
@@ -362,18 +329,6 @@ function full_data = processPacket(packet)
     else, full_data = packet; end
 end
 
-function [jsonStr, remaining] = extractJSON(buffer)
-    jsonStr = ''; remaining = buffer; startIdx = find(buffer == '{', 1);
-    if isempty(startIdx), return; end
-    braceCount = 0; endIdx = 0; inString = false; escaped = false;
-    for i = startIdx:length(buffer)
-        char = buffer(i);
-        if ~inString, if char == '{', braceCount = braceCount + 1; elseif char == '}', braceCount = braceCount - 1; if braceCount == 0, endIdx = i; break; end; elseif char == '"', inString = true; end
-        else, if ~escaped, if char == '"', inString = false; elseif char == '\', escaped = true; end; else, escaped = false; end; end
-    end
-    if endIdx > 0, jsonStr = buffer(startIdx:endIdx); remaining = buffer(endIdx+1:end); end
-end
-
 function logToDashboard(uiHandles, message)
     if ~isvalid(uiHandles.fig), return; end
     timestamp = datestr(now, 'HH:MM:SS'); newMessage = sprintf('%s - %s', timestamp, message);
@@ -389,97 +344,35 @@ function decoded = base64decode(str)
 end
 
 function threat = computeThreatAssessment(frame)
-    threat.min_front_distance = inf;
-    threat.closing_velocity = 0;
+    threat.min_front_distance = inf; threat.closing_velocity = 0;
     radar_data = get_safe(frame, 'radar_front', []);
-    if isstruct(radar_data)
-        detections = radar_data;
-        for i = 1:numel(detections)
-            if abs(detections(i).az) < 0.2 
-                if detections(i).depth < threat.min_front_distance
-                    threat.min_front_distance = detections(i).depth;
-                    threat.closing_velocity = detections(i).vel;
-                end
-            end
-        end
-    end
+    if isstruct(radar_data), for i=1:numel(radar_data), if abs(radar_data(i).az)<0.2 && radar_data(i).depth<threat.min_front_distance, threat.min_front_distance=radar_data(i).depth; threat.closing_velocity=radar_data(i).vel; end, end, end
 end
 
 function score = computeDriverAttention(frame)
-    persistent time_of_last_input;
-    if isempty(time_of_last_input), time_of_last_input = tic; end
-    attention_decay_period = 5.0; 
-    score = 1.0; 
-    mode = get_safe(frame, 'mode', 'autopilot');
-    default_control = struct('steer',0,'throttle',0,'brake',0);
-    controls = get_safe(frame, 'control', default_control);
-    if strcmp(mode, 'manual')
-        if abs(controls.steer) > 0.01 || controls.throttle > 0.01 || controls.brake > 0.01
-            time_of_last_input = tic;
-            score = 1.0;
-        else
-            time_since_input = toc(time_of_last_input);
-            score = 1.0 - (time_since_input / attention_decay_period);
-            score = max(0, min(1, score));
-        end
-    else
-        time_of_last_input = tic;
-        score = 1.0;
-    end
+    persistent time_of_last_input; if isempty(time_of_last_input), time_of_last_input = tic; end
+    score = 1.0; controls = get_safe(frame, 'control', struct('steer',0,'throttle',0,'brake',0));
+    if strcmp(get_safe(frame, 'mode', 'autopilot'), 'manual'), if abs(controls.steer)>0.01 || controls.throttle>0.01 || controls.brake>0.01, time_of_last_input = tic; score = 1.0; else, score = max(0, min(1, 1.0 - (toc(time_of_last_input) / 5.0))); end
+    else, time_of_last_input = tic; score = 1.0; end
 end
 
 function score = computeDriverReadiness(frame)
-    score = 1.0; 
-    default_control = struct('throttle',0,'brake',0,'hand_brake',false);
-    controls = get_safe(frame, 'control', default_control);
-    if controls.throttle > 0.1 && controls.brake > 0.1
-        score = 0.1; 
-        return;
-    end
-    if controls.hand_brake && controls.throttle > 0.1
-        score = 0.3; 
-        return;
-    end
+    score = 1.0; controls = get_safe(frame, 'control', struct('throttle',0,'brake',0,'hand_brake',false));
+    if controls.throttle > 0.1 && controls.brake > 0.1, score = 0.1; return; end
+    if controls.hand_brake && controls.throttle > 0.1, score = 0.3; return; end
 end
 
 function value = get_safe(s, field, default_value)
-    if isfield(s, field)
-        value = s.(field);
-    else
-        value = default_value;
-    end
+    if isfield(s, field), value = s.(field); else, value = default_value; end
 end
 
 function severity = computeWeatherSeverity(frame)
     weather_str = get_safe(frame, 'weather', 'ClearNoon');
-    switch weather_str
-        case 'ClearNoon'
-            severity = 0.1;
-        case 'CloudyNoon'
-            severity = 0.3;
-        case 'WetNoon'
-            severity = 0.6;
-        case 'HardRainNoon'
-            severity = 0.9;
-        otherwise
-            severity = 0.1; % Default to benign
-    end
+    switch weather_str, case 'ClearNoon', severity=0.1; case 'CloudyNoon', severity=0.3; case 'WetNoon', severity=0.6; case 'HardRainNoon', severity=0.9; otherwise, severity=0.1; end
 end
 
 function density = computeObstacleDensity(frame)
-    density = 0;
-    detection_radius = 50; % meters
-    
-    obstacles = get_safe(frame, 'Detected_Obstacles', []);
-    ego_pos = get_safe(frame, 'position', struct('x', 0, 'y', 0, 'z', 0));
-    
+    density = 0; obstacles = get_safe(frame, 'Detected_Obstacles', []); ego_pos = get_safe(frame, 'position', struct('x', 0, 'y', 0, 'z', 0));
     if isempty(obstacles), return; end
-    
-    for i = 1:numel(obstacles)
-        obs_pos = obstacles(i).position;
-        distance = sqrt((obs_pos.x - ego_pos.x)^2 + (obs_pos.y - ego_pos.y)^2);
-        if distance < detection_radius
-            density = density + 1;
-        end
-    end
+    for i = 1:numel(obstacles), if sqrt((obstacles(i).position.x - ego_pos.x)^2 + (obstacles(i).position.y - ego_pos.y)^2) < 50, density = density + 1; end, end
 end
