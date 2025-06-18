@@ -36,7 +36,7 @@ WINDOW_WIDTH, WINDOW_HEIGHT = IMAGE_WIDTH * GRID_COLS, IMAGE_HEIGHT * GRID_ROWS
 TICK_RATE = 20
 VEHICLE_MODEL = 'vehicle.tesla.model3'
 NUM_BACKUPS = 2
-NUM_NPC_VEHICLES = 50 # Number of NPCs for V2V
+NUM_NPC_VEHICLES = 20 # Number of NPCs for V2V
 DATA_DIR = 'data'
 LOG_DIR = os.path.join(DATA_DIR, 'logs')
 CAMERA_DIRS = {
@@ -543,20 +543,59 @@ class CarlaSimulation:
         self.udp_sender.send_string_chunks(json.dumps(data_packet,separators=(',',':')), snapshot.frame)
 
     def _cleanup(self):
+        """
+        A more robust cleanup method to prevent server timeouts.
+        """
         print("Cleaning up resources...")
-        if self.command_receiver: self.command_receiver.stop(); self.command_receiver.join()
-        if self.image_saver: self.image_saver.stop()
-        if self.udp_sender: self.udp_sender.close()
-        [f.close() for f in self.log_files.values()]
-        if self.client and self.npc_vehicles:
-            print("Stopping and destroying NPC vehicles...")
-            self.client.apply_batch([carla.command.SetAutopilot(x.id, False) for x in self.npc_vehicles])
-            self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in self.npc_vehicles if x.is_alive], True)
+
+        # Stop threads first to prevent them from making more requests
+        if self.command_receiver:
+            self.command_receiver.stop()
+            self.command_receiver.join()
+        if self.image_saver:
+            self.image_saver.stop()
+        if self.udp_sender:
+            self.udp_sender.close()
+        
+        # Close log files
+        for f in self.log_files.values():
+            f.close()
+
+        # If the world object exists, try to un-freeze the server first
         if self.world:
-            settings=self.world.get_settings(); settings.synchronous_mode=False; settings.fixed_delta_seconds=None
-            self.world.apply_settings(settings); [s.destroy() for s_list in self.sensors.values() for s in s_list]
-            if self.vehicle: self.vehicle.destroy()
-        pygame.quit(); print("Simulation ended.")
+            print("Resetting CARLA server settings...")
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            try:
+                self.world.apply_settings(settings)
+            except RuntimeError as e:
+                print(f"[WARN] Could not apply settings during cleanup: {e}. Server might have already disconnected.")
+
+        # Destroy actors only after the server is unfrozen (or was never frozen)
+        if self.client:
+            print("Destroying actors...")
+            # Use a single batch command for efficiency and safety
+            actor_ids = []
+            if self.npc_vehicles:
+                actor_ids.extend([x.id for x in self.npc_vehicles if x.is_alive])
+            
+            for sensor_list in self.sensors.values():
+                actor_ids.extend([s.sensor.id for s in sensor_list if s.sensor and s.sensor.is_alive])
+            
+            if self.vehicle and self.vehicle.is_alive:
+                actor_ids.append(self.vehicle.id)
+            
+            if actor_ids:
+                try:
+                    # Use a synchronous batch to ensure commands are processed before quitting
+                    self.client.apply_batch_sync([carla.command.DestroyActor(aid) for aid in actor_ids], True)
+                    print(f"  - Destroyed {len(actor_ids)} actors.")
+                except RuntimeError as e:
+                    print(f"[WARN] Could not destroy all actors during cleanup: {e}. They may already be gone.")
+
+        pygame.quit()
+        print("Simulation ended.")
 
     def apply_vehicle_control(self, control):
         if self.vehicle and self.vehicle.is_alive:
