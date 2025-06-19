@@ -323,6 +323,7 @@ class CarlaSimulation:
         self.command_receiver = None
         self.active_sensor_indices = {}
         self.safe_mode_locked = False
+        self.was_autopilot_on_lock = False
 
     def run(self):
         try:
@@ -422,6 +423,21 @@ class CarlaSimulation:
         self.world.tick()
         snapshot = self.world.get_snapshot()
         self._process_fdir_commands()
+
+        # Handle safe mode override: bring vehicle to a stop if it was in autopilot.
+        if self.safe_mode_locked and self.was_autopilot_on_lock:
+            v = self.vehicle.get_velocity()
+            speed = np.linalg.norm([v.x, v.y, v.z]) # Speed in m/s
+
+            # If moving faster than a crawl, apply gentle, constant braking.
+            if speed > 0.1: # approx 0.36 km/h
+                control = carla.VehicleControl(throttle=0.0, brake=0.4, steer=0.0, hand_brake=False)
+                self.apply_vehicle_control(control)
+            else:
+                # Once stopped, apply the handbrake to hold position securely.
+                control = carla.VehicleControl(throttle=0.0, brake=0.0, hand_brake=True)
+                self.apply_vehicle_control(control)
+
         self._process_sensor_data(snapshot)
         self._run_sensor_fusion()
         self._run_object_detection()
@@ -445,6 +461,8 @@ class CarlaSimulation:
             elif cmd_type == 'ENTER_SAFE_MODE':
                 reason = command.get('reason', 'No reason specified')
                 print(f"!!! ENTERING LOCKED SAFE MODE. Reason: {reason} !!!")
+                # Record if autopilot was active at the moment of the lock command
+                self.was_autopilot_on_lock = self.autopilot
                 if self.autopilot: 
                     self.autopilot = False; 
                     self.vehicle.set_autopilot(self.autopilot)
@@ -599,6 +617,9 @@ class CarlaSimulation:
 
     def apply_vehicle_control(self, control):
         if self.vehicle and self.vehicle.is_alive:
+            # Do not apply manual control if safe mode is locked from an autopilot state
+            if self.safe_mode_locked and self.was_autopilot_on_lock:
+                return
             self.vehicle.apply_control(carla.VehicleControl(**control))
 
     def toggle_autopilot(self):
@@ -639,6 +660,7 @@ class CarlaSimulation:
         if self.safe_mode_locked:
             print("[INFO] User override: Safe Mode unlocked. All sensors reset to primary.")
             self.safe_mode_locked = False
+            self.was_autopilot_on_lock = False
             for key in self.active_sensor_indices:
                 self.active_sensor_indices[key] = 0
         else:

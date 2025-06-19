@@ -170,10 +170,10 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.healthLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
     uilabel(g_diag_metrics,'Text','Fallback Status:', 'FontSize', 10); 
     uiHandles.fallbackLabel=uilabel(g_diag_metrics,'Text','IDLE','FontWeight','bold','FontColor','g', 'HorizontalAlignment', 'left', 'FontSize', 10);
-    uilabel(g_diag_metrics,'Text','Traffic Light:', 'FontSize', 10, 'FontColor', [0.9 0.9 0.9]); 
+    uilabel(g_diag_metrics,'Text','Traffic Light:', 'FontSize', 10); 
     uiHandles.trafficLightLabel = uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
     % <<< ADDED: UI element for V2V/Sensor Cross-Validation Status >>>
-    uilabel(g_diag_metrics,'Text','Sys. Confidence:', 'FontSize', 10, 'FontColor', [0.9 0.9 0.9]);
+    uilabel(g_diag_metrics,'Text','Sys. Confidence:', 'FontSize', 10);
     uiHandles.confidenceLabel = uilabel(g_diag_metrics, 'Text', 'NOMINAL', 'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
 
 
