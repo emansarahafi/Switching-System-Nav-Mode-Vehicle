@@ -154,8 +154,8 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     p_diag = uipanel(gl,'Title','Diagnostics','FontWeight','bold'); p_diag.Layout.Row=1; p_diag.Layout.Column=4;
     g_diag = uigridlayout(p_diag,[1 1]);
     p_diag_metrics = uipanel(g_diag,'Title','');
-    % <<< MODIFIED: Increased grid layout rows from 8 to 9 for new V2X checks >>>
-    g_diag_metrics = uigridlayout(p_diag_metrics,[9,2],'ColumnWidth',{'fit','1x'});
+    % <<< MODIFIED: Increased grid layout rows from 9 to 10 for Fuzzy Logic output >>>
+    g_diag_metrics = uigridlayout(p_diag_metrics,[10,2],'ColumnWidth',{'fit','1x'});
     uilabel(g_diag_metrics,'Text','Frame:', 'FontSize', 10); 
     uiHandles.frameLabel=uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'FontSize', 10);
     uilabel(g_diag_metrics,'Text','Net Latency:', 'FontSize', 10); 
@@ -172,9 +172,11 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.fallbackLabel=uilabel(g_diag_metrics,'Text','IDLE','FontWeight','bold','FontColor','g', 'HorizontalAlignment', 'left', 'FontSize', 10);
     uilabel(g_diag_metrics,'Text','Traffic Light:', 'FontSize', 10); 
     uiHandles.trafficLightLabel = uilabel(g_diag_metrics,'Text','N/A','FontWeight','bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
-    % <<< ADDED: UI element for V2V/Sensor Cross-Validation Status >>>
     uilabel(g_diag_metrics,'Text','Sys. Confidence:', 'FontSize', 10);
     uiHandles.confidenceLabel = uilabel(g_diag_metrics, 'Text', 'NOMINAL', 'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
+    % <<< ADDED: UI element for Fuzzy Logic Decision >>>
+    uilabel(g_diag_metrics,'Text','Fuzzy Decision:', 'FontSize', 10, 'FontWeight', 'bold');
+    uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'FontSize', 10);
 
 
     p_cameras = uipanel(gl,'Title','Camera Feeds','FontWeight','bold'); p_cameras.Layout.Row=2; p_cameras.Layout.Column=[1 2];
@@ -256,7 +258,6 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
         uiHandles.trafficLightLabel.FontColor = [0.9, 0.9, 0.9];
     end
     
-    % <<< ADDED: Update the System Confidence label >>>
     if isfield(outputs, 'system_confidence')
         conf = outputs.system_confidence;
         uiHandles.confidenceLabel.Text = conf.status_text;
@@ -266,6 +267,20 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
             uiHandles.confidenceLabel.FontColor = [1, 0.9, 0]; % Yellow
         else
             uiHandles.confidenceLabel.FontColor = [1, 0.2, 0.2]; % Red
+        end
+    end
+    
+    % <<< ADDED: Update the Fuzzy Logic Decision label >>>
+    if isfield(outputs, 'fuzzy_decision')
+        % Format the text to show both the decision and the score
+        decision_text = sprintf('%s (%.1f)', outputs.fuzzy_decision, outputs.fuzzy_desirability_score);
+        uiHandles.fuzzyDecisionLabel.Text = decision_text;
+        
+        % Color-code the decision for quick visual feedback
+        if strcmp(outputs.fuzzy_decision, 'AUTOPILOT')
+            uiHandles.fuzzyDecisionLabel.FontColor = [0.2, 1, 0.2]; % Green
+        else
+            uiHandles.fuzzyDecisionLabel.FontColor = [1, 0.9, 0];   % Yellow for Manual/Handover
         end
     end
 end
@@ -312,7 +327,6 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     
     driver_attention = computeDriverAttention(frame); driver_readiness = computeDriverReadiness(frame);
     
-    % <<< MODIFIED: Threat assessment and confidence now use V2V data >>>
     threat_data = computeThreatAssessment(frame);
     system_confidence = computeSystemConfidence(frame);
     
@@ -322,22 +336,26 @@ function processAndAnalyzeFrame(frame, latency, uiHandles)
     if threat_data.min_front_distance < 10 && threat_data.closing_velocity < -5, fallback = true; reason{end+1} = 'Imminent Collision Risk'; end
     if driver_attention < 0.2, fallback = true; reason{end+1} = 'Low Driver Attention'; end
     
-    % <<< ADDED: Fallback triggers based on V2V and V2I data >>>
-    % 1. Check for V2I behavioral conflicts (running a red light)
     v2i_data = get_safe(frame, 'V2I_Data', struct());
     if isfield(v2i_data, 'traffic_light_state') && strcmp(v2i_data.traffic_light_state, 'RED') && frame.speed > 5
         fallback = true; reason{end+1} = 'V2I Conflict: Moving on Red Light';
     end
     
-    % 2. Check for low system confidence from sensor cross-validation
     if system_confidence.score < 0.5
         fallback = true; reason{end+1} = ['Sensor Discrepancy: ' system_confidence.status_text];
     end
     
     if fallback, logToDashboard(uiHandles, sprintf('[FALLBACK] Reasons: %s', strjoin(reason, ', '))); end
 
-    % <<< MODIFIED: Added system_confidence to the final output struct >>>
     carla_outputs = struct('network_status', network_status, 'sensor_fusion_status', sensor_fusion_status, 'processed_sensor_data', processed_sensor_data, 'fallback_initiation', fallback, 'driver_attention', driver_attention, 'driver_readiness', driver_readiness, 'system_confidence', system_confidence);
+
+    % --- FINAL STEP: Call the Fuzzy Logic Decider ---
+    % Ensure fuzzy_bbna.m is in the same directory or on the MATLAB path.
+    [decision, score] = fuzzy_bbna(carla_outputs);
+    
+    % Store the fuzzy logic output back into the main struct for logging and display
+    carla_outputs.fuzzy_decision = decision;
+    carla_outputs.fuzzy_desirability_score = score;
 end
 
 
@@ -376,12 +394,9 @@ function decoded = base64decode(str)
     catch, decoded = []; end
 end
 
-% <<< MODIFIED: Threat assessment now uses V2V data as a secondary source >>>
 function threat = computeThreatAssessment(frame)
     threat.min_front_distance = inf; 
     threat.closing_velocity = 0;
-    
-    % 1. Assess threat from front radar
     min_dist_radar = inf;
     radar_data = get_safe(frame, 'radar_front', []);
     if isstruct(radar_data)
@@ -392,25 +407,14 @@ function threat = computeThreatAssessment(frame)
             end
         end
     end
-    
-    % 2. Assess threat from V2V data
     [min_dist_v2v, ~] = findClosestV2VThreat(frame);
-    
-    % 3. Fused Threat: Use the closest threat from either source
     threat.min_front_distance = min(min_dist_radar, min_dist_v2v);
 end
 
-% <<< ADDED: New function for V2V/Sensor cross-validation >>>
 function confidence = computeSystemConfidence(frame)
-    % This function checks for major discrepancies between sensor systems.
-    % Score: 1.0 = Nominal, < 0.5 = Major Discrepancy.
-    
     confidence.score = 1.0;
     confidence.status_text = 'NOMINAL';
-    
-    % Get threats from both Radar and V2V
-    [min_dist_v2v, v2v_vel] = findClosestV2VThreat(frame);
-    
+    [min_dist_v2v, ~] = findClosestV2VThreat(frame);
     min_dist_radar = inf;
     radar_data = get_safe(frame, 'radar_front', []);
     if isstruct(radar_data)
@@ -420,19 +424,13 @@ function confidence = computeSystemConfidence(frame)
             end
         end
     end
-    
-    % Check for critical discrepancy: One sensor sees a close object, the other sees nothing.
     DANGER_THRESHOLD = 20;  % meters
     CLEAR_THRESHOLD = 50;   % meters
-    
-    % Case 1: V2V reports DANGER, Radar reports CLEAR
     if min_dist_v2v < DANGER_THRESHOLD && min_dist_radar > CLEAR_THRESHOLD
         confidence.score = 0.2;
         confidence.status_text = 'V2V/Radar Mismatch (Radar Blind)';
         return;
     end
-    
-    % Case 2: Radar reports DANGER, V2V reports CLEAR
     if min_dist_radar < DANGER_THRESHOLD && min_dist_v2v > CLEAR_THRESHOLD
         confidence.score = 0.4;
         confidence.status_text = 'V2V/Radar Mismatch (V2V Missing)';
@@ -440,43 +438,29 @@ function confidence = computeSystemConfidence(frame)
     end
 end
 
-% <<< ADDED: Helper function to find the closest threat from V2V data >>>
 function [closest_dist, closing_vel] = findClosestV2VThreat(frame)
     closest_dist = inf;
     closing_vel = 0;
-    
     v2v_data = get_safe(frame, 'V2V_Data', []);
     ego_pos = get_safe(frame, 'position', []);
     ego_rot = get_safe(frame, 'rotation', []);
-    
     if isempty(v2v_data) || isempty(ego_pos) || isempty(ego_rot), return; end
-    
     ego_yaw_rad = deg2rad(ego_rot.yaw);
     forward_vec = [cos(ego_yaw_rad), sin(ego_yaw_rad)];
-    
     for i = 1:numel(v2v_data)
         v = v2v_data(i);
-        
-        % Vector from ego to other vehicle
         rel_pos_vec = [v.position.x - ego_pos.x, v.position.y - ego_pos.y];
-        
-        % Check if the other vehicle is in front of the ego vehicle
         dot_product = dot(rel_pos_vec, forward_vec);
         if dot_product > 0 % It's in the forward hemisphere
             dist = norm(rel_pos_vec);
-            
-            % Check if it's within a narrow forward cone (approx +/- 12 degrees)
             if dot_product / dist > 0.98 
                 if dist < closest_dist
                     closest_dist = dist;
-                    % Placeholder for closing velocity, would need ego velocity too
-                    % closing_vel = ...
                 end
             end
         end
     end
 end
-
 
 function score = computeDriverAttention(frame)
     persistent time_of_last_input; if isempty(time_of_last_input), time_of_last_input = tic; end
