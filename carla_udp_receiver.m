@@ -1,8 +1,8 @@
 function carla_udp_receiver(port)
 % CARLA_UDP_RECEIVER - Main entry point for the CARLA diagnostics dashboard.
-% This script sets up a modern UI, receives data from a Python CARLA client
-% over UDP, processes it, and continuously updates the dashboard components.
-% It uses a robust, state-aware fuzzy logic controller to manage driving modes.
+% This script acts as a supervisory controller. It receives data from Python,
+% runs a fuzzy logic system to decide on a course of action, and only sends
+% control commands when it determines AUTOPILOT is necessary and safe.
 
     % --- Configuration ---
     if nargin < 1
@@ -80,6 +80,7 @@ function carla_udp_receiver(port)
             buffer = [buffer, newData];
             last_message_time = tic;
             
+            % Using a robust delimiter strategy for concatenated JSON
             delimiter = '|||JSON_DELIMITER|||';
             sanitizedBuffer = strrep(buffer, '}{', ['}' delimiter '{']);
             jsonObjects = strsplit(sanitizedBuffer, delimiter);
@@ -112,25 +113,45 @@ function carla_udp_receiver(port)
             [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, ...
                 trajectory, gnss_track, imu_history);
             
-            % Call analysis and controller in sequence
+            % =========================================================================
+            % --- MODIFIED CONTROL LOGIC STARTS HERE ---
+            % =========================================================================
+
+            % 1. Analyze the incoming data and calculate all metrics
             [dt] = processAndAnalyzeFrame(frame_data, toc(last_message_time), uiHandles);
             
-            % Get the current control mode from the global state
-            current_mode = get_safe(carla_outputs, 'fuzzy_decision', 'MANUAL');
+            % 2. Get the vehicle's TRUE current mode from the Python script
+            current_mode_from_python = get_safe(frame_data, 'mode', 'MANUAL');
 
-            % Run the fuzzy decider to get the target mode
-            [target_decision, score] = fuzzy_bbna(carla_outputs, current_mode);
+            % 3. Run the fuzzy decider to get the DESIRED mode from this system's perspective
+            [fuzzy_decision, score] = fuzzy_bbna(carla_outputs, current_mode_from_python);
             
-            % Run the Mode Controller to handle transitions and get the final command
-            [final_mode, vehicle_command] = ModeController(target_decision, current_mode, carla_outputs, dt);
+            % 4. ACT based on the fuzzy decision
+            if strcmp(fuzzy_decision, 'AUTOPILOT')
+                % The fuzzy system wants to drive. Calculate the control command.
+                % The ModeController generates the specific throttle/steer/brake values.
+                [~, vehicle_command] = ModeController('AUTOPILOT', current_mode_from_python, carla_outputs, dt);
+                
+                % Send the command. The Python script will only obey this if the
+                % user has enabled the MATLAB link (with the 'M' key).
+                send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
+                
+            else 
+                % The fuzzy system decided on 'MANUAL' or 'REQUEST_HANDOVER'.
+                % In this new paradigm, we DO NOT send any command.
+                % This allows the Python script to remain in control (either
+                % manual WASD or user autopilot via 'P' key).
+            end
             
-            % Send the final command back to CARLA
-            send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
-            
-            % Update the persistent state for the next cycle
-            carla_outputs.fuzzy_decision = final_mode;
+            % 5. Update the global state for the next cycle and for the dashboard
+            carla_outputs.fuzzy_decision = fuzzy_decision;
             carla_outputs.fuzzy_desirability_score = score;
             
+            % =========================================================================
+            % --- MODIFIED CONTROL LOGIC ENDS HERE ---
+            % =========================================================================
+            
+            % Update all visual components of the dashboard
             updateDashboard(uiHandles, frame_data, trajectory, ...
                 gnss_track, imu_history, carla_outputs);
         end
@@ -199,14 +220,14 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     g_diag_metrics = uigridlayout(p_diag_metrics, [10, 2], 'ColumnWidth', {'fit', '1x'});
     uilabel(g_diag_metrics, 'Text', 'Frame:'); uiHandles.frameLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
     uilabel(g_diag_metrics, 'Text', 'Net Latency:'); uiHandles.latencyLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Mode:'); uiHandles.modeLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
+    uilabel(g_diag_metrics, 'Text', 'Actual Mode:'); uiHandles.modeLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
     uilabel(g_diag_metrics, 'Text', 'Map:'); uiHandles.mapLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
     uilabel(g_diag_metrics, 'Text', 'Weather:'); uiHandles.weatherLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
     uilabel(g_diag_metrics, 'Text', 'Sensor Health:'); uiHandles.healthLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
     uilabel(g_diag_metrics, 'Text', 'Fallback Status:'); uiHandles.fallbackLabel = uilabel(g_diag_metrics, 'Text', 'IDLE', 'FontWeight', 'bold', 'FontColor', 'g');
     uilabel(g_diag_metrics, 'Text', 'Traffic Light:'); uiHandles.trafficLightLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
     uilabel(g_diag_metrics, 'Text', 'Sys. Confidence:'); uiHandles.confidenceLabel = uilabel(g_diag_metrics, 'Text', 'NOMINAL', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Final Mode:', 'FontWeight', 'bold'); uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold');
+    uilabel(g_diag_metrics, 'Text', 'Fuzzy Decision:', 'FontWeight', 'bold'); uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold');
     
     % Camera Feeds
     p_cameras = uipanel(gl, 'Title', 'Camera Feeds', 'FontWeight', 'bold');
@@ -266,7 +287,7 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     
     % Update text labels
     if isfield(data, 'frame'), uiHandles.frameLabel.Text = num2str(data.frame); end
-    if isfield(data, 'mode'), uiHandles.modeLabel.Text = data.mode; end
+    if isfield(data, 'mode'), uiHandles.modeLabel.Text = strrep(data.mode, '_', ' '); end
     if isfield(data, 'map'), uiHandles.mapLabel.Text = data.map; end
     if isfield(data, 'weather'), uiHandles.weatherLabel.Text = data.weather; end
     
@@ -359,7 +380,7 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
         uiHandles.trafficLightLabel.FontColor = [0.9, 0.9, 0.9];
     end
     
-    % Update the Final Mode label
+    % Update the Fuzzy Decision label
     if isfield(outputs, 'fuzzy_decision') && ~isempty(outputs.fuzzy_decision)
         decision_text = sprintf('%s (Score: %.1f)', outputs.fuzzy_decision, outputs.fuzzy_desirability_score);
         uiHandles.fuzzyDecisionLabel.Text = strrep(decision_text, '_', ' ');

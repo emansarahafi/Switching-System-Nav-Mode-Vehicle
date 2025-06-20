@@ -137,7 +137,7 @@ class ObjectTracker:
         try:
             points = np.frombuffer(point_cloud.raw_data, dtype=np.float32).reshape(-1, 4)
             points_xyz = points[:, :3]
-            ground_height_threshold = -1.4 
+            ground_height_threshold = -1.4
             non_ground_indices = points_xyz[:, 2] > ground_height_threshold
             points_xyz = points_xyz[non_ground_indices]
             if len(points_xyz) < 10: return []
@@ -176,20 +176,36 @@ class HUD:
         if self.show_help: self._render_help_text(display)
 
     def _render_hud_info(self, display: pygame.Surface, sim_state: Dict[str, Any]):
-        mode_text = sim_state.get('matlab_mode', 'MANUAL')
+        mode_text = 'MANUAL' # Default
+        if sim_state.get('is_matlab_actively_controlling'):
+            mode_text = 'MATLAB CONTROL'
+        elif sim_state.get('control_mode') == 'USER_AUTOPILOT':
+            mode_text = 'USER AUTOPILOT'
+
         if sim_state.get('safe_mode_locked', False):
             mode_text = 'LOCKED'
+
+        matlab_link_status = 'ENABLED' if sim_state.get('accept_matlab_commands') else 'DISABLED'
+        matlab_link_color = (0, 255, 0) if sim_state.get('accept_matlab_commands') else (255, 165, 0)
+
         info_text = [
             f"Speed: {sim_state['speed']:.2f} km/h", f"Map: {sim_state['map_name']}",
             f"Fused Pos: {sim_state.get('fused_pos', 'N/A')}", f"Collisions: {sim_state['collision_count']}",
             f"Lane Invasions: {sim_state['lane_invasion_count']}", "-----------",
             f"Throttle: {sim_state['control']['throttle']:.2f}", f"Steer: {sim_state['control']['steer']:.2f}",
             f"Brake: {sim_state['control']['brake']:.2f}", "-----------",
-            f"Control Mode: {mode_text}", f"Img Record: {'ON' if sim_state['recording_images'] else 'OFF'}",
+            f"Control Mode: {mode_text}",
+            f"Img Record: {'ON' if sim_state['recording_images'] else 'OFF'}",
             f"Sim Record: {'ON' if sim_state['recording_sim'] else 'OFF'}"
         ]
-        for i, text in enumerate(info_text): display.blit(self.font.render(text, True, (255, 255, 255)), (10, 10 + i * 20))
-    
+
+        for i, text in enumerate(info_text):
+            display.blit(self.font.render(text, True, (255, 255, 255)), (10, 10 + i * 20))
+
+        # Add the MATLAB link status separately for emphasis
+        link_surf = self.font.render(f"MATLAB Link (M): {matlab_link_status}", True, matlab_link_color)
+        display.blit(link_surf, (10, 30 + len(info_text) * 20))
+
     def _render_sensor_health(self, display: pygame.Surface, health_data: Dict[str, List[str]], active_indices: Dict[str, int]):
         x_offset = WINDOW_WIDTH - 280; y_offset = 10
         display.blit(self.font.render("--- Sensor Health (Active*) ---", True, (255, 255, 255)), (x_offset, y_offset)); y_offset += 20
@@ -205,7 +221,7 @@ class HUD:
                 if i < len(statuses) - 1:
                     sep_surface = self.font.render(" | ", True, (255, 255, 255)); display.blit(sep_surface, (current_x, y_offset)); current_x += sep_surface.get_width()
             y_offset += 20
-            
+
     def _render_safe_mode_warning(self, display: pygame.Surface):
         s = pygame.Surface((WINDOW_WIDTH, 80)); s.set_alpha(180); s.fill((255, 0, 0))
         display.blit(s, (0, (WINDOW_HEIGHT / 2) - 40))
@@ -217,9 +233,18 @@ class HUD:
         display.blit(sub_text_surf, sub_text_rect)
 
     def _render_help_text(self, display: pygame.Surface):
-        help_text = ["W/S: Throttle/Brake", "A/D: Steer Left/Right", "Q: Toggle Reverse", "Space: Hand Brake", "P: Control now managed by MATLAB", "L: Unlock Safe Mode", "C: Next Weather (Shift+C: Prev)", "V: Next Map Layer (Shift+V: Prev)", "B: Load Layer (Shift+B: Unload)", "R: Toggle Image Recording", "Ctrl+R: Toggle Sim Recording", "3: Switch to Town03", "0: Switch to Town10HD", "F1: Toggle HUD", "H: Toggle Help", "ESC: Quit"]
-        s = pygame.Surface((300, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
-        for i, text in enumerate(help_text): display.blit(self.help_font.render(text, True, (255, 255, 255)), (60, 60 + i * 22))
+        help_text = [
+            "W/S: Throttle/Brake", "A/D: Steer Left/Right", "Q: Toggle Reverse",
+            "Space: Hand Brake", "P: Toggle User Autopilot", "M: Toggle MATLAB Control Link",
+            "L: Unlock Safe Mode", "C: Next Weather (Shift+C: Prev)",
+            "V: Next Map Layer (Shift+V: Prev)", "B: Load Layer (Shift+B: Unload)",
+            "R: Toggle Image Recording", "Ctrl+R: Toggle Sim Recording",
+            "3: Switch to Town03", "0: Switch to Town10HD", "F1: Toggle HUD",
+            "H: Toggle Help", "ESC: Quit"
+        ]
+        s = pygame.Surface((360, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
+        for i, text in enumerate(help_text):
+            display.blit(self.help_font.render(text, True, (255, 255, 255)), (60, 60 + i * 22))
 
 class KeyboardController:
     def __init__(self, sim):
@@ -232,17 +257,24 @@ class KeyboardController:
         return True
     def get_control_state(self): return self._control_state
     def _parse_key_event(self, event):
-        is_keydown = (event.type == pygame.KEYDOWN); key = event.key; mods = pygame.key.get_mods()
-        is_ctrl = (mods & pygame.KMOD_CTRL); is_shift = (mods & pygame.KMOD_SHIFT)
-        if key == K_w: self._control_state['throttle'] = 1.0 if is_keydown else 0.0
-        elif key == K_s: self._control_state['brake'] = 1.0 if is_keydown else 0.0
-        elif key == K_a: self._control_state['steer'] = -0.7 if is_keydown else 0.0
-        elif key == K_d: self._control_state['steer'] = 0.7 if is_keydown else 0.0
-        elif key == K_q and is_keydown: self._control_state['reverse'] = not self._control_state['reverse']
-        elif key == K_SPACE: self._control_state['hand_brake'] = is_keydown
+        is_keydown = (event.type == pygame.KEYDOWN); key = event.key
+
+        # Manual driving inputs are only processed if no autopilot is active
+        if not self.simulation.is_matlab_actively_controlling and self.simulation.control_mode == 'MANUAL':
+            if key == K_w: self._control_state['throttle'] = 1.0 if is_keydown else 0.0
+            elif key == K_s: self._control_state['brake'] = 1.0 if is_keydown else 0.0
+            elif key == K_a: self._control_state['steer'] = -0.7 if is_keydown else 0.0
+            elif key == K_d: self._control_state['steer'] = 0.7 if is_keydown else 0.0
+            elif key == K_q and is_keydown: self._control_state['reverse'] = not self._control_state['reverse']
+            elif key == K_SPACE: self._control_state['hand_brake'] = is_keydown
+
         if not is_keydown: return
-        if key == K_p and not is_ctrl: 
-            print("[INFO] Autopilot is now fully managed by the MATLAB controller.")
+
+        mods = pygame.key.get_mods()
+        is_ctrl = (mods & pygame.KMOD_CTRL); is_shift = (mods & pygame.KMOD_SHIFT)
+
+        if key == K_p: self.simulation.toggle_user_autopilot()
+        elif key == K_m: self.simulation.toggle_matlab_link()
         elif key == K_l: self.simulation.reset_safe_mode_lock()
         elif key == K_r and not is_ctrl: self.simulation.toggle_image_recording()
         elif key == K_r and is_ctrl: self.simulation.toggle_sim_recording()
@@ -315,7 +347,12 @@ class CarlaSimulation:
     def __init__(self):
         self.client=None; self.world=None; self.vehicle=None; self.display_manager=None; self.hud=None
         self.controller=None; self.udp_sender=None; self.image_saver=None; self.sensors={}; self.log_files={}; self.csv_writers={}
-        self.kalman_filter=None; self.fused_state=None; self.running=True; self.matlab_mode = 'MANUAL'
+        self.kalman_filter=None; self.fused_state=None; self.running=True
+
+        self.control_mode = 'MANUAL'  # The user's intended mode: 'MANUAL' or 'USER_AUTOPILOT'
+        self.accept_matlab_commands = False # Master switch for MATLAB link, toggled by 'M'
+        self.is_matlab_actively_controlling = False # True only when a MATLAB command is being applied
+
         self.recording_images=False; self.recording_sim=False; self.show_hud=True; self.collision_count=0; self.lane_invasion_count=0
         self.weather_names = list(WEATHER_PRESETS.keys()); self.current_weather_index = 0; self.current_layer_index = 0
         self.object_tracker = None; self.detected_obstacles = []
@@ -376,12 +413,11 @@ class CarlaSimulation:
         vehicle_bp = self.world.get_blueprint_library().find(VEHICLE_MODEL)
         spawn_point = random.choice(self.world.get_map().get_spawn_points())
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
-        
-        # This is the fully RESTORED sensor list
+
         self._spawn_sensor_with_backups('cam_front', 'RGB', carla.Transform(carla.Location(x=1.5,z=2.4)), display_pos=(1,0), camera_name='front')
-        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(1,2), camera_name='back') 
+        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(1,2), camera_name='back')
         self._spawn_sensor_with_backups('cam_left', 'RGB', carla.Transform(carla.Location(x=1.3,y=-0.9,z=1.2),carla.Rotation(yaw=-110)), display_pos=(0,0), camera_name='left')
-        self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right') 
+        self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right')
         self._spawn_sensor_with_backups('cam_interior', 'RGB', carla.Transform(carla.Location(x=0.5,y=-0.3,z=1.4),carla.Rotation(pitch=-15,yaw=180)), display_pos=(1,1), camera_name='interior')
         self._spawn_sensor_with_backups('gnss', 'GNSS', carla.Transform(carla.Location(z=2.6)))
         self._spawn_sensor_with_backups('imu', 'IMU', carla.Transform(carla.Location(x=0,z=0.5)))
@@ -422,6 +458,10 @@ class CarlaSimulation:
         snapshot = self.world.get_snapshot()
         self._process_fdir_commands()
 
+        # Apply manual control only if no other system is in charge.
+        if not self.safe_mode_locked and not self.is_matlab_actively_controlling and self.control_mode == 'MANUAL':
+            self.apply_vehicle_control(self.controller.get_control_state())
+
         if self.safe_mode_locked and self.was_autopilot_on_lock:
             v = self.vehicle.get_velocity(); speed = np.linalg.norm([v.x, v.y, v.z])
             if speed > 0.1: self.apply_vehicle_control({'brake': 0.5})
@@ -441,11 +481,23 @@ class CarlaSimulation:
             cmd_type = command.get('command')
 
             if cmd_type == 'SET_VEHICLE_CONTROL':
+                # This is the critical gate for MATLAB control
+                if not self.accept_matlab_commands:
+                    # If the link is disabled, just ignore the command
+                    return
+
                 control_data = command.get('control', None)
                 if control_data:
-                    self.matlab_mode = 'AUTOPILOT' if control_data.get('throttle',0) > 0 or control_data.get('steer',0) != 0 else 'MANUAL'
+                    # MATLAB is now officially in control
+                    self.is_matlab_actively_controlling = True
+
+                    # Disable user autopilot if it was on
+                    if self.control_mode == 'USER_AUTOPILOT':
+                        self.vehicle.set_autopilot(False)
+                        self.control_mode = 'MANUAL' # Reset user mode
+
                     self.apply_vehicle_control(control_data)
-            
+
             elif cmd_type == 'ACTIVATE_BACKUP':
                 sensor_group = command.get('sensor_group'); backup_index = command.get('backup_index')
                 if sensor_group in self.active_sensor_indices:
@@ -455,10 +507,14 @@ class CarlaSimulation:
             elif cmd_type == 'ENTER_SAFE_MODE':
                 reason = command.get('reason', 'No reason specified')
                 print(f"!!! ENTERING LOCKED SAFE MODE. Reason: {reason} !!!")
-                self.was_autopilot_on_lock = (self.matlab_mode == 'AUTOPILOT')
-                self.matlab_mode = 'LOCKED'
+                self.was_autopilot_on_lock = (self.is_matlab_actively_controlling or self.control_mode == 'USER_AUTOPILOT')
+                if self.control_mode == 'USER_AUTOPILOT':
+                    self.vehicle.set_autopilot(False)
+                self.control_mode = 'MANUAL'
+                self.is_matlab_actively_controlling = False
+                self.accept_matlab_commands = False
                 self.safe_mode_locked = True
-        except Empty: 
+        except Empty:
             return
 
     def _process_sensor_data(self, snapshot):
@@ -489,7 +545,7 @@ class CarlaSimulation:
             self.object_tracker.update(lidar_sensor.data, self.vehicle.get_transform())
             self.detected_obstacles = self.object_tracker.get_obstacles()
         else: self.detected_obstacles = []
-    
+
     def _gather_v2v_data(self) -> List[Dict[str, Any]]:
         v2v_list = []
         for actor in self.npc_vehicles:
@@ -508,9 +564,17 @@ class CarlaSimulation:
     def _send_udp_data(self, snapshot):
         t=self.vehicle.get_transform(); v=self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
+        
+        # Determine current mode string for UDP packet
+        current_mode_str = 'MANUAL'
+        if self.is_matlab_actively_controlling:
+            current_mode_str = 'MATLAB_CONTROL'
+        elif self.control_mode == 'USER_AUTOPILOT':
+            current_mode_str = 'USER_AUTOPILOT'
+        
         data_packet = {
             'timestamp':snapshot.timestamp.elapsed_seconds, 'frame':snapshot.frame,
-            'mode': self.matlab_mode,
+            'mode': current_mode_str,
             'map': self.world.get_map().name.split('/')[-1],
             'weather': self.weather_names[self.current_weather_index],
             'speed':np.linalg.norm([v.x,v.y,v.z])*3.6, 'position':{'x':t.location.x,'y':t.location.y,'z':t.location.z},
@@ -564,7 +628,7 @@ class CarlaSimulation:
                 safe_control = carla.VehicleControl(throttle=0.0, brake=float(control.get('brake', 0.5)), steer=0.0)
                 self.vehicle.apply_control(safe_control)
                 return
-            
+
             vehicle_control = carla.VehicleControl(
                 throttle=float(control.get('throttle', 0.0)),
                 steer=float(control.get('steer', 0.0)),
@@ -574,12 +638,44 @@ class CarlaSimulation:
             )
             self.vehicle.apply_control(vehicle_control)
 
+    def toggle_matlab_link(self):
+        """Toggles the master switch to accept/ignore commands from MATLAB."""
+        self.accept_matlab_commands = not self.accept_matlab_commands
+        if self.accept_matlab_commands:
+            print("[INFO] MATLAB Control Link: ENABLED. Awaiting commands.")
+        else:
+            print("[INFO] MATLAB Control Link: DISABLED. Ignoring commands.")
+            # If we disable the link, we immediately revert to manual control
+            self.is_matlab_actively_controlling = False
+            if self.control_mode == 'USER_AUTOPILOT':
+                self.vehicle.set_autopilot(False)
+                self.control_mode = 'MANUAL'
+
+    def toggle_user_autopilot(self):
+        """Toggles the built-in CARLA autopilot."""
+        if not self.vehicle or not self.vehicle.is_alive:
+            return
+
+        # Cannot enable user autopilot if MATLAB is currently in charge
+        if self.is_matlab_actively_controlling:
+            print("[WARN] Cannot engage User Autopilot while MATLAB is actively controlling. Disable MATLAB link (M) first.")
+            return
+
+        if self.control_mode == 'MANUAL':
+            self.vehicle.set_autopilot(True)
+            self.control_mode = 'USER_AUTOPILOT'
+            print("[INFO] User Autopilot engaged.")
+        elif self.control_mode == 'USER_AUTOPILOT':
+            self.vehicle.set_autopilot(False)
+            self.control_mode = 'MANUAL'
+            print("[INFO] User Autopilot disengaged. Manual control active.")
+
     def toggle_image_recording(self): self.recording_images = not self.recording_images
     def toggle_sim_recording(self):
         self.recording_sim=not self.recording_sim
         if self.recording_sim: self.client.start_recorder(os.path.join(LOG_DIR,f"sim_rec_{time.time()}.log"))
         else: self.client.stop_recorder()
-    
+
     def change_weather(self, d):
         self.current_weather_index = (self.current_weather_index + d) % len(self.weather_names)
         self.world.set_weather(WEATHER_PRESETS[self.weather_names[self.current_weather_index]])
@@ -590,7 +686,7 @@ class CarlaSimulation:
         else: self.world.load_map_layer(MAP_LAYERS[self.current_layer_index])
     def toggle_hud(self): self.show_hud = not self.show_hud
     def toggle_help(self): self.hud.show_help = not self.hud.show_help
-    
+
     def change_map(self, map_name):
         if self.world.get_map().name.endswith(map_name): return
         if self.client and self.npc_vehicles: self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in self.npc_vehicles if x.is_alive], True); self.npc_vehicles.clear()
@@ -599,12 +695,13 @@ class CarlaSimulation:
         self.world = self.client.load_world(map_name)
         settings=self.world.get_settings(); settings.synchronous_mode=True; settings.fixed_delta_seconds=1.0/TICK_RATE
         self.world.apply_settings(settings); self._setup_actors_and_sensors()
-    
+
     def reset_safe_mode_lock(self):
         if self.safe_mode_locked:
             print("[INFO] User override: Safe Mode unlocked. All sensors reset to primary.")
             self.safe_mode_locked = False
             self.was_autopilot_on_lock = False
+            self.control_mode = 'MANUAL'
             for key in self.active_sensor_indices: self.active_sensor_indices[key] = 0
         else: print("[INFO] Safe mode is not currently locked.")
 
@@ -614,7 +711,10 @@ class CarlaSimulation:
         return {
             'speed':np.linalg.norm([v.x,v.y,v.z])*3.6, 'map_name':self.world.get_map().name.split('/')[-1],
             'collision_count':self.collision_count, 'lane_invasion_count':self.lane_invasion_count,
-            'control':self.controller.get_control_state(), 'matlab_mode': self.matlab_mode,
+            'control':self.controller.get_control_state(),
+            'control_mode': self.control_mode,
+            'accept_matlab_commands': self.accept_matlab_commands,
+            'is_matlab_actively_controlling': self.is_matlab_actively_controlling,
             'recording_images':self.recording_images, 'recording_sim':self.recording_sim,
             'fused_pos':f"({self.fused_state['x']:.1f},{self.fused_state['y']:.1f})" if self.fused_state else "N/A",
             'sensor_health': health_data,
