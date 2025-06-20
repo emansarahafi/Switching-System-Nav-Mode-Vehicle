@@ -175,7 +175,7 @@ end
 
 
 %% =======================================================================
-%                      UI SETUP (NO CHANGES)
+%                      UI SETUP (MODIFIED)
 % ========================================================================
 function [uiHandles] = setupDashboard(historyLength, closeCallback)
     fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Position', [50 50, 1600, 950]);
@@ -218,16 +218,38 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     g_diag = uigridlayout(p_diag, [1 1]);
     p_diag_metrics = uipanel(g_diag, 'Title', '');
     g_diag_metrics = uigridlayout(p_diag_metrics, [10, 2], 'ColumnWidth', {'fit', '1x'});
-    uilabel(g_diag_metrics, 'Text', 'Frame:'); uiHandles.frameLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Net Latency:'); uiHandles.latencyLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Actual Mode:'); uiHandles.modeLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Map:'); uiHandles.mapLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Weather:'); uiHandles.weatherLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Sensor Health:'); uiHandles.healthLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Fallback Status:'); uiHandles.fallbackLabel = uilabel(g_diag_metrics, 'Text', 'IDLE', 'FontWeight', 'bold', 'FontColor', 'g');
-    uilabel(g_diag_metrics, 'Text', 'Traffic Light:'); uiHandles.trafficLightLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Sys. Confidence:'); uiHandles.confidenceLabel = uilabel(g_diag_metrics, 'Text', 'NOMINAL', 'FontWeight', 'bold');
-    uilabel(g_diag_metrics, 'Text', 'Fuzzy Decision:', 'FontWeight', 'bold'); uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold');
+    
+    % --- MODIFICATION: Added 'FontSize', 10 to all labels in this grid ---
+    uilabel(g_diag_metrics, 'Text', 'Frame:', 'FontSize', 10); 
+    uiHandles.frameLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Net Latency:', 'FontSize', 10); 
+    uiHandles.latencyLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Actual Mode:', 'FontSize', 10); 
+    uiHandles.modeLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Map:', 'FontSize', 10); 
+    uiHandles.mapLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Weather:', 'FontSize', 10); 
+    uiHandles.weatherLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Sensor Health:', 'FontSize', 10); 
+    uiHandles.healthLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Fallback Status:', 'FontSize', 10); 
+    uiHandles.fallbackLabel = uilabel(g_diag_metrics, 'Text', 'IDLE', 'FontWeight', 'bold', 'FontColor', 'g', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Traffic Light:', 'FontSize', 10); 
+    uiHandles.trafficLightLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Sys. Confidence:', 'FontSize', 10); 
+    uiHandles.confidenceLabel = uilabel(g_diag_metrics, 'Text', 'NOMINAL', 'FontWeight', 'bold', 'FontSize', 10);
+    
+    uilabel(g_diag_metrics, 'Text', 'Fuzzy Decision:', 'FontWeight', 'bold', 'FontSize', 10); 
+    uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold', 'FontSize', 10);
+    % --- END MODIFICATION ---
     
     % Camera Feeds
     p_cameras = uipanel(gl, 'Title', 'Camera Feeds', 'FontWeight', 'bold');
