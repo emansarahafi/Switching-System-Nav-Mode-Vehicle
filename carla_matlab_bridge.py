@@ -89,7 +89,9 @@ class CommandReceiver(threading.Thread):
                     command_str = data.decode('utf-8')
                     try:
                         command_obj = json.loads(command_str)
-                        print(f"[FDIR CMD RECEIVED]: {command_obj}")
+                        # Don't print control commands to avoid flooding the console
+                        if command_obj.get('command') != 'SET_VEHICLE_CONTROL':
+                             print(f"[CMD RECEIVED]: {command_obj}")
                         self.queue.put(command_obj)
                     except json.JSONDecodeError:
                         print(f"[WARN] Received invalid JSON command: {command_str}")
@@ -174,16 +176,16 @@ class HUD:
         if self.show_help: self._render_help_text(display)
 
     def _render_hud_info(self, display: pygame.Surface, sim_state: Dict[str, Any]):
-        mode_text = 'ON' if sim_state['autopilot'] else 'OFF'
+        mode_text = sim_state.get('matlab_mode', 'MANUAL')
         if sim_state.get('safe_mode_locked', False):
-            mode_text = 'OFF (LOCKED)'
+            mode_text = 'LOCKED'
         info_text = [
             f"Speed: {sim_state['speed']:.2f} km/h", f"Map: {sim_state['map_name']}",
             f"Fused Pos: {sim_state.get('fused_pos', 'N/A')}", f"Collisions: {sim_state['collision_count']}",
             f"Lane Invasions: {sim_state['lane_invasion_count']}", "-----------",
             f"Throttle: {sim_state['control']['throttle']:.2f}", f"Steer: {sim_state['control']['steer']:.2f}",
             f"Brake: {sim_state['control']['brake']:.2f}", "-----------",
-            f"Autopilot: {mode_text}", f"Img Record: {'ON' if sim_state['recording_images'] else 'OFF'}",
+            f"Control Mode: {mode_text}", f"Img Record: {'ON' if sim_state['recording_images'] else 'OFF'}",
             f"Sim Record: {'ON' if sim_state['recording_sim'] else 'OFF'}"
         ]
         for i, text in enumerate(info_text): display.blit(self.font.render(text, True, (255, 255, 255)), (10, 10 + i * 20))
@@ -215,7 +217,7 @@ class HUD:
         display.blit(sub_text_surf, sub_text_rect)
 
     def _render_help_text(self, display: pygame.Surface):
-        help_text = ["W/S: Throttle/Brake", "A/D: Steer Left/Right", "Q: Toggle Reverse", "Space: Hand Brake", "P: Toggle Autopilot", "L: Unlock Safe Mode", "C: Next Weather (Shift+C: Prev)", "V: Next Map Layer (Shift+V: Prev)", "B: Load Layer (Shift+B: Unload)", "R: Toggle Image Recording", "Ctrl+R: Toggle Sim Recording", "3: Switch to Town03", "0: Switch to Town10HD", "F1: Toggle HUD", "H: Toggle Help", "ESC: Quit"]
+        help_text = ["W/S: Throttle/Brake", "A/D: Steer Left/Right", "Q: Toggle Reverse", "Space: Hand Brake", "P: Control now managed by MATLAB", "L: Unlock Safe Mode", "C: Next Weather (Shift+C: Prev)", "V: Next Map Layer (Shift+V: Prev)", "B: Load Layer (Shift+B: Unload)", "R: Toggle Image Recording", "Ctrl+R: Toggle Sim Recording", "3: Switch to Town03", "0: Switch to Town10HD", "F1: Toggle HUD", "H: Toggle Help", "ESC: Quit"]
         s = pygame.Surface((300, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
         for i, text in enumerate(help_text): display.blit(self.help_font.render(text, True, (255, 255, 255)), (60, 60 + i * 22))
 
@@ -227,7 +229,6 @@ class KeyboardController:
         for event in pygame.event.get():
             if event.type == pygame.QUIT: return False
             elif event.type in (pygame.KEYDOWN, pygame.KEYUP): self._parse_key_event(event)
-        if not self.simulation.autopilot: self.simulation.apply_vehicle_control(self._control_state)
         return True
     def get_control_state(self): return self._control_state
     def _parse_key_event(self, event):
@@ -240,7 +241,8 @@ class KeyboardController:
         elif key == K_q and is_keydown: self._control_state['reverse'] = not self._control_state['reverse']
         elif key == K_SPACE: self._control_state['hand_brake'] = is_keydown
         if not is_keydown: return
-        if key == K_p and not is_ctrl: self.simulation.toggle_autopilot()
+        if key == K_p and not is_ctrl: 
+            print("[INFO] Autopilot is now fully managed by the MATLAB controller.")
         elif key == K_l: self.simulation.reset_safe_mode_lock()
         elif key == K_r and not is_ctrl: self.simulation.toggle_image_recording()
         elif key == K_r and is_ctrl: self.simulation.toggle_sim_recording()
@@ -313,7 +315,7 @@ class CarlaSimulation:
     def __init__(self):
         self.client=None; self.world=None; self.vehicle=None; self.display_manager=None; self.hud=None
         self.controller=None; self.udp_sender=None; self.image_saver=None; self.sensors={}; self.log_files={}; self.csv_writers={}
-        self.kalman_filter=None; self.fused_state=None; self.autopilot=False; self.running=True
+        self.kalman_filter=None; self.fused_state=None; self.running=True; self.matlab_mode = 'MANUAL'
         self.recording_images=False; self.recording_sim=False; self.show_hud=True; self.collision_count=0; self.lane_invasion_count=0
         self.weather_names = list(WEATHER_PRESETS.keys()); self.current_weather_index = 0; self.current_layer_index = 0
         self.object_tracker = None; self.detected_obstacles = []
@@ -375,7 +377,6 @@ class CarlaSimulation:
         spawn_point = random.choice(self.world.get_map().get_spawn_points())
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
         
-        # This is the fully RESTORED sensor list
         self._spawn_sensor_with_backups('cam_front', 'RGB', carla.Transform(carla.Location(x=1.5,z=2.4)), display_pos=(1,0), camera_name='front')
         self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(1,2), camera_name='back') 
         self._spawn_sensor_with_backups('cam_left', 'RGB', carla.Transform(carla.Location(x=1.3,y=-0.9,z=1.2),carla.Rotation(yaw=-110)), display_pos=(0,0), camera_name='left')
@@ -384,21 +385,11 @@ class CarlaSimulation:
         self._spawn_sensor_with_backups('gnss', 'GNSS', carla.Transform(carla.Location(z=2.6)))
         self._spawn_sensor_with_backups('imu', 'IMU', carla.Transform(carla.Location(x=0,z=0.5)))
         self._spawn_sensor_with_backups('lidar_roof', 'LIDAR', carla.Transform(carla.Location(z=2.5)), {'range':'100', 'points_per_second':'100000'})
-        self._spawn_sensor_with_backups('lidar_front', 'LIDAR', carla.Transform(carla.Location(x=2.5, z=0.5)), {'range': '50', 'points_per_second':'60000'})
-        self._spawn_sensor_with_backups('lidar_back', 'LIDAR', carla.Transform(carla.Location(x=-2.5, z=0.5), carla.Rotation(yaw=180)), {'range': '50', 'points_per_second':'60000'})
         self._spawn_sensor_with_backups('radar_front', 'RADAR', carla.Transform(carla.Location(x=2.5,z=0.7)), {'range':'150'})
-        self._spawn_sensor_with_backups('radar_back', 'RADAR', carla.Transform(carla.Location(x=-2.5,z=0.7), carla.Rotation(yaw=180)), {'range':'150'})
-        self._spawn_sensor_with_backups('ultrasonic_front', 'ULTRASONIC', carla.Transform(carla.Location(x=2.2,z=0.5)))
-        self._spawn_sensor_with_backups('ultrasonic_back', 'ULTRASONIC', carla.Transform(carla.Location(x=-2.2,z=0.5), carla.Rotation(yaw=180)))
-        self._spawn_sensor_with_backups('radar_front_left', 'RADAR', carla.Transform(carla.Location(x=2.0, y=-0.9, z=0.7), carla.Rotation(yaw=-45)), {'range':'75'})
-        self._spawn_sensor_with_backups('radar_front_right', 'RADAR', carla.Transform(carla.Location(x=2.0, y=0.9, z=0.7), carla.Rotation(yaw=45)), {'range':'75'})
-        self._spawn_sensor_with_backups('radar_rear_left', 'RADAR', carla.Transform(carla.Location(x=-2.0, y=-0.9, z=0.7), carla.Rotation(yaw=-135)), {'range':'75'})
-        self._spawn_sensor_with_backups('radar_rear_right', 'RADAR', carla.Transform(carla.Location(x=-2.0, y=0.9, z=0.7), carla.Rotation(yaw=135)), {'range':'75'})
         self._spawn_sensor_with_backups('collision', 'COLLISION', carla.Transform())
         self._spawn_sensor_with_backups('lane_invasion', 'LANE_INVASION', carla.Transform())
         print("All ego sensors spawned.")
 
-        # Spawn NPC vehicles for V2V simulation
         print("Spawning NPC vehicles...")
         if self.npc_vehicles:
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.npc_vehicles])
@@ -412,11 +403,8 @@ class CarlaSimulation:
             bp = random.choice(vehicle_blueprints)
             try:
                 npc = self.world.try_spawn_actor(bp, spawn_point)
-                if npc is not None:
-                    npc.set_autopilot(True)
-                    self.npc_vehicles.append(npc)
-            except Exception:
-                continue
+                if npc is not None: npc.set_autopilot(True); self.npc_vehicles.append(npc)
+            except Exception: continue
         print(f"  - Spawned {len(self.npc_vehicles)} NPC vehicles for V2V.")
 
     def _tick_simulation(self):
@@ -424,19 +412,10 @@ class CarlaSimulation:
         snapshot = self.world.get_snapshot()
         self._process_fdir_commands()
 
-        # Handle safe mode override: bring vehicle to a stop if it was in autopilot.
         if self.safe_mode_locked and self.was_autopilot_on_lock:
-            v = self.vehicle.get_velocity()
-            speed = np.linalg.norm([v.x, v.y, v.z]) # Speed in m/s
-
-            # If moving faster than a crawl, apply gentle, constant braking.
-            if speed > 0.1: # approx 0.36 km/h
-                control = carla.VehicleControl(throttle=0.0, brake=0.4, steer=0.0, hand_brake=False)
-                self.apply_vehicle_control(control)
-            else:
-                # Once stopped, apply the handbrake to hold position securely.
-                control = carla.VehicleControl(throttle=0.0, brake=0.0, hand_brake=True)
-                self.apply_vehicle_control(control)
+            v = self.vehicle.get_velocity(); speed = np.linalg.norm([v.x, v.y, v.z])
+            if speed > 0.1: self.apply_vehicle_control({'brake': 0.5})
+            else: self.apply_vehicle_control({'hand_brake': True})
 
         self._process_sensor_data(snapshot)
         self._run_sensor_fusion()
@@ -450,22 +429,24 @@ class CarlaSimulation:
         try:
             command = self.command_queue.get_nowait()
             cmd_type = command.get('command')
-            if cmd_type == 'ACTIVATE_BACKUP':
-                sensor_group = command.get('sensor_group'); 
-                backup_index = command.get('backup_index')
+
+            if cmd_type == 'SET_VEHICLE_CONTROL':
+                control_data = command.get('control', None)
+                if control_data:
+                    self.matlab_mode = 'AUTOPILOT' if control_data.get('throttle',0) > 0 or control_data.get('steer',0) != 0 else 'MANUAL'
+                    self.apply_vehicle_control(control_data)
+            
+            elif cmd_type == 'ACTIVATE_BACKUP':
+                sensor_group = command.get('sensor_group'); backup_index = command.get('backup_index')
                 if sensor_group in self.active_sensor_indices:
                     self.active_sensor_indices[sensor_group] = backup_index
                     print(f"Activated backup #{backup_index} for sensor '{sensor_group}'")
-                else:
-                    print(f"[WARN] Tried to activate backup for unknown sensor group: {sensor_group}")
+                else: print(f"[WARN] Tried to activate backup for unknown sensor group: {sensor_group}")
             elif cmd_type == 'ENTER_SAFE_MODE':
                 reason = command.get('reason', 'No reason specified')
                 print(f"!!! ENTERING LOCKED SAFE MODE. Reason: {reason} !!!")
-                # Record if autopilot was active at the moment of the lock command
-                self.was_autopilot_on_lock = self.autopilot
-                if self.autopilot: 
-                    self.autopilot = False; 
-                    self.vehicle.set_autopilot(self.autopilot)
+                self.was_autopilot_on_lock = (self.matlab_mode == 'AUTOPILOT')
+                self.matlab_mode = 'LOCKED'
                 self.safe_mode_locked = True
         except Empty: 
             return
@@ -484,10 +465,8 @@ class CarlaSimulation:
             for event in sensor_group.get_events(): self.lane_invasion_count+=1; lane_types=','.join([str(m.type) for m in event.crossed_lane_markings]); self.csv_writers['lane'].writerow([time.time(), event.frame, lane_types])
 
     def _run_sensor_fusion(self):
-        gnss_active_idx = self.active_sensor_indices.get('gnss', 0)
-        imu_active_idx = self.active_sensor_indices.get('imu', 0)
-        gnss_sensor = self.sensors.get('gnss',[None])[gnss_active_idx]
-        imu_sensor = self.sensors.get('imu',[None])[imu_active_idx]
+        gnss_sensor = self.sensors.get('gnss',[None])[self.active_sensor_indices.get('gnss', 0)]
+        imu_sensor = self.sensors.get('imu',[None])[self.active_sensor_indices.get('imu', 0)]
         loc = self.vehicle.get_transform().location
         gps_pos = np.array([loc.x, loc.y]) if gnss_sensor and gnss_sensor.data else None
         imu_accel = np.array([imu_sensor.data.accelerometer.x, imu_sensor.data.accelerometer.y]) if imu_sensor and imu_sensor.data else None
@@ -495,60 +474,44 @@ class CarlaSimulation:
         self.fused_state = self.kalman_filter.get_fused_state()
 
     def _run_object_detection(self):
-        lidar_active_idx = self.active_sensor_indices.get('lidar_roof', 0)
-        lidar_sensor = self.sensors.get('lidar_roof', [None])[lidar_active_idx]
+        lidar_sensor = self.sensors.get('lidar_roof', [None])[self.active_sensor_indices.get('lidar_roof', 0)]
         if lidar_sensor and lidar_sensor.data:
             self.object_tracker.update(lidar_sensor.data, self.vehicle.get_transform())
             self.detected_obstacles = self.object_tracker.get_obstacles()
-        else:
-            self.detected_obstacles = []
+        else: self.detected_obstacles = []
     
     def _gather_v2v_data(self) -> List[Dict[str, Any]]:
         v2v_list = []
         for actor in self.npc_vehicles:
             if actor and actor.is_alive:
-                t = actor.get_transform()
-                v = actor.get_velocity()
-                v2v_list.append({
-                    'id': actor.id,
-                    'position': {'x': t.location.x, 'y': t.location.y, 'z': t.location.z},
-                    'velocity': {'x': v.x, 'y': v.y, 'z': v.z}
-                })
+                t = actor.get_transform(); v = actor.get_velocity()
+                v2v_list.append({'id': actor.id, 'position': {'x': t.location.x, 'y': t.location.y, 'z': t.location.z}, 'velocity': {'x': v.x, 'y': v.y, 'z': v.z}})
         return v2v_list
 
     def _gather_v2i_data(self) -> Dict[str, Any]:
         v2i_data = {}
         if self.vehicle and self.vehicle.is_at_traffic_light():
             traffic_light = self.vehicle.get_traffic_light()
-            if traffic_light:
-                state_str = str(traffic_light.get_state())
-                v2i_data['traffic_light_state'] = state_str
-                v2i_data['traffic_light_id'] = traffic_light.id
+            if traffic_light: v2i_data['traffic_light_state'] = str(traffic_light.get_state()); v2i_data['traffic_light_id'] = traffic_light.id
         return v2i_data
 
     def _send_udp_data(self, snapshot):
         t=self.vehicle.get_transform(); v=self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
-        current_weather_name = self.weather_names[self.current_weather_index]
-        v2v_info = self._gather_v2v_data()
-        v2i_info = self._gather_v2i_data()
         data_packet = {
             'timestamp':snapshot.timestamp.elapsed_seconds, 'frame':snapshot.frame,
-            'mode': 'autopilot' if self.autopilot else 'manual',
+            'mode': self.matlab_mode,
             'map': self.world.get_map().name.split('/')[-1],
-            'weather': current_weather_name,
+            'weather': self.weather_names[self.current_weather_index],
             'speed':np.linalg.norm([v.x,v.y,v.z])*3.6, 'position':{'x':t.location.x,'y':t.location.y,'z':t.location.z},
             'rotation':{'pitch':t.rotation.pitch,'yaw':t.rotation.yaw,'roll':t.rotation.roll},
             'control':self.controller.get_control_state(), 'fused_state':self.fused_state,
             'ekf_covariance':self.kalman_filter.kf.P.tolist() if self.kalman_filter else None,
             'sensor_health': health_data, 'collisions': self.collision_count, 'lane_invasions': self.lane_invasion_count,
-            'Detected_Obstacles': self.detected_obstacles,
-            'V2V_Data': v2v_info, 'V2I_Data': v2i_info,
+            'Detected_Obstacles': self.detected_obstacles, 'V2V_Data': self._gather_v2v_data(), 'V2I_Data': self._gather_v2i_data(),
         }
         for name, sensor_list in self.sensors.items():
-            active_idx = self.active_sensor_indices.get(name, 0)
-            if active_idx >= len(sensor_list): active_idx = 0
-            active_sensor = sensor_list[active_idx]
+            active_sensor = sensor_list[self.active_sensor_indices.get(name, 0)]
             if active_sensor.data is None or active_sensor.stype in ['COLLISION','LANE_INVASION']: continue
             data=active_sensor.data; key_name=name; processed_data=None
             if active_sensor.stype == 'RGB': key_name=f"image_{active_sensor.cname}"; _,jpeg=cv2.imencode('.jpg',data); processed_data=base64.b64encode(jpeg).decode('utf-8')
@@ -561,73 +524,46 @@ class CarlaSimulation:
         self.udp_sender.send_string_chunks(json.dumps(data_packet,separators=(',',':')), snapshot.frame)
 
     def _cleanup(self):
-        """
-        A more robust cleanup method to prevent server timeouts.
-        """
         print("Cleaning up resources...")
+        if self.command_receiver: self.command_receiver.stop(); self.command_receiver.join()
+        if self.image_saver: self.image_saver.stop()
+        if self.udp_sender: self.udp_sender.close()
+        for f in self.log_files.values(): f.close()
 
-        # Stop threads first to prevent them from making more requests
-        if self.command_receiver:
-            self.command_receiver.stop()
-            self.command_receiver.join()
-        if self.image_saver:
-            self.image_saver.stop()
-        if self.udp_sender:
-            self.udp_sender.close()
-        
-        # Close log files
-        for f in self.log_files.values():
-            f.close()
-
-        # If the world object exists, try to un-freeze the server first
         if self.world:
             print("Resetting CARLA server settings...")
-            settings = self.world.get_settings()
-            settings.synchronous_mode = False
-            settings.fixed_delta_seconds = None
-            try:
-                self.world.apply_settings(settings)
-            except RuntimeError as e:
-                print(f"[WARN] Could not apply settings during cleanup: {e}. Server might have already disconnected.")
+            settings = self.world.get_settings(); settings.synchronous_mode = False; settings.fixed_delta_seconds = None
+            try: self.world.apply_settings(settings)
+            except RuntimeError as e: print(f"[WARN] Could not apply settings during cleanup: {e}")
 
-        # Destroy actors only after the server is unfrozen (or was never frozen)
         if self.client:
             print("Destroying actors...")
-            # Use a single batch command for efficiency and safety
             actor_ids = []
-            if self.npc_vehicles:
-                actor_ids.extend([x.id for x in self.npc_vehicles if x.is_alive])
-            
-            for sensor_list in self.sensors.values():
-                actor_ids.extend([s.sensor.id for s in sensor_list if s.sensor and s.sensor.is_alive])
-            
-            if self.vehicle and self.vehicle.is_alive:
-                actor_ids.append(self.vehicle.id)
-            
+            if self.npc_vehicles: actor_ids.extend([x.id for x in self.npc_vehicles if x.is_alive])
+            for sensor_list in self.sensors.values(): actor_ids.extend([s.sensor.id for s in sensor_list if s.sensor and s.sensor.is_alive])
+            if self.vehicle and self.vehicle.is_alive: actor_ids.append(self.vehicle.id)
             if actor_ids:
-                try:
-                    # Use a synchronous batch to ensure commands are processed before quitting
-                    self.client.apply_batch_sync([carla.command.DestroyActor(aid) for aid in actor_ids], True)
-                    print(f"  - Destroyed {len(actor_ids)} actors.")
-                except RuntimeError as e:
-                    print(f"[WARN] Could not destroy all actors during cleanup: {e}. They may already be gone.")
-
+                try: self.client.apply_batch_sync([carla.command.DestroyActor(aid) for aid in actor_ids], True); print(f"  - Destroyed {len(actor_ids)} actors.")
+                except RuntimeError as e: print(f"[WARN] Could not destroy all actors during cleanup: {e}")
         pygame.quit()
         print("Simulation ended.")
 
-    def apply_vehicle_control(self, control):
+    def apply_vehicle_control(self, control: dict):
         if self.vehicle and self.vehicle.is_alive:
-            # Do not apply manual control if safe mode is locked from an autopilot state
             if self.safe_mode_locked and self.was_autopilot_on_lock:
+                safe_control = carla.VehicleControl(throttle=0.0, brake=float(control.get('brake', 0.5)), steer=0.0)
+                self.vehicle.apply_control(safe_control)
                 return
-            self.vehicle.apply_control(carla.VehicleControl(**control))
+            
+            vehicle_control = carla.VehicleControl(
+                throttle=float(control.get('throttle', 0.0)),
+                steer=float(control.get('steer', 0.0)),
+                brake=float(control.get('brake', 0.0)),
+                hand_brake=bool(control.get('hand_brake', False)),
+                reverse=bool(control.get('reverse', False))
+            )
+            self.vehicle.apply_control(vehicle_control)
 
-    def toggle_autopilot(self):
-        if self.safe_mode_locked:
-            print("[INFO] Cannot engage autopilot: Safe Mode is locked by FDIR. Press 'L' to unlock.")
-            return
-        self.autopilot = not self.autopilot; self.vehicle.set_autopilot(self.autopilot)
-        
     def toggle_image_recording(self): self.recording_images = not self.recording_images
     def toggle_sim_recording(self):
         self.recording_sim=not self.recording_sim
@@ -647,9 +583,7 @@ class CarlaSimulation:
     
     def change_map(self, map_name):
         if self.world.get_map().name.endswith(map_name): return
-        if self.client and self.npc_vehicles:
-            self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in self.npc_vehicles if x.is_alive], True)
-            self.npc_vehicles.clear()
+        if self.client and self.npc_vehicles: self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in self.npc_vehicles if x.is_alive], True); self.npc_vehicles.clear()
         [s.destroy() for s_list in self.sensors.values() for s in s_list]; self.sensors.clear()
         if self.vehicle: self.vehicle.destroy(); self.vehicle=None
         self.world = self.client.load_world(map_name)
@@ -661,10 +595,8 @@ class CarlaSimulation:
             print("[INFO] User override: Safe Mode unlocked. All sensors reset to primary.")
             self.safe_mode_locked = False
             self.was_autopilot_on_lock = False
-            for key in self.active_sensor_indices:
-                self.active_sensor_indices[key] = 0
-        else:
-            print("[INFO] Safe mode is not currently locked.")
+            for key in self.active_sensor_indices: self.active_sensor_indices[key] = 0
+        else: print("[INFO] Safe mode is not currently locked.")
 
     def _get_simulation_state(self, snapshot):
         v = self.vehicle.get_velocity()
@@ -672,7 +604,7 @@ class CarlaSimulation:
         return {
             'speed':np.linalg.norm([v.x,v.y,v.z])*3.6, 'map_name':self.world.get_map().name.split('/')[-1],
             'collision_count':self.collision_count, 'lane_invasion_count':self.lane_invasion_count,
-            'control':self.controller.get_control_state(), 'autopilot':self.autopilot,
+            'control':self.controller.get_control_state(), 'matlab_mode': self.matlab_mode,
             'recording_images':self.recording_images, 'recording_sim':self.recording_sim,
             'fused_pos':f"({self.fused_state['x']:.1f},{self.fused_state['y']:.1f})" if self.fused_state else "N/A",
             'sensor_health': health_data,
@@ -684,4 +616,4 @@ if __name__ == '__main__':
     try:
         CarlaSimulation().run()
     except Exception as e:
-        print(f"\nAn error occurred: {e}\n{traceback.format_exc()}")
+        print(f"\nAn unhandled error occurred: {e}\n{traceback.format_exc()}")
