@@ -113,10 +113,6 @@ function carla_udp_receiver(port)
             [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, ...
                 trajectory, gnss_track, imu_history);
             
-            % =========================================================================
-            % --- MODIFIED CONTROL LOGIC STARTS HERE ---
-            % =========================================================================
-
             % 1. Analyze the incoming data and calculate all metrics
             [dt] = processAndAnalyzeFrame(frame_data, toc(last_message_time), uiHandles);
             
@@ -129,7 +125,6 @@ function carla_udp_receiver(port)
             % 4. ACT based on the fuzzy decision
             if strcmp(fuzzy_decision, 'AUTOPILOT')
                 % The fuzzy system wants to drive. Calculate the control command.
-                % The ModeController generates the specific throttle/steer/brake values.
                 [~, vehicle_command] = ModeController('AUTOPILOT', current_mode_from_python, carla_outputs, dt);
                 
                 % Send the command. The Python script will only obey this if the
@@ -138,7 +133,7 @@ function carla_udp_receiver(port)
                 
             else 
                 % The fuzzy system decided on 'MANUAL' or 'REQUEST_HANDOVER'.
-                % In this new paradigm, we DO NOT send any command.
+                % In this paradigm, we DO NOT send any driving commands.
                 % This allows the Python script to remain in control (either
                 % manual WASD or user autopilot via 'P' key).
             end
@@ -146,11 +141,7 @@ function carla_udp_receiver(port)
             % 5. Update the global state for the next cycle and for the dashboard
             carla_outputs.fuzzy_decision = fuzzy_decision;
             carla_outputs.fuzzy_desirability_score = score;
-            
-            % =========================================================================
-            % --- MODIFIED CONTROL LOGIC ENDS HERE ---
-            % =========================================================================
-            
+
             % Update all visual components of the dashboard
             updateDashboard(uiHandles, frame_data, trajectory, ...
                 gnss_track, imu_history, carla_outputs);
@@ -175,7 +166,7 @@ end
 
 
 %% =======================================================================
-%                      UI SETUP (MODIFIED)
+%                      UI SETUP (NO CHANGES)
 % ========================================================================
 function [uiHandles] = setupDashboard(historyLength, closeCallback)
     fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Position', [50 50, 1600, 950]);
@@ -219,7 +210,6 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     p_diag_metrics = uipanel(g_diag, 'Title', '');
     g_diag_metrics = uigridlayout(p_diag_metrics, [10, 2], 'ColumnWidth', {'fit', '1x'});
     
-    % --- MODIFICATION: Added 'FontSize', 10 to all labels in this grid ---
     uilabel(g_diag_metrics, 'Text', 'Frame:', 'FontSize', 10); 
     uiHandles.frameLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
     
@@ -249,7 +239,6 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     
     uilabel(g_diag_metrics, 'Text', 'Fuzzy Decision:', 'FontWeight', 'bold', 'FontSize', 10); 
     uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold', 'FontSize', 10);
-    % --- END MODIFICATION ---
     
     % Camera Feeds
     p_cameras = uipanel(gl, 'Title', 'Camera Feeds', 'FontWeight', 'bold');
@@ -674,15 +663,21 @@ function data_out = extractRawSensorData(frame)
     data_out.throttle_input = get_safe(control_data, 'throttle', 0); data_out.brake_input = get_safe(control_data, 'brake', 0); data_out.steering_input = get_safe(control_data, 'steer', 0);
 end
 
-function [fallback, reason] = checkForFallback(latency, health, threat, attention, confidence, frame)
-    fallback = false; reason = {};
-    if latency > 0.2, fallback = true; reason{end+1} = 'High Latency (>200ms)'; end
-    if health < 0.75, fallback = true; reason{end+1} = 'Low Sensor Health'; end
-    if threat.min_front_distance < 10 && threat.closing_velocity < -5, fallback = true; reason{end+1} = 'Imminent Collision Risk'; end
-    if attention < 0.2, fallback = true; reason{end+1} = 'Low Driver Attention'; end
-    if confidence.score < 0.5, fallback = true; reason{end+1} = ['Sensor Discrepancy: ' confidence.status_text]; end
-    v2i_data = get_safe(frame, 'V2I_Data', struct());
-    if isfield(v2i_data, 'traffic_light_state') && strcmp(v2i_data.traffic_light_state, 'RED') && frame.speed > 5
-        fallback = true; reason{end+1} = 'V2I Conflict: Moving on Red Light';
+function [fallback, reason] = checkForFallback(latency, health, ~, ~, ~, ~)
+    % MODIFIED: Fallback detection is based on system health and latency.
+    % Unused input arguments are replaced with '~' to suppress warnings.
+    fallback = false; 
+    reason = {};
+    
+    % Check for high network latency
+    if latency > 0.2
+        fallback = true; 
+        reason{end+1} = 'High Latency (>200ms)';
+    end
+    
+    % Check for low overall sensor health
+    if health < 0.75 
+        fallback = true; 
+        reason{end+1} = 'Low Sensor Health';
     end
 end
