@@ -10,7 +10,10 @@ function carla_udp_receiver(port)
     end
     COMMAND_PORT = 10001; % Port to send commands back to Python
     HISTORY_LENGTH = 100; % Number of historical data points for plots
-    FDIR_RATE_HZ = 5;     % How often the FDIR system checks for faults
+    
+    % MODIFIED: FDIR rate increased to meet the <100ms fault detection requirement.
+    % 20 Hz gives a 50ms cycle time, well within the spec.
+    FDIR_RATE_HZ = 20;     
 
     % --- Global Outputs for External Access ---
     global carla_outputs;
@@ -18,25 +21,20 @@ function carla_udp_receiver(port)
 
     is_running = true;
     fdirTimer = [];
-    command_sender_udp = []; % Initialize UDP sender handle
+    command_sender_udp = [];
 
     % --- Setup UI and UDP ---
     [uiHandles] = setupDashboard(HISTORY_LENGTH, @onCloseRequest);
     logToDashboard(uiHandles, 'Dashboard initialized. Starting UDP receiver...');
     
     try
-        % Setup data receiver
         u = udpport("IPV4", "LocalPort", port, "Timeout", 1, "EnablePortSharing", true);
         u.InputBufferSize = 2000000;
         logToDashboard(uiHandles, sprintf('UDP Receiver started on port %d.', port));
-
-        % Setup command sender
         command_sender_udp = udpport("datagram");
         logToDashboard(uiHandles, sprintf('UDP Command Sender targeting 127.0.0.1:%d.', COMMAND_PORT));
-
     catch ME
         logToDashboard(uiHandles, sprintf('[FATAL] UDP setup failed: %s', ME.message));
-        errordlg(sprintf('UDP setup on port %d failed. Is it in use?', port), 'UDP Error');
         is_running = false; 
     end
 
@@ -45,13 +43,12 @@ function carla_udp_receiver(port)
         fdirTimer = timer(...
             'ExecutionMode', 'fixedRate', ...
             'Period', 1/FDIR_RATE_HZ, ...
-            'TimerFcn', @(~,~) run_fdir_cycle(command_sender_udp), ... % Pass handle
+            'TimerFcn', @(~,~) run_fdir_cycle(command_sender_udp), ...
             'StartDelay', 2, ...
             'Tag', 'FDIR_Timer', ...
             'StopFcn', @(~,~) disp('FDIR Timer has been stopped.'));
         start(fdirTimer);
-        logToDashboard(uiHandles, ...
-            sprintf('FDIR background monitoring system started at %d Hz.', FDIR_RATE_HZ));
+        logToDashboard(uiHandles, sprintf('FDIR background monitoring system started at %d Hz.', FDIR_RATE_HZ));
     catch ME
         logToDashboard(uiHandles, sprintf('[FATAL] FDIR Timer setup failed: %s', ME.message));
         is_running = false;
@@ -61,11 +58,8 @@ function carla_udp_receiver(port)
     trajectory = nan(HISTORY_LENGTH * 5, 2);
     gnss_track = nan(HISTORY_LENGTH * 5, 2);
     imu_history = struct('x', nan(1, HISTORY_LENGTH), 'y', nan(1, HISTORY_LENGTH), 'z', nan(1, HISTORY_LENGTH));
-    
     buffer = '';
     last_message_time = tic;
-    
-    % --- MATLAB's own state memory to prevent flickering ---
     matlab_control_mode = 'MANUAL';
     
     % --- Main Loop ---
@@ -76,7 +70,6 @@ function carla_udp_receiver(port)
         end
         
         latest_frame_to_render = [];
-        
         if u.NumBytesAvailable > 0
             byteData = read(u, u.NumBytesAvailable, "uint8");
             newData = native2unicode(byteData, 'UTF-8');
@@ -90,34 +83,36 @@ function carla_udp_receiver(port)
             if ~endsWith(jsonObjects{end}, '}')
                 buffer = jsonObjects{end};
                 jsonObjects = jsonObjects(1:end-1);
-            else
-                buffer = '';
-            end
+            else, buffer = ''; end
             
             for i = 1:numel(jsonObjects)
                 jsonStr = jsonObjects{i};
                 if isempty(jsonStr), continue; end
-                
                 try
                     packet = jsondecode(jsonStr);
                     processed_frame = processPacket(packet); 
                     if ~isempty(processed_frame)
                         latest_frame_to_render = processed_frame;
                     end
-                catch ME
-                    logToDashboard(uiHandles, sprintf('[WARN] JSON decode failed: %s', ME.message));
-                end
+                catch ME, logToDashboard(uiHandles, sprintf('[WARN] JSON decode failed: %s', ME.message)); end
             end
         end
         
         if ~isempty(latest_frame_to_render)
             frame_data = latest_frame_to_render;
-            [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, ...
-                trajectory, gnss_track, imu_history);
+            [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, trajectory, gnss_track, imu_history);
             
             dt = processAndAnalyzeFrame(frame_data, toc(last_message_time));
             current_mode_from_python = get_safe(frame_data, 'mode', 'MANUAL');
-            [fuzzy_decision, score] = fuzzy_bbna(carla_outputs, current_mode_from_python);
+
+            % Fuzzylogic system makes a recommendation
+            if exist('fuzzy_bbna.m', 'file')
+                [fuzzy_decision, score] = fuzzy_bbna(carla_outputs, current_mode_from_python);
+            else
+                fuzzy_decision = 'MANUAL'; score = 0; % Fallback
+            end
+
+            % ModeController makes the final decision and generates control commands
             [new_mode, vehicle_command] = ModeController(fuzzy_decision, matlab_control_mode, carla_outputs, dt);
             matlab_control_mode = new_mode;
             send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
@@ -126,21 +121,17 @@ function carla_udp_receiver(port)
             carla_outputs.fuzzy_desirability_score = score;
             carla_outputs.matlab_commanded_mode = matlab_control_mode;
 
-            updateDashboard(uiHandles, frame_data, trajectory, ...
-                gnss_track, imu_history, carla_outputs);
+            updateDashboard(uiHandles, frame_data, trajectory, gnss_track, imu_history, carla_outputs);
         end
-        
         pause(0.01); 
     end
     
-    logToDashboard(uiHandles, 'Shutdown sequence initiated...');
-    
     % --- CLEANUP ---
+    logToDashboard(uiHandles, 'Shutdown sequence initiated...');
     if ~isempty(fdirTimer) && isvalid(fdirTimer), stop(fdirTimer); delete(fdirTimer); end
     if exist('u','var') && isvalid(u), delete(u); end
     if ~isempty(command_sender_udp) && isvalid(command_sender_udp), delete(command_sender_udp); end
     if ishandle(uiHandles.fig), delete(uiHandles.fig); end
-    disp('CARLA UDP Receiver has shut down gracefully.');
 
     function onCloseRequest(~, ~)
         is_running = false;
