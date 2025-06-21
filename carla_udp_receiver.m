@@ -186,12 +186,9 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     g_diag = uigridlayout(p_diag, [1 1]);
     p_diag_metrics = uipanel(g_diag, 'Title', '');
     g_diag_metrics = uigridlayout(p_diag_metrics, [11, 2], 'ColumnWidth', {'fit', '1x'});
-    
-    % --- UI FIX: Reduce row spacing to prevent vertical cropping ---
     g_diag_metrics.RowSpacing = 2;
     g_diag_metrics.Padding = [5 5 5 5];
 
-    % --- UI FIX: Shorten text labels to prevent horizontal cropping ---
     uilabel(g_diag_metrics, 'Text', 'Frame:', 'FontSize', 10); uiHandles.frameLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
     uilabel(g_diag_metrics, 'Text', 'Latency:', 'FontSize', 10); uiHandles.latencyLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
     uilabel(g_diag_metrics, 'Text', 'Vehicle Mode:', 'FontSize', 10); uiHandles.modeLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
@@ -278,6 +275,10 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency)
     processed_sensor_data.is_collision_event = (current_collisions > last_collisions); last_collisions = current_collisions;
     current_lane_invasions = get_safe(frame, 'lane_invasions', 0); if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end
     processed_sensor_data.is_lane_invasion_event = (current_lane_invasions > last_lane_invasions); last_lane_invasions = current_lane_invasions;
+    ego_pos = get_safe(frame, 'fused_state', struct('x',0,'y',0));
+    ego_rot = get_safe(frame, 'rotation', struct('yaw',0));
+    ego_speed_ms = get_safe(frame, 'speed', 0) / 3.6;
+    processed_sensor_data.lane_waypoints = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms);
     driver_attention = computeDriverAttention(frame);
     driver_readiness = computeDriverReadiness(frame);
     carla_outputs.network_status = network_status;
@@ -382,4 +383,45 @@ function data_out = extractRawSensorData(frame)
         if ~copy && ismember(field, singles), copy = true; end; if copy, data_out.(field) = frame.(field); end; end
     data_out.speed = get_safe(frame, 'speed', 0); data_out.ultrasonic_front = get_safe(frame, 'ultrasonic_front', inf); data_out.ultrasonic_back = get_safe(frame, 'ultrasonic_back', inf);
     data_out.throttle_input = get_safe(control_data, 'throttle', 0); data_out.brake_input = get_safe(control_data, 'brake', 0); data_out.steering_input = get_safe(control_data, 'steer', 0);
+end
+
+function waypoints = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms)
+% Simulates a path planner using trajectoryGeneratorFrenet from the
+% Automated Driving Toolbox. It generates a smooth, curved path ahead.
+
+    % Define a simple reference path (a long straight line). The trajectory
+    % will be generated RELATIVE to this simple path.
+    ref_wps = [ ego_pos.x - 1, ego_pos.y; 
+                ego_pos.x + 100, ego_pos.y]; % A line starting near the car
+    refPath = referencePathFrenet(ref_wps);
+
+    % Convert the car's current global state to Frenet coordinates
+    ego_state_global = [ego_pos.x, ego_pos.y, deg2rad(ego_rot.yaw), 0, 0, ego_speed_ms];
+    frenet_state_current = global2frenet(refPath, ego_state_global);
+
+    % Define a target state in Frenet coordinates
+    lookahead_dist = 20.0;
+    % Define the full 6-element target state for a smooth connection
+    frenet_state_target = [frenet_state_current(1) + lookahead_dist, ... % Target S
+                           0, ...   % Target d (lateral deviation)
+                           0, ...   % Target d_prime (lateral velocity relative to path)
+                           ego_speed_ms, ... % Target S_dot (speed along path)
+                           0, ...   % Target d_double_prime (lateral acceleration)
+                           0];      % Target S_double_prime (longitudinal acceleration)
+
+    % Calculate the time over which to generate the trajectory
+    timeSpan = lookahead_dist / max(ego_speed_ms, 5); % Avoid division by zero, min 5 m/s speed for calc
+
+    % Create a trajectory generator object and connect the states
+    trajGen = trajectoryGeneratorFrenet(refPath);
+    
+    % --- FIX: Provide all required arguments to the connect method ---
+    [~, trajectory] = connect(trajGen, frenet_state_current, frenet_state_target, timeSpan);
+
+    if isempty(trajectory.Trajectory)
+        % Fallback in case of an error
+        waypoints = ref_wps;
+    else
+        waypoints = trajectory.Trajectory(:, 1:2);
+    end
 end
