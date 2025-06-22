@@ -76,6 +76,8 @@ function carla_udp_receiver(port)
             buffer = [buffer, newData];
             last_message_time = tic;
             
+            % This delimiter handles multiple JSONs in one UDP read, but the
+            % chunking logic inside processPacket handles the reassembly.
             delimiter = '|||JSON_DELIMITER|||';
             sanitizedBuffer = strrep(buffer, '}{', ['}' delimiter '{']);
             jsonObjects = strsplit(sanitizedBuffer, delimiter);
@@ -94,7 +96,11 @@ function carla_udp_receiver(port)
                     if ~isempty(processed_frame)
                         latest_frame_to_render = processed_frame;
                     end
-                catch ME, logToDashboard(uiHandles, sprintf('[WARN] JSON decode failed: %s', ME.message)); end
+                catch ME
+                    % This catch is now a secondary fallback. The robust
+                    % processPacket function should prevent most of these.
+                    logToDashboard(uiHandles, sprintf('[WARN] JSON decode failed: %s', ME.message));
+                end
             end
         end
         
@@ -105,19 +111,13 @@ function carla_udp_receiver(port)
             dt = processAndAnalyzeFrame(frame_data, toc(last_message_time));
             current_mode_from_python = get_safe(frame_data, 'mode', 'MANUAL');
 
-            % Fuzzylogic system makes a recommendation
             if exist('fuzzy_bbna.m', 'file')
                 [fuzzy_decision, score] = fuzzy_bbna(carla_outputs, current_mode_from_python);
-            else
-                fuzzy_decision = 'MANUAL'; score = 0; % Fallback
-            end
+            else, fuzzy_decision = 'MANUAL'; score = 0; end
 
-            % ModeController makes the final decision and generates control commands
             if exist('ModeController.m', 'file')
                 [new_mode, vehicle_command] = ModeController(fuzzy_decision, matlab_control_mode, carla_outputs, dt);
-            else
-                new_mode = 'MANUAL'; vehicle_command = struct('steer',0,'throttle',0,'brake',1);
-            end
+            else, new_mode = 'MANUAL'; vehicle_command = struct('steer',0,'throttle',0,'brake',1); end
             matlab_control_mode = new_mode;
             send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
             
@@ -150,16 +150,12 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Position', [50 50, 1600, 950]);
     fig.CloseRequestFcn = closeCallback;
     uiHandles.fig = fig;
-    
     gl = uigridlayout(fig, [3, 4]);
-    gl.RowHeight = {250, '2x', 200};
-    gl.ColumnWidth = {'1x', '1x', '1x', '1x'};
-    
+    gl.RowHeight = {250, '2x', 200}; gl.ColumnWidth = {'1x', '1x', '1x', '1x'};
     p_speed = uipanel(gl, 'Title', 'Speed (km/h)', 'FontWeight', 'bold');
     p_speed.Layout.Row = 1; p_speed.Layout.Column = 1;
     speed_grid = uigridlayout(p_speed, [1 1]);
     uiHandles.speedGauge = uigauge(speed_grid, 'ScaleColors', {[0 .8 .4], [.9 .8 0], [1 .2 .2]}, 'ScaleColorLimits', [0 60; 60 100; 100 160]);
-    
     p_imu = uipanel(gl, 'Title', 'IMU - Accelerometer', 'FontWeight', 'bold');
     p_imu.Layout.Row = 1; p_imu.Layout.Column = 2;
     uiHandles.imuAx = uiaxes(p_imu);
@@ -168,22 +164,18 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.accelYPlot = plot(uiHandles.imuAx, NaN(1, historyLength), 'g-', 'LineWidth', 1.5, 'DisplayName', 'Y');
     uiHandles.accelZPlot = plot(uiHandles.imuAx, NaN(1, historyLength), 'b-', 'LineWidth', 1.5, 'DisplayName', 'Z');
     xlabel(uiHandles.imuAx, 'Frames Ago'); ylabel(uiHandles.imuAx, 'm/s^2'); legend(uiHandles.imuAx);
-    
     p_gnss = uipanel(gl, 'Title', 'GNSS Trajectory', 'FontWeight', 'bold');
     p_gnss.Layout.Row = 1; p_gnss.Layout.Column = 3;
     uiHandles.gnssAx = uiaxes(p_gnss);
     hold(uiHandles.gnssAx, 'on'); grid(uiHandles.gnssAx, 'on'); axis(uiHandles.gnssAx, 'equal');
     xlabel(uiHandles.gnssAx, 'Longitude'); ylabel(uiHandles.gnssAx, 'Latitude');
     uiHandles.gnssPlot = plot(uiHandles.gnssAx, NaN, NaN, '-m', 'LineWidth', 1.5);
-    
     p_diag = uipanel(gl, 'Title', 'Diagnostics', 'FontWeight', 'bold');
     p_diag.Layout.Row = 1; p_diag.Layout.Column = 4;
     g_diag = uigridlayout(p_diag, [1 1]);
     p_diag_metrics = uipanel(g_diag, 'Title', '');
     g_diag_metrics = uigridlayout(p_diag_metrics, [11, 2], 'ColumnWidth', {'fit', '1x'});
-    g_diag_metrics.RowSpacing = 2;
-    g_diag_metrics.Padding = [5 5 5 5];
-
+    g_diag_metrics.RowSpacing = 2; g_diag_metrics.Padding = [5 5 5 5];
     uilabel(g_diag_metrics, 'Text', 'Frame:', 'FontSize', 10); uiHandles.frameLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
     uilabel(g_diag_metrics, 'Text', 'Latency:', 'FontSize', 10); uiHandles.latencyLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
     uilabel(g_diag_metrics, 'Text', 'Vehicle Mode:', 'FontSize', 10); uiHandles.modeLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
@@ -195,30 +187,25 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uilabel(g_diag_metrics, 'Text', 'Traffic Light:', 'FontSize', 10); uiHandles.trafficLightLabel = uilabel(g_diag_metrics, 'Text', 'N/A', 'FontWeight', 'bold', 'FontSize', 10);
     uilabel(g_diag_metrics, 'Text', 'Sys. Conf:', 'FontSize', 10); uiHandles.confidenceLabel = uilabel(g_diag_metrics, 'Text', 'NOMINAL', 'FontWeight', 'bold', 'FontSize', 10);
     uilabel(g_diag_metrics, 'Text', 'Fuzzy Desire:', 'FontWeight', 'bold', 'FontSize', 10); uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold', 'FontSize', 10);
-    
     p_cameras = uipanel(gl, 'Title', 'Camera Feeds', 'FontWeight', 'bold');
     p_cameras.Layout.Row = 2; p_cameras.Layout.Column = [1 2];
     g_cameras = uigridlayout(p_cameras, [2 3]);
     uiHandles.camLeftAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camLeftAx, 'Left'); uiHandles.camFrontAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camFrontAx, 'Front'); uiHandles.camRightAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camRightAx, 'Right'); uiHandles.camInteriorAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camInteriorAx, 'Interior'); uiHandles.camRearAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camRearAx, 'Back');
-    
     p_traj = uipanel(gl, 'Title', 'Vehicle Trajectory (Fused)', 'FontWeight', 'bold');
     p_traj.Layout.Row = 2; p_traj.Layout.Column = 3;
     uiHandles.trajAx = uiaxes(p_traj);
     hold(uiHandles.trajAx, 'on'); grid(uiHandles.trajAx, 'on'); axis(uiHandles.trajAx, 'equal'); xlabel(uiHandles.trajAx, 'X (m)'); ylabel(uiHandles.trajAx, 'Y (m)');
     uiHandles.trajPlot = plot(uiHandles.trajAx, NaN, NaN, '-c', 'LineWidth', 2, 'DisplayName', 'Ego Path'); uiHandles.currentPosPlot = plot(uiHandles.trajAx, NaN, NaN, 'bo', 'MarkerFaceColor', 'b', 'MarkerSize', 8, 'DisplayName', 'Ego Vehicle'); uiHandles.v2vPlot = plot(uiHandles.trajAx, NaN, NaN, 'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 5, 'DisplayName', 'Other Vehicles'); legend(uiHandles.trajAx);
-    
     p_lidar = uipanel(gl, 'Title', '3D LiDAR & Object Detections', 'FontWeight', 'bold');
     p_lidar.Layout.Row = 2; p_lidar.Layout.Column = 4;
     uiHandles.lidarAx = uiaxes(p_lidar); 
     hold(uiHandles.lidarAx, 'on'); grid(uiHandles.lidarAx, 'on'); axis(uiHandles.lidarAx, 'equal'); xlabel(uiHandles.lidarAx, 'X (m)'); ylabel(uiHandles.lidarAx, 'Y (m)'); zlabel(uiHandles.lidarAx, 'Z (m)'); view(uiHandles.lidarAx, -45, 30);
     uiHandles.lidarPlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 10, NaN, 'filled', 'DisplayName', 'LiDAR Points'); uiHandles.obstaclePlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 100, 'bo', 'filled', 'MarkerFaceAlpha', 0.6, 'DisplayName', 'Obstacles'); legend(uiHandles.lidarAx);
-    
     p_log = uipanel(gl, 'Title', 'System Log', 'FontWeight', 'bold');
     p_log.Layout.Row = 3; p_log.Layout.Column = [1 4];
     log_grid = uigridlayout(p_log, [1 1]);
     uiHandles.logArea = uitextarea(log_grid, 'Value', {''}, 'Editable', 'off', 'FontName', 'Monospaced', 'BackgroundColor', [0.1 0.1 0.1], 'FontColor', [0.9 0.9 0.9]);
 end
-
 
 %% =======================================================================
 %                      DATA PROCESSING AND UPDATING
@@ -256,41 +243,28 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency)
     global carla_outputs;
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
     if isempty(last_call_timer), time_since_last = 1/20; last_call_timer = tic; else, time_since_last = toc(last_call_timer); last_call_timer = tic; end
-    
-    % --- Core Data Extraction ---
     network_status = struct('latency', latency, 'data_rate', 1 / max(time_since_last, 0.001));
     [health_score, sensor_health_data] = computeSensorHealth(frame);
     covariance_trace = computeEkfUncertainty(frame);
     sensor_fusion_status = struct('fused_state', get_safe(frame, 'fused_state', struct()), 'position_uncertainty', covariance_trace, 'health_score', health_score, 'raw_health', sensor_health_data);
     processed_sensor_data = extractRawSensorData(frame);
-    
-    % --- Call Improved, Data-Driven Analysis Functions ---
     weather_severity = computeWeatherSeverity(frame);
     threat_level = computeThreatLevel(frame);
-    simple_density = computeSimpleObstacleDensity(frame); % Legacy for fuzzy_bbna
+    simple_density = computeSimpleObstacleDensity(frame);
     system_confidence = computeSystemConfidence(health_score, covariance_trace, threat_level, weather_severity);
-    
     processed_sensor_data.Weather_Severity = weather_severity;
     processed_sensor_data.Obstacle_Threat = threat_level;
     processed_sensor_data.Obstacle_Density = simple_density; 
-    
-    % --- Event & State Change Detection ---
     rotation_data = get_safe(frame, 'rotation', struct('yaw', 0)); current_yaw = rotation_data.yaw; if isempty(last_yaw), last_yaw = current_yaw; end
     yaw_delta = current_yaw - last_yaw; if yaw_delta > 180, yaw_delta = yaw_delta - 360; end; if yaw_delta < -180, yaw_delta = yaw_delta + 360; end
     processed_sensor_data.yaw_rate = yaw_delta / max(time_since_last, 0.001); last_yaw = current_yaw;
-    
     current_collisions = get_safe(frame, 'collisions', 0); if isempty(last_collisions), last_collisions = current_collisions; end
     processed_sensor_data.is_collision_event = (current_collisions > last_collisions); last_collisions = current_collisions;
-    
     current_lane_invasions = get_safe(frame, 'lane_invasions', 0); if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end
     is_lane_invasion = (current_lane_invasions > last_lane_invasions);
     processed_sensor_data.is_lane_invasion_event = is_lane_invasion; last_lane_invasions = current_lane_invasions;
-
-    % --- Call Improved Driver State Functions ---
     driver_attention = computeDriverAttention(frame, is_lane_invasion);
     driver_readiness = computeDriverReadiness(frame, driver_attention, threat_level);
-
-    % --- Call Improved Path Planner ---
     ego_pos = get_safe(frame, 'fused_state', struct('x',0,'y',0));
     ego_rot = get_safe(frame, 'rotation', struct('yaw',0));
     ego_speed_ms = get_safe(frame, 'speed', 0) / 3.6;
@@ -298,15 +272,13 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency)
     v2i_data = get_safe(frame, 'V2I_Data', struct());
     [planned_waypoints, intelligent_target_speed] = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms, real_lane_data, v2i_data, threat_level);
     processed_sensor_data.lane_waypoints = planned_waypoints;
-
-    % --- Store all outputs for global access ---
     carla_outputs.network_status = network_status;
     carla_outputs.sensor_fusion_status = sensor_fusion_status;
     carla_outputs.processed_sensor_data = processed_sensor_data;
     carla_outputs.driver_attention = driver_attention;
     carla_outputs.driver_readiness = driver_readiness;
     carla_outputs.system_confidence = system_confidence;
-    carla_outputs.intelligent_target_speed_ms = intelligent_target_speed; % Pass to ModeController
+    carla_outputs.intelligent_target_speed_ms = intelligent_target_speed;
     carla_outputs.control = get_safe(frame, 'control', struct());
     carla_outputs.speed = get_safe(frame, 'speed', 0);
     carla_outputs.rotation = get_safe(frame, 'rotation', struct());
@@ -324,11 +296,64 @@ function send_control_to_carla(udp_sender, command, port)
 end
 
 function full_data = processPacket(packet)
-    persistent chunkBuffer; if isempty(chunkBuffer), chunkBuffer = containers.Map('KeyType', 'double', 'ValueType', 'any'); end; full_data = [];
-    if isfield(packet, 'chunk'), frameId = packet.frame; if ~isKey(chunkBuffer, frameId), chunkBuffer(frameId) = struct('chunks', {cell(1, packet.total_chunks)}, 'received_chunks', 0); end
-        chunkData = chunkBuffer(frameId); if isempty(chunkData.chunks{packet.chunk + 1}), chunkData.chunks{packet.chunk + 1} = packet.data; chunkData.received_chunks = chunkData.received_chunks + 1; chunkBuffer(frameId) = chunkData; end
-        currentChunkData = chunkBuffer(frameId); if currentChunkData.received_chunks == packet.total_chunks, full_json_string = strjoin(currentChunkData.chunks, ''); try, full_data = jsondecode(full_json_string); catch, full_data = []; end; remove(chunkBuffer, frameId); end
-    else, full_data = packet; end
+% MODIFIED: Robust chunk reassembly to handle out-of-order/lost UDP packets.
+    persistent chunkBuffer;
+    if isempty(chunkBuffer)
+        chunkBuffer = containers.Map('KeyType', 'double', 'ValueType', 'any');
+    end
+    
+    full_data = [];
+    PACKET_TIMEOUT_S = 1.0; % Discard incomplete frames after 1 second.
+    
+    % --- Part 1: Clean up stale, incomplete frames ---
+    keys_to_remove = {};
+    all_keys = keys(chunkBuffer);
+    for i = 1:length(all_keys)
+        key = all_keys{i};
+        if toc(chunkBuffer(key).timestamp) > PACKET_TIMEOUT_S
+            keys_to_remove{end+1} = key;
+        end
+    end
+    if ~isempty(keys_to_remove)
+        remove(chunkBuffer, keys_to_remove);
+    end
+
+    % --- Part 2: Process the incoming packet ---
+    if isfield(packet, 'chunk')
+        % This is a chunked packet
+        frameId = packet.frame;
+        
+        % Initialize buffer for this frame ID if it's new
+        if ~isKey(chunkBuffer, frameId)
+            chunkBuffer(frameId) = struct(...
+                'chunks', {cell(1, packet.total_chunks)}, ...
+                'received_chunks', 0, ...
+                'timestamp', tic ...
+            );
+        end
+        
+        % Store the chunk data if the slot is empty (prevents duplicates)
+        frame_buffer = chunkBuffer(frameId);
+        if isempty(frame_buffer.chunks{packet.chunk + 1})
+            frame_buffer.chunks{packet.chunk + 1} = packet.data;
+            frame_buffer.received_chunks = frame_buffer.received_chunks + 1;
+            chunkBuffer(frameId) = frame_buffer;
+        end
+        
+        % Check if all chunks for this frame have now arrived
+        if frame_buffer.received_chunks == packet.total_chunks
+            full_json_string = strjoin(frame_buffer.chunks, '');
+            try
+                full_data = jsondecode(full_json_string);
+            catch
+                full_data = []; % Failed to decode, return empty
+            end
+            remove(chunkBuffer, frameId); % Clean up the completed frame
+        end
+    else
+        % This is a simple, non-chunked packet
+        full_data = packet;
+    end
 end
 
 function logToDashboard(uiHandles, message)
@@ -351,223 +376,122 @@ end
 %% =======================================================================
 %                    IMPROVED ANALYSIS & PERCEPTION FUNCTIONS
 % ========================================================================
-
 function density = computeSimpleObstacleDensity(frame)
-% This is the original, simple logic required by fuzzy_bbna.m.
-% It counts the number of obstacles within a fixed 50m radius.
     density = 0;
     obstacles = get_safe(frame, 'Detected_Obstacles', []);
     ego_pos = get_safe(frame, 'position', struct('x', 0, 'y', 0, 'z', 0));
     if isempty(obstacles) || ~isfield(ego_pos, 'x'), return; end
-    
     for i = 1:numel(obstacles)
         dist = sqrt((obstacles(i).position.x - ego_pos.x)^2 + (obstacles(i).position.y - ego_pos.y)^2);
-        if dist < 50
-            density = density + 1;
-        end
+        if dist < 50, density = density + 1; end
     end
 end
-
 function threat = computeThreatLevel(frame)
-% Computes a weighted threat level based on detected obstacles.
-% Considers distance and whether the obstacle is directly in the path.
     threat = 0;
     obstacles = get_safe(frame, 'Detected_Obstacles', []);
-    ego_pos = get_safe(frame, 'fused_state', []); % Use fused state for better accuracy
+    ego_pos = get_safe(frame, 'fused_state', []);
     ego_rot = get_safe(frame, 'rotation', []);
-
     if isempty(obstacles) || isempty(ego_pos) || isempty(ego_rot), return; end
-
-    % Get the ego vehicle's forward vector
     ego_yaw_rad = deg2rad(ego_rot.yaw);
     forward_vec = [cos(ego_yaw_rad), sin(ego_yaw_rad)];
-
     for i = 1:numel(obstacles)
         obs = obstacles(i);
         rel_pos_vec = [obs.position.x - ego_pos.x, obs.position.y - ego_pos.y];
         dist = norm(rel_pos_vec);
-        
-        if dist > 50 || dist < 0.1 % Ignore very far or overlapping obstacles
-            continue;
-        end
-        
-        % Normalize the relative position vector to get the direction
+        if dist > 50 || dist < 0.1, continue; end
         rel_pos_dir = rel_pos_vec / dist;
-        
-        % Check alignment with the forward vector (dot product)
-        % A value of 1 means directly in front, 0 is perpendicular, -1 is behind.
         alignment = dot(forward_vec, rel_pos_dir);
-        
-        if alignment > 0.5 % Consider only obstacles in the forward cone
-            % Threat is inversely proportional to distance and directly
-            % proportional to how "in-path" the obstacle is.
-            distance_threat = (1 / dist) * 10; % Scale factor
-            alignment_threat = alignment^2; % Square to weigh direct threats more
-            
+        if alignment > 0.5
+            distance_threat = (1 / dist) * 10;
+            alignment_threat = alignment^2;
             threat = threat + (distance_threat * alignment_threat);
         end
     end
 end
-
 function confidence = computeSystemConfidence(health_score, uncertainty, threat_level, weather_severity)
-% Calculates a holistic system confidence score.
     score = health_score;
     status_text = 'NOMINAL';
-
-    % 1. Penalize for high EKF uncertainty (unreliable position)
-    if uncertainty > 1.0 % Threshold for high uncertainty (trace of covariance)
-        score = score * 0.7;
-        status_text = 'HIGH_UNCERTAINTY';
-    end
-
-    % 2. Penalize for high environmental threat
-    if threat_level > 10.0 % Threshold for dangerous obstacle situation
-        score = score * (1 - min(threat_level / 50, 0.8)); % Penalize up to 80%
-        status_text = 'HIGH_THREAT_ENV';
-    end
-    
-    % 3. Penalize for severe weather
-    if weather_severity > 0.7 % e.g., HardRainNoon
+    if uncertainty > 1.0, score = score * 0.7; status_text = 'HIGH_UNCERTAINTY'; end
+    if threat_level > 10.0, score = score * (1 - min(threat_level / 50, 0.8)); status_text = 'HIGH_THREAT_ENV'; end
+    if weather_severity > 0.7
         score = score * 0.8;
-        if strcmp(status_text, 'NOMINAL') % Don't override a more severe status
-            status_text = 'POOR_WEATHER';
-        end
+        if strcmp(status_text, 'NOMINAL'), status_text = 'POOR_WEATHER'; end
     end
-
-    confidence.score = max(0, score); % Ensure score is not negative
+    confidence.score = max(0, score);
     confidence.status_text = status_text;
 end
-
 function score = computeDriverAttention(frame, is_lane_invasion)
-% Computes a more realistic driver attention score.
-% It uses a simulated gaze tracker (from interior camera) and penalizes for lane invasions.
     persistent last_image_hash time_head_away;
     if isempty(last_image_hash), last_image_hash = 0; time_head_away = tic; end
-    
     score = 1.0;
-    
-    % --- 1. Simulated Gaze Tracking from Interior Camera ---
     img_b64 = get_safe(frame, 'image_interior', '');
     head_is_forward = true;
     if ~isempty(img_b64)
         try
-            % We create a simple "hash" of the image. A large change implies head movement.
             img_bytes = base64decode(img_b64);
-            current_hash = sum(img_bytes(1:10:end)); % Simple checksum/hash
-            
-            % If the hash is significantly different, the view has changed.
+            current_hash = sum(img_bytes(1:10:end));
             if abs(current_hash - last_image_hash) > numel(img_bytes) * 0.1 && last_image_hash ~= 0
                 head_is_forward = false;
             end
             last_image_hash = current_hash;
         catch
-            head_is_forward = true; % Failsafe
+            head_is_forward = true;
         end
     end
-    
-    if head_is_forward
-        time_head_away = tic; % Reset the timer if head is forward
-    else
-        % Penalize based on how long the driver has looked away.
-        score = score - min(1.0, toc(time_head_away) / 3.0);
-    end
-
-    % --- 2. Penalty for Lane Invasion ---
-    if is_lane_invasion
-        score = score * 0.2; % Major penalty for lane departure
-    end
-    
-    score = max(0, score); % Ensure score is within bounds [0, 1]
+    if head_is_forward, time_head_away = tic;
+    else, score = score - min(1.0, toc(time_head_away) / 3.0); end
+    if is_lane_invasion, score = score * 0.2; end
+    score = max(0, score);
 end
-
 function score = computeDriverReadiness(frame, attention_score, threat_level)
-% Computes a more realistic driver readiness score.
-% Readiness depends on attention and appropriate reaction to the environment.
     score = 1.0;
     controls = get_safe(frame, 'control', struct('throttle',0,'brake',0,'hand_brake',false));
     v2i_data = get_safe(frame, 'V2I_Data', struct());
-    
-    % 1. Check for Contradictory Inputs (Critical Error)
     if controls.throttle > 0.1 && controls.brake > 0.1, score = 0.1; end
     if controls.hand_brake && controls.throttle > 0.1, score = 0.3; end
-    
-    % 2. Check for Failure to React to Environment
     traffic_light_state = get_safe(v2i_data, 'traffic_light_state', 'GREEN');
-    if strcmpi(traffic_light_state, 'RED') && controls.throttle > 0.1
-        score = min(score, 0.2); % Accelerating at red light
-    end
-    if threat_level > 10.0 && controls.brake < 0.1
-        score = min(score, 0.4); % High threat but no braking
-    end
-    
-    % 3. Readiness is Capped by Attention
+    if strcmpi(traffic_light_state, 'RED') && controls.throttle > 0.1, score = min(score, 0.2); end
+    if threat_level > 10.0 && controls.brake < 0.1, score = min(score, 0.4); end
     score = min(score, attention_score);
 end
-
 function [waypoints, target_speed_ms] = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms, real_lane_waypoints, v2i_data, threat_level)
-% Generates a feasible trajectory that reacts to traffic lights and threats.
-% MODIFIED: Also returns the calculated intelligent target speed.
     if ~isempty(real_lane_waypoints) && ismatrix(real_lane_waypoints) && size(real_lane_waypoints, 2) == 2 && size(real_lane_waypoints, 1) > 1
         ref_wps = real_lane_waypoints;
-    else
-        ref_wps = [ ego_pos.x - 1, ego_pos.y; ego_pos.x + 100, ego_pos.y];
-    end
+    else, ref_wps = [ ego_pos.x - 1, ego_pos.y; ego_pos.x + 100, ego_pos.y]; end
     refPath = referencePathFrenet(ref_wps);
     ego_state_global = [ego_pos.x, ego_pos.y, deg2rad(ego_rot.yaw), 0, 0, ego_speed_ms];
     frenet_state_current = global2frenet(refPath, ego_state_global);
-    
-    % --- INTELLIGENT TARGET STATE LOGIC ---
-    target_speed_ms = ego_speed_ms; % Default: maintain current speed
-
-    % 1. React to Traffic Lights (V2I)
+    target_speed_ms = ego_speed_ms;
     traffic_light_state = get_safe(v2i_data, 'traffic_light_state', 'GREEN');
-    if strcmpi(traffic_light_state, 'RED')
-        target_speed_ms = 0; % Plan to stop
-    end
-
-    % 2. React to Immediate Threats
-    if threat_level > 15.0 
-        target_speed_ms = 0; % Emergency stop for critical threat
-    elseif threat_level > 8.0
-        target_speed_ms = min(target_speed_ms, 5.0); % Slow for medium threat
-    end
-    
+    if strcmpi(traffic_light_state, 'RED'), target_speed_ms = 0; end
+    if threat_level > 15.0, target_speed_ms = 0; 
+    elseif threat_level > 8.0, target_speed_ms = min(target_speed_ms, 5.0); end
     lookahead_dist = 20.0;
-    frenet_state_target = [frenet_state_current(1) + lookahead_dist, ...
-                           0, 0, target_speed_ms, 0, 0];
-
+    frenet_state_target = [frenet_state_current(1) + lookahead_dist, 0, 0, target_speed_ms, 0, 0];
     timeSpan = lookahead_dist / max(ego_speed_ms, 5); 
     trajGen = trajectoryGeneratorFrenet(refPath);
     [~, trajectory] = connect(trajGen, frenet_state_current, frenet_state_target, timeSpan);
-
-    if isempty(trajectory.Trajectory)
-        waypoints = ref_wps;
-    else
-        waypoints = trajectory.Trajectory(:, 1:2);
-    end
+    if isempty(trajectory.Trajectory), waypoints = ref_wps;
+    else, waypoints = trajectory.Trajectory(:, 1:2); end
 end
 
 %% =======================================================================
 %                    ORIGINAL UTILITY FUNCTIONS (UNMODIFIED)
 % ========================================================================
-
 function severity = computeWeatherSeverity(frame)
     weather_str = get_safe(frame, 'weather', 'ClearNoon');
     switch weather_str, case 'ClearNoon', severity = 0.1; case 'CloudyNoon', severity = 0.3; case 'WetNoon', severity = 0.6; case 'HardRainNoon', severity = 0.9; otherwise, severity = 0.1; end
 end
-
 function [score, raw_health] = computeSensorHealth(frame)
     raw_health = get_safe(frame, 'sensor_health', []); if ~isstruct(raw_health), score = 0; return; end
     all_groups = struct2cell(raw_health); total_ok = 0; total_sensors = 0;
     for i = 1:numel(all_groups), status_list = all_groups{i}; total_sensors = total_sensors + numel(status_list); total_ok = total_ok + sum(strcmp(status_list, 'OK')); end
     if total_sensors > 0, score = total_ok / total_sensors; else, score = 1; end
 end
-
 function trace_val = computeEkfUncertainty(frame)
     ekf_cov_data = get_safe(frame, 'ekf_covariance', []);
     if iscell(ekf_cov_data), try, covariance_matrix = cell2mat(cellfun(@cell2mat, ekf_cov_data, 'UniformOutput', false)); trace_val = trace(covariance_matrix(1:2, 1:2)); catch, trace_val = inf; end; else, trace_val = inf; end
 end
-
 function data_out = extractRawSensorData(frame)
     data_out = struct(); control_data = get_safe(frame, 'control', struct()); all_fields = fieldnames(frame); prefixes = {'image_', 'lidar_', 'radar_'}; singles = {'gnss', 'imu', 'position', 'rotation', 'Detected_Obstacles', 'V2V_Data', 'V2I_Data'};
     for i = 1:numel(all_fields), field = all_fields{i}; copy = false; for j = 1:numel(prefixes), if startsWith(field, prefixes{j}), copy = true; break; end; end
