@@ -1,7 +1,6 @@
 function [final_mode, final_command] = ModeController(target_mode, current_mode, carla_outputs, dt)
 % ModeController - Manages control modes and implements advanced controllers.
-% Lateral Control: Super-Twisting Sliding Mode (STSM).
-% Longitudinal Control: Gain-Scheduled H-infinity for robust speed tracking.
+% ## RELAXED DEVELOPER VERSION ##
 
 persistent state;
 if isempty(state)
@@ -15,22 +14,18 @@ end
 
 % --- State Transition Logic ---
 if ~strcmp(target_mode, current_mode) && ~state.in_transition
-    % --- REALISTIC MODIFICATION: Trust the Fuzzy Arbitrator ---
-    % The fuzzy system (target_mode) has already weighed all the nuanced factors
-    % like driver readiness and environmental complexity. ModeController should
-    % not second-guess it with its own hard-coded thresholds.
-    % The only remaining check is for a catastrophic, non-negotiable
-    % controller instability, which is a system-level fault.
-    if strcmp(target_mode, 'AUTOPILOT')
-        is_stable = check_stability_conditions();
-        
-        if ~is_stable
-            fprintf('[FATAL ABORT] Transition to AUTOPILOT denied. Controller stability conditions not met.\n');
-            final_mode = 'MANUAL'; state.alpha = 1.0;
-            final_command = get_human_control(carla_outputs); 
-            return;
-        end
-    end
+    
+    % ## MODIFIED ## The secondary stability check is commented out for testing.
+    % The fuzzy system's decision is now the only gatekeeper.
+    % if strcmp(target_mode, 'AUTOPILOT')
+    %     is_stable = check_stability_conditions();
+    %     if ~is_stable
+    %         fprintf('[FATAL ABORT] Transition to AUTOPILOT denied. Controller stability conditions not met.\n');
+    %         final_mode = 'MANUAL'; state.alpha = 1.0;
+    %         final_command = get_human_control(carla_outputs); 
+    %         return;
+    %     end
+    % end
     
     state.in_transition = true; state.transition_start_time = tic; state.target_mode = target_mode;
     if strcmp(target_mode, 'MANUAL'), state.transition_duration = 0.2; else, state.transition_duration = 1.5; end

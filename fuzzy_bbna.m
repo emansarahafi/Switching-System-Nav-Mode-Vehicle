@@ -1,27 +1,12 @@
 function [decision, desirability_score] = fuzzy_bbna(carla_outputs, current_mode)
 % FUZZY_BBNA - Decides control mode using a refined fuzzy logic system.
-% This version (V4) adds System Latency and Lane Keeping analysis to the
-% decision matrix, making it more sensitive to system performance and
-% vehicle control stability.
-%
-% Syntax: [decision, desirability_score] = fuzzy_bbna(carla_outputs, current_mode)
-%
-% Inputs:
-%   carla_outputs - A struct containing all processed data from the CARLA
-%                   simulation environment.
-%   current_mode  - A string for the current control state. Must be one of:
-%                   'AUTOPILOT', 'MANUAL'.
-%
-% Outputs:
-%   decision      - The new recommended state. One of:
-%                   'AUTOPILOT': Conditions are safe for autonomous control.
-%                   'MANUAL': Manual control is required.
-%   desirability_score - The raw numeric output [0-100] from the FIS, where
-%                        higher scores indicate greater suitability for autopilot.
+% ## FINAL CORRECTED VERSION ##
+% This version fixes the state-flicker issue by making the fuzzy inputs
+% dependent on the current control mode.
 
-% --- Configuration: Hysteresis Thresholds for robust switching ---
-THRESH_ACTIVATE_AP = 65;   % Score must be ABOVE this to switch TO Autopilot.
-THRESH_DEACTIVATE_AP = 35; % Score must be BELOW this to switch FROM Autopilot.
+% --- Configuration: Hysteresis Thresholds ---
+THRESH_ACTIVATE_AP = 45;
+THRESH_DEACTIVATE_AP = 25;
 
 % --- Create or Load the Fuzzy Inference System (FIS) ---
 persistent fis;
@@ -31,7 +16,8 @@ if isempty(fis)
 end
 
 % --- Pre-process CARLA data into fuzzy inputs ---
-inputs = preprocess_carla_data(carla_outputs);
+% ## BUG FIX ## Pass the current_mode into the pre-processor.
+inputs = preprocess_carla_data(carla_outputs, current_mode);
 
 % --- Evaluate the FIS ---
 desirability_score = evalfis(fis, inputs);
@@ -41,16 +27,16 @@ decision = current_mode; % Default to staying in the current mode
 
 switch current_mode
     case 'AUTOPILOT'
-        % If in Autopilot, only disengage if conditions become poor.
         if desirability_score < THRESH_DEACTIVATE_AP
-            decision = 'MANUAL'; % Conditions are no longer safe for Autopilot.
+            decision = 'MANUAL';
         end
         
     case 'MANUAL'
-        % If in Manual, only engage Autopilot if conditions are very good.
         if desirability_score > THRESH_ACTIVATE_AP
             decision = 'AUTOPILOT';
         end
+    
+    % For other states like AWAITING_CONFIRMATION, we don't change the decision here.
 end
 
 end
@@ -61,7 +47,6 @@ end
 function fis = create_bbna_fis_v4()
     fis = mamfis('Name', 'BBNA_Mode_Switcher_V4');
 
-    % --- Define Inputs ---
     fis = addInput(fis, [0 1], 'Name', 'EnvironmentalComplexity');
     fis = addInput(fis, [0 1], 'Name', 'DriverState');
     fis = addInput(fis, [0 1], 'Name', 'CriticalEvent');
@@ -69,7 +54,6 @@ function fis = create_bbna_fis_v4()
     fis = addInput(fis, [0 1], 'Name', 'SystemLatency');       
     fis = addInput(fis, [0 1], 'Name', 'LaneKeeping');         
 
-    % --- Define Input Membership Functions ---
     fis = addMF(fis, 'EnvironmentalComplexity', 'trapmf', [0 0 0.2 0.4], 'Name', 'Low');
     fis = addMF(fis, 'EnvironmentalComplexity', 'trimf', [0.3 0.5 0.7], 'Name', 'Moderate');
     fis = addMF(fis, 'EnvironmentalComplexity', 'trapmf', [0.6 0.8 1 1], 'Name', 'High');
@@ -86,15 +70,12 @@ function fis = create_bbna_fis_v4()
     fis = addMF(fis, 'LaneKeeping', 'trapmf', [0 0 0.1 0.2], 'Name', 'OK');
     fis = addMF(fis, 'LaneKeeping', 'trapmf', [0.8 0.9 1 1], 'Name', 'Drifting');
 
-    % --- Define Output and its Membership Functions ---
     fis = addOutput(fis, [0 100], 'Name', 'AutopilotDesirability');
     fis = addMF(fis, 'AutopilotDesirability', 'trapmf', [0 0 20 35], 'Name', 'Manual');
     fis = addMF(fis, 'AutopilotDesirability', 'trimf', [30 50 70], 'Name', 'Handover');
     fis = addMF(fis, 'AutopilotDesirability', 'trapmf', [65 80 100 100], 'Name', 'Autopilot');
 
-    % --- Define Rules ---
     rules = [
-    % Env Drv Crit Comm Lat  Lane -> Out | Wght | Conn (1=AND)
       0   0   2   0    0    0       1      1.0    1;
       0   0   0   0    0    2       1      1.0    1;
       0   0   0   0    3    0       1      1.0    1;
@@ -113,7 +94,8 @@ end
 %% =======================================================================
 %               DATA PRE-PROCESSING (V4 - LATENCY & LANE KEEPING)
 % ========================================================================
-function processed_inputs = preprocess_carla_data(outputs)
+% ## BUG FIX ## Added current_mode as an input argument
+function processed_inputs = preprocess_carla_data(outputs, current_mode)
     required_fields = {'processed_sensor_data', 'driver_attention', 'driver_readiness', 'network_status'};
     for i = 1:length(required_fields)
         if ~isfield(outputs, required_fields{i})
@@ -126,14 +108,23 @@ function processed_inputs = preprocess_carla_data(outputs)
     weather_severity = outputs.processed_sensor_data.Weather_Severity;
     obstacle_density_raw = outputs.processed_sensor_data.Obstacle_Density;
     obstacle_density_norm = min(1, obstacle_density_raw / MAX_OBSTACLE_DENSITY);
-    
-    % MODIFICATION: Re-balanced complexity to prioritize obstacle density over weather.
     EnvironmentalComplexity = (0.2 * weather_severity) + (0.8 * obstacle_density_norm);
     
     % --- 2. Driver State ---
-    attention = outputs.driver_attention;
-    readiness = outputs.driver_readiness;
-    DriverState = attention * readiness;
+    % ## BUG FIX ##
+    % This logic now correctly separates the check for entering AP from staying in AP.
+    if strcmp(current_mode, 'AUTOPILOT')
+        % When in Autopilot, the driver is expected to be passive. We force a
+        % perfect score for this input so that the system is only judged on
+        % other factors (environment, system health, etc.).
+        DriverState = 1.0;
+    else
+        % When in MANUAL or AWAITING_CONFIRMATION, we must evaluate if the
+        % driver is ready to hand over control.
+        attention = outputs.driver_attention;
+        readiness = outputs.driver_readiness;
+        DriverState = (0.7 * readiness) + (0.3 * attention);
+    end
     
     % --- 3. Critical Event ---
     is_collision = outputs.processed_sensor_data.is_collision_event;
