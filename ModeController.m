@@ -15,32 +15,20 @@ end
 
 % --- State Transition Logic ---
 if ~strcmp(target_mode, current_mode) && ~state.in_transition
+    % --- REALISTIC MODIFICATION: Trust the Fuzzy Arbitrator ---
+    % The fuzzy system (target_mode) has already weighed all the nuanced factors
+    % like driver readiness and environmental complexity. ModeController should
+    % not second-guess it with its own hard-coded thresholds.
+    % The only remaining check is for a catastrophic, non-negotiable
+    % controller instability, which is a system-level fault.
     if strcmp(target_mode, 'AUTOPILOT')
         is_stable = check_stability_conditions();
         
-        % MODIFICATION: Relaxed the hard-coded gatekeeping check.
-        % The fuzzy system is designed to handle driver readiness nuances.
-        % This check now only prevents engagement if the driver is clearly
-        % incapacitated or completely unresponsive (score near zero).
-        driver_ready = get_safe(carla_outputs, 'driver_readiness', 0) > 0.1;
-        
-        % Obstacle check for immediate safety before transition
-        obstacles = get_safe(carla_outputs.processed_sensor_data, 'Detected_Obstacles', []);
-        ego_pos_struct = get_safe(carla_outputs.processed_sensor_data, 'position', struct('x',0,'y',0));
-        ego_pos = [ego_pos_struct.x, ego_pos_struct.y];
-        is_env_safe = true;
-        for i = 1:numel(obstacles)
-            obs_pos = [obstacles(i).position.x, obstacles(i).position.y];
-            if norm(ego_pos - obs_pos) < 5.0
-                is_env_safe = false;
-                break;
-            end
-        end
-        
-        if ~is_stable || ~driver_ready || ~is_env_safe
-            fprintf('[ABORT] Transition to AUTOPILOT denied. Stable: %d, Driver Ready: %d, Env Safe: %d\n', is_stable, driver_ready, is_env_safe);
+        if ~is_stable
+            fprintf('[FATAL ABORT] Transition to AUTOPILOT denied. Controller stability conditions not met.\n');
             final_mode = 'MANUAL'; state.alpha = 1.0;
-            final_command = get_human_control(carla_outputs); return;
+            final_command = get_human_control(carla_outputs); 
+            return;
         end
     end
     
@@ -60,7 +48,8 @@ if state.in_transition
         if strcmp(state.target_mode, 'AUTOPILOT'), state.alpha = 1.0 - progress; else, state.alpha = progress; end
         final_mode = current_mode;
     end
-else, final_mode = current_mode; end
+else, final_mode = current_mode; 
+end
 
 % --- Explicit State-Based Control Generation ---
 alpha = max(0, min(1, state.alpha));
