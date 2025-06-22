@@ -235,7 +235,7 @@ class HUD:
             "L: Unlock Safe Mode", "C: Next Weather (Shift+C: Prev)",
             "V: Next Map Layer (Shift+V: Prev)", "B: Load Layer (Shift+B: Unload)",
             "R: Toggle Image Recording", "Ctrl+R: Toggle Sim Recording",
-            "3: Switch to Town03", "0: Switch to Town10HD", "F1: Toggle HUD",
+            "4: Switch to Town04", "0: Switch to Town10HD", "F1: Toggle HUD",
             "H: Toggle Help", "ESC: Quit"
         ]
         s = pygame.Surface((360, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
@@ -274,7 +274,7 @@ class KeyboardController:
         elif key == K_b: self.simulation.toggle_current_map_layer(unload=is_shift)
         elif key == K_F1: self.simulation.toggle_hud()
         elif key == K_h: self.simulation.toggle_help()
-        elif key == K_3: self.simulation.change_map('Town03')
+        elif key == K_4: self.simulation.change_map('Town04')
         elif key == K_0: self.simulation.change_map('Town10HD')
         elif key == K_ESCAPE: self.simulation.running = False
 
