@@ -1,23 +1,24 @@
 function carla_udp_receiver(port)
-% CARLA_UDP_RECEIVER - Main entry point for the CARLA diagnostics dashboard.
-% This script acts as a supervisory controller. It receives data from Python,
-% runs a fuzzy logic system to decide on a course of action, and only sends
-% control commands when it determines AUTOPILOT is necessary and safe.
+% CARLA_UDP_RECEIVER - Finalized supervisory controller for CARLA.
 
     % --- Configuration ---
     if nargin < 1
         port = 10000;
     end
-    COMMAND_PORT = 10001; % Port to send commands back to Python
-    HISTORY_LENGTH = 100; % Number of historical data points for plots
-    
-    % MODIFIED: FDIR rate increased to meet the <100ms fault detection requirement.
-    % 20 Hz gives a 50ms cycle time, well within the spec.
+    COMMAND_PORT = 10001;
+    HISTORY_LENGTH = 100;
     FDIR_RATE_HZ = 20;     
-
-    % --- Global Outputs for External Access ---
+    
+    % --- Global Outputs and State ---
     global carla_outputs;
     carla_outputs = struct(); 
+    
+    persistent matlab_control_mode handover_requested_time handoff_confirmed;
+    if isempty(matlab_control_mode)
+        matlab_control_mode = 'MANUAL'; % States: MANUAL, AWAITING_CONFIRMATION, AUTOPILOT
+        handover_requested_time = tic;
+        handoff_confirmed = false;
+    end
 
     is_running = true;
     fdirTimer = [];
@@ -31,6 +32,7 @@ function carla_udp_receiver(port)
         u = udpport("IPV4", "LocalPort", port, "Timeout", 1, "EnablePortSharing", true);
         u.InputBufferSize = 2000000;
         logToDashboard(uiHandles, sprintf('UDP Receiver started on port %d.', port));
+        
         command_sender_udp = udpport("datagram");
         logToDashboard(uiHandles, sprintf('UDP Command Sender targeting 127.0.0.1:%d.', COMMAND_PORT));
     catch ME
@@ -54,13 +56,12 @@ function carla_udp_receiver(port)
         is_running = false;
     end
     
-    % --- Data Storage and State Initialization ---
+    % --- Data Storage and Initialization ---
     trajectory = nan(HISTORY_LENGTH * 5, 2);
     gnss_track = nan(HISTORY_LENGTH * 5, 2);
     imu_history = struct('x', nan(1, HISTORY_LENGTH), 'y', nan(1, HISTORY_LENGTH), 'z', nan(1, HISTORY_LENGTH));
     buffer = '';
     last_message_time = tic;
-    matlab_control_mode = 'MANUAL';
     
     % --- Main Loop ---
     logToDashboard(uiHandles, 'Waiting for data from CARLA...');
@@ -75,9 +76,7 @@ function carla_udp_receiver(port)
             newData = native2unicode(byteData, 'UTF-8');
             buffer = [buffer, newData];
             last_message_time = tic;
-            
-            % This delimiter handles multiple JSONs in one UDP read, but the
-            % chunking logic inside processPacket handles the reassembly.
+
             delimiter = '|||JSON_DELIMITER|||';
             sanitizedBuffer = strrep(buffer, '}{', ['}' delimiter '{']);
             jsonObjects = strsplit(sanitizedBuffer, delimiter);
@@ -91,14 +90,13 @@ function carla_udp_receiver(port)
                 jsonStr = jsonObjects{i};
                 if isempty(jsonStr), continue; end
                 try
-                    packet = jsondecode(jsonStr);
+                    [packet, handoff_confirmed] = jsondecode_wrapper(jsonStr, handoff_confirmed);
+                    if isempty(packet), continue; end % Skip ACK/CONFIRM packets
                     processed_frame = processPacket(packet); 
                     if ~isempty(processed_frame)
                         latest_frame_to_render = processed_frame;
                     end
                 catch ME
-                    % This catch is now a secondary fallback. The robust
-                    % processPacket function should prevent most of these.
                     logToDashboard(uiHandles, sprintf('[WARN] JSON decode failed: %s', ME.message));
                 end
             end
@@ -107,19 +105,50 @@ function carla_udp_receiver(port)
         if ~isempty(latest_frame_to_render)
             frame_data = latest_frame_to_render;
             [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, trajectory, gnss_track, imu_history);
-            
             dt = processAndAnalyzeFrame(frame_data, toc(last_message_time));
+            
             current_mode_from_python = get_safe(frame_data, 'mode', 'MANUAL');
-
+            
             if exist('fuzzy_bbna.m', 'file')
                 [fuzzy_decision, score] = fuzzy_bbna(carla_outputs, current_mode_from_python);
             else, fuzzy_decision = 'MANUAL'; score = 0; end
 
             if exist('ModeController.m', 'file')
-                [new_mode, vehicle_command] = ModeController(fuzzy_decision, matlab_control_mode, carla_outputs, dt);
-            else, new_mode = 'MANUAL'; vehicle_command = struct('steer',0,'throttle',0,'brake',1); end
-            matlab_control_mode = new_mode;
-            send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
+                [desired_mode, vehicle_command] = ModeController(fuzzy_decision, matlab_control_mode, carla_outputs, dt);
+            else, desired_mode = 'MANUAL'; vehicle_command = struct('steer',0,'throttle',0,'brake',1); end
+
+            switch matlab_control_mode
+                case 'MANUAL'
+                    if strcmp(desired_mode, 'AUTOPILOT')
+                        logToDashboard(uiHandles, '[STATE] Conditions met for handover. Requesting confirmation from driver...');
+                        matlab_control_mode = 'AWAITING_CONFIRMATION';
+                        handover_requested_time = tic;
+                        send_simple_command_to_carla(command_sender_udp, 'REQUEST_REMOTE_HANDOVER', 'All checks passed', COMMAND_PORT);
+                    end
+                
+                case 'AWAITING_CONFIRMATION'
+                    if handoff_confirmed
+                        logToDashboard(uiHandles, '[STATE] Handover confirmed by driver! Engaging AUTOPILOT.');
+                        matlab_control_mode = 'AUTOPILOT';
+                        handoff_confirmed = false;
+                    elseif toc(handover_requested_time) > 10
+                        logToDashboard(uiHandles, '[STATE-WARN] Handover request timed out. Reverting to MANUAL.');
+                        matlab_control_mode = 'MANUAL';
+                    elseif strcmp(desired_mode, 'MANUAL')
+                        logToDashboard(uiHandles, '[STATE] Handover cancelled. Reverting to MANUAL.');
+                        matlab_control_mode = 'MANUAL';
+                    end
+
+                case 'AUTOPILOT'
+                    if strcmp(desired_mode, 'MANUAL')
+                        logToDashboard(uiHandles, '[STATE] Conditions no longer met for AUTOPILOT. Disengaging.');
+                        matlab_control_mode = 'MANUAL';
+                    end
+            end
+            
+            if strcmp(matlab_control_mode, 'AUTOPILOT')
+                send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
+            end
             
             carla_outputs.fuzzy_decision = fuzzy_decision;
             carla_outputs.fuzzy_desirability_score = score;
@@ -136,6 +165,8 @@ function carla_udp_receiver(port)
     if exist('u','var') && isvalid(u), delete(u); end
     if ~isempty(command_sender_udp) && isvalid(command_sender_udp), delete(command_sender_udp); end
     if ishandle(uiHandles.fig), delete(uiHandles.fig); end
+    clearvars -global carla_outputs;
+    clearvars -persistent matlab_control_mode handover_requested_time handoff_confirmed;
 
     function onCloseRequest(~, ~)
         is_running = false;
@@ -230,7 +261,7 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     v2v_data = get_safe(data, 'V2V_Data', []); if ~isempty(v2v_data), num_vehicles = numel(v2v_data); v2v_x = nan(num_vehicles, 1); v2v_y = nan(num_vehicles, 1); for i = 1:num_vehicles, v2v_x(i) = v2v_data(i).position.x; v2v_y(i) = v2v_data(i).position.y; end; set(uiHandles.v2vPlot, 'XData', v2v_x, 'YData', v2v_y); else, set(uiHandles.v2vPlot, 'XData', NaN, 'YData', NaN); end
     v2i_data = get_safe(data, 'V2I_Data', struct()); if isfield(v2i_data, 'traffic_light_state') && ~isempty(v2i_data.traffic_light_state), state = v2i_data.traffic_light_state; uiHandles.trafficLightLabel.Text = state; switch upper(state), case 'RED', uiHandles.trafficLightLabel.FontColor = [1, 0.2, 0.2]; case 'YELLOW', uiHandles.trafficLightLabel.FontColor = [1, 0.9, 0]; case 'GREEN', uiHandles.trafficLightLabel.FontColor = [0.2, 1, 0.2]; otherwise, uiHandles.trafficLightLabel.FontColor = [0.8, 0.8, 0.8]; end; else, uiHandles.trafficLightLabel.Text = 'N/A'; uiHandles.trafficLightLabel.FontColor = [0.9, 0.9, 0.9]; end
     if isfield(outputs, 'fuzzy_decision'), decision_text = sprintf('%s (%.1f)', outputs.fuzzy_decision, outputs.fuzzy_desirability_score); uiHandles.fuzzyDecisionLabel.Text = strrep(decision_text, '_', ' '); switch outputs.fuzzy_decision, case 'AUTOPILOT', uiHandles.fuzzyDecisionLabel.FontColor = [0.2, 1, 0.2]; case 'MANUAL', uiHandles.fuzzyDecisionLabel.FontColor = [1, 0.2, 0.2]; otherwise, uiHandles.fuzzyDecisionLabel.FontColor = [0.9, 0.9, 0.9]; end; end
-    if isfield(outputs, 'matlab_commanded_mode'), mode_text = outputs.matlab_commanded_mode; uiHandles.matlabModeLabel.Text = strrep(mode_text, '_', ' '); switch mode_text, case 'AUTOPILOT', uiHandles.matlabModeLabel.FontColor = [0.2, 1, 0.2]; case 'MANUAL', uiHandles.matlabModeLabel.FontColor = [1, 0.9, 0]; otherwise, uiHandles.matlabModeLabel.FontColor = [0.9, 0.9, 0.9]; end; end
+    if isfield(outputs, 'matlab_commanded_mode'), mode_text = outputs.matlab_commanded_mode; uiHandles.matlabModeLabel.Text = strrep(mode_text, '_', ' '); switch mode_text, case 'AUTOPILOT', uiHandles.matlabModeLabel.FontColor = [0.2, 1, 0.2]; case 'MANUAL', uiHandles.matlabModeLabel.FontColor = [1, 0.9, 0]; case 'AWAITING_CONFIRMATION', uiHandles.matlabModeLabel.FontColor = [0.2, 0.8, 1]; otherwise, uiHandles.matlabModeLabel.FontColor = [0.9, 0.9, 0.9]; end; end
 end
 
 function [trajectory, gnss_track, imu_history] = updateDataHistories(data, trajectory, gnss_track, imu_history)
@@ -288,24 +319,41 @@ end
 %                        NETWORK & UTILITY FUNCTIONS
 % ========================================================================
 function send_control_to_carla(udp_sender, command, port)
+    persistent command_id;
+    if isempty(command_id), command_id = 0; end
+    
     if ~isempty(udp_sender) && isvalid(udp_sender)
-        packet = struct('command', 'SET_VEHICLE_CONTROL', 'control', command);
+        packet = struct(...
+            'command', 'SET_VEHICLE_CONTROL', ...
+            'control', command, ...
+            'command_id', command_id, ...
+            'api_key', 'SECRET_CARLA_KEY_123');
+        json_packet = jsonencode(packet);
+        write(udp_sender, json_packet, "char", "127.0.0.1", port);
+        command_id = command_id + 1;
+    end
+end
+
+function send_simple_command_to_carla(udp_sender, command_type, reason, port)
+    if ~isempty(udp_sender) && isvalid(udp_sender)
+        packet = struct(...
+            'command', command_type, ...
+            'reason', reason, ...
+            'api_key', 'SECRET_CARLA_KEY_123');
         json_packet = jsonencode(packet);
         write(udp_sender, json_packet, "char", "127.0.0.1", port);
     end
 end
 
 function full_data = processPacket(packet)
-% MODIFIED: Robust chunk reassembly to handle out-of-order/lost UDP packets.
     persistent chunkBuffer;
     if isempty(chunkBuffer)
         chunkBuffer = containers.Map('KeyType', 'double', 'ValueType', 'any');
     end
     
     full_data = [];
-    PACKET_TIMEOUT_S = 1.0; % Discard incomplete frames after 1 second.
+    PACKET_TIMEOUT_S = 1.0;
     
-    % --- Part 1: Clean up stale, incomplete frames ---
     keys_to_remove = {};
     all_keys = keys(chunkBuffer);
     for i = 1:length(all_keys)
@@ -318,12 +366,9 @@ function full_data = processPacket(packet)
         remove(chunkBuffer, keys_to_remove);
     end
 
-    % --- Part 2: Process the incoming packet ---
     if isfield(packet, 'chunk')
-        % This is a chunked packet
         frameId = packet.frame;
         
-        % Initialize buffer for this frame ID if it's new
         if ~isKey(chunkBuffer, frameId)
             chunkBuffer(frameId) = struct(...
                 'chunks', {cell(1, packet.total_chunks)}, ...
@@ -332,7 +377,6 @@ function full_data = processPacket(packet)
             );
         end
         
-        % Store the chunk data if the slot is empty (prevents duplicates)
         frame_buffer = chunkBuffer(frameId);
         if isempty(frame_buffer.chunks{packet.chunk + 1})
             frame_buffer.chunks{packet.chunk + 1} = packet.data;
@@ -340,21 +384,38 @@ function full_data = processPacket(packet)
             chunkBuffer(frameId) = frame_buffer;
         end
         
-        % Check if all chunks for this frame have now arrived
         if frame_buffer.received_chunks == packet.total_chunks
             full_json_string = strjoin(frame_buffer.chunks, '');
             try
                 full_data = jsondecode(full_json_string);
             catch
-                full_data = []; % Failed to decode, return empty
+                full_data = [];
             end
-            remove(chunkBuffer, frameId); % Clean up the completed frame
+            remove(chunkBuffer, frameId);
         end
     else
-        % This is a simple, non-chunked packet
         full_data = packet;
     end
 end
+
+function [s, handoff_confirmed_out] = jsondecode_wrapper(json_str, handoff_confirmed_in)
+    s = jsondecode(json_str);
+    handoff_confirmed_out = handoff_confirmed_in;
+    
+    if isfield(s, 'type') && strcmp(s.type, 'ack')
+        s = []; % Return empty so it's not processed as a data frame
+        return;
+    end
+    
+    if isfield(s, 'command') && strcmp(s.command, 'CONFIRM_REMOTE_HANDOVER')
+        if isfield(s, 'api_key') && strcmp(s.api_key, 'SECRET_CARLA_KEY_123')
+            handoff_confirmed_out = true;
+        end
+        s = []; % Return empty
+        return;
+    end
+end
+
 
 function logToDashboard(uiHandles, message)
     if ~isvalid(uiHandles.fig), return; end
