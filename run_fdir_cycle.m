@@ -4,12 +4,11 @@ function run_fdir_cycle(command_sender)
 % struct for critical system-level faults.
 %
 % This version:
-% 1. Detects faults based on latency and system health.
+% 1. Detects faults based on overall system health.
 % 2. Commands the vehicle to enter a safe mode upon fault detection.
 % 3. Controls the 'fallback_initiation' flag for UI display.
 
     % --- Configuration: Fault Thresholds ---
-    LATENCY_THRESHOLD_S = 0.2;  % 200 milliseconds
     HEALTH_THRESHOLD = 0.75;    % 75% health
 
     global carla_outputs;
@@ -21,18 +20,7 @@ function run_fdir_cycle(command_sender)
     
     % --- Fault Detection Logic ---
     
-    % 1. Check for high network latency
-    if isfield(carla_outputs, 'network_status') && isfield(carla_outputs.network_status, 'latency')
-        if carla_outputs.network_status.latency > LATENCY_THRESHOLD_S
-            % FAULT DETECTED: Set the flag and command safe mode.
-            carla_outputs.fallback_initiation = true;
-            reason = sprintf('High Network Latency detected (%.0fms)', carla_outputs.network_status.latency * 1000);
-            command_switch_to_safe_mode(command_sender, reason);
-            return; % A fault was found, exit cycle.
-        end
-    end
-
-    % 2. Check for low overall system health
+    % Check for low overall system health
     if isfield(carla_outputs, 'sensor_fusion_status') && isfield(carla_outputs.sensor_fusion_status, 'health_score')
         if carla_outputs.sensor_fusion_status.health_score < HEALTH_THRESHOLD
             % FAULT DETECTED: Set the flag and command safe mode.
