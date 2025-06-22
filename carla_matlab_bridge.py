@@ -575,6 +575,39 @@ class CarlaSimulation:
             if traffic_light: v2i_data['traffic_light_state'] = str(traffic_light.get_state()); v2i_data['traffic_light_id'] = traffic_light.id
         return v2i_data
 
+    def _gather_lane_waypoints(self, lookahead_distance: float = 50.0, step_distance: float = 2.0) -> Optional[List[List[float]]]:
+        """
+        Generates a list of [x, y] coordinates for the lane centerline ahead of the vehicle.
+        This data is crucial for the MATLAB path planner.
+        """
+        if not self.vehicle or not self.world:
+            return None
+        
+        try:
+            vehicle_location = self.vehicle.get_location()
+            current_waypoint = self.world.get_map().get_waypoint(vehicle_location, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if not current_waypoint:
+                return None # Vehicle is not on a drivable lane
+
+            waypoints = [[current_waypoint.transform.location.x, current_waypoint.transform.location.y]]
+            
+            total_distance = 0.0
+            next_waypoint = current_waypoint
+            while total_distance < lookahead_distance:
+                next_waypoints_list = next_waypoint.next(step_distance)
+                if not next_waypoints_list:
+                    break # Reached the end of the road
+                
+                next_waypoint = next_waypoints_list[0] # In case of forks, just pick the first one
+                loc = next_waypoint.transform.location
+                waypoints.append([loc.x, loc.y])
+                total_distance += step_distance
+            return waypoints
+        except Exception as e:
+            # This can happen if the map changes or vehicle is destroyed mid-tick.
+            print(f"[WARN] Could not generate lane waypoints: {e}")
+            return None
+            
     def _send_udp_data(self, snapshot):
         t=self.vehicle.get_transform(); v=self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
@@ -591,6 +624,8 @@ class CarlaSimulation:
             'ekf_covariance':self.kalman_filter.kf.P.tolist() if self.kalman_filter else None,
             'sensor_health': health_data, 'collisions': self.collision_count, 'lane_invasions': self.lane_invasion_count,
             'Detected_Obstacles': self.detected_obstacles, 'V2V_Data': self._gather_v2v_data(), 'V2I_Data': self._gather_v2i_data(),
+            # MODIFIED: Add the real lane waypoint data needed by the MATLAB controller
+            'lane_waypoints': self._gather_lane_waypoints(),
         }
         for name, sensor_list in self.sensors.items():
             active_sensor = sensor_list[self.active_sensor_indices.get(name, 0)]
