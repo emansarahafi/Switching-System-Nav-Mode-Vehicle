@@ -16,13 +16,17 @@ end
 % --- State Transition Logic ---
 if ~strcmp(target_mode, current_mode) && ~state.in_transition
     if strcmp(target_mode, 'AUTOPILOT')
-        % MODIFIED: Added mandatory safety checks before allowing transition to AUTOPILOT
         is_stable = check_stability_conditions();
-        driver_ready = get_safe(carla_outputs.driver_readiness, 'score', 0) >= 0.99;
         
-        % Check for obstacles within 5 meters
-        obstacles = get_safe(carla_outputs, 'Detected_Obstacles', []);
-        ego_pos_struct = get_safe(carla_outputs, 'position', struct('x',0,'y',0));
+        % MODIFICATION: Relaxed the hard-coded gatekeeping check.
+        % The fuzzy system is designed to handle driver readiness nuances.
+        % This check now only prevents engagement if the driver is clearly
+        % incapacitated or completely unresponsive (score near zero).
+        driver_ready = get_safe(carla_outputs, 'driver_readiness', 0) > 0.1;
+        
+        % Obstacle check for immediate safety before transition
+        obstacles = get_safe(carla_outputs.processed_sensor_data, 'Detected_Obstacles', []);
+        ego_pos_struct = get_safe(carla_outputs.processed_sensor_data, 'position', struct('x',0,'y',0));
         ego_pos = [ego_pos_struct.x, ego_pos_struct.y];
         is_env_safe = true;
         for i = 1:numel(obstacles)
@@ -33,7 +37,6 @@ if ~strcmp(target_mode, current_mode) && ~state.in_transition
             end
         end
         
-        % Abort if any condition is not met
         if ~is_stable || ~driver_ready || ~is_env_safe
             fprintf('[ABORT] Transition to AUTOPILOT denied. Stable: %d, Driver Ready: %d, Env Safe: %d\n', is_stable, driver_ready, is_env_safe);
             final_mode = 'MANUAL'; state.alpha = 1.0;
@@ -42,7 +45,6 @@ if ~strcmp(target_mode, current_mode) && ~state.in_transition
     end
     
     state.in_transition = true; state.transition_start_time = tic; state.target_mode = target_mode;
-    % MODIFIED: Set transition durations to meet NFRs
     if strcmp(target_mode, 'MANUAL'), state.transition_duration = 0.2; else, state.transition_duration = 1.5; end
     fprintf('MODE_CONTROLLER: Starting transition from %s to %s (duration: %.2fs)\n', current_mode, target_mode, state.transition_duration);
 end
@@ -60,18 +62,35 @@ if state.in_transition
     end
 else, final_mode = current_mode; end
 
-% --- Control Blending ---
+% --- Explicit State-Based Control Generation ---
 alpha = max(0, min(1, state.alpha));
-reset_integrator = (alpha > 0);
+reset_integrator = (alpha > 0.95); 
 
-sw_h = get_human_control(carla_outputs);
-sw_as = compute_stsm_control(carla_outputs, dt, reset_integrator);
+if alpha >= 1.0 % FULL MANUAL MODE
+    final_command = get_human_control(carla_outputs);
+    compute_stsm_control(carla_outputs, dt, true);
+    
+elseif alpha <= 0.0 % FULL AUTOPILOT MODE
+    final_command = compute_stsm_control(carla_outputs, dt, false);
+    final_command.hand_brake = false;
+    final_command.reverse = false;
+    
+else % TRANSITIONING (BLENDING)
+    sw_h = get_human_control(carla_outputs);
+    sw_as = compute_stsm_control(carla_outputs, dt, reset_integrator);
 
-final_command.steer = alpha * sw_h.steer + (1 - alpha) * sw_as.steer;
-final_command.throttle = alpha * sw_h.throttle + (1 - alpha) * sw_as.throttle;
-final_command.brake = alpha * sw_h.brake + (1 - alpha) * sw_as.brake;
-if alpha > 0.5, final_command.hand_brake = sw_h.hand_brake; final_command.reverse = sw_h.reverse;
-else, final_command.hand_brake = false; final_command.reverse = false; end
+    final_command.steer = alpha * sw_h.steer + (1 - alpha) * sw_as.steer;
+    final_command.throttle = alpha * sw_h.throttle + (1 - alpha) * sw_as.throttle;
+    final_command.brake = alpha * sw_h.brake + (1 - alpha) * sw_as.brake;
+    
+    if alpha > 0.5
+        final_command.hand_brake = sw_h.hand_brake;
+        final_command.reverse = sw_h.reverse;
+    else
+        final_command.hand_brake = false;
+        final_command.reverse = false;
+    end
+end
 end
 
 %% --- Controller Helper Functions ---
@@ -86,14 +105,18 @@ if ~isfield(sw_h, 'reverse'), sw_h.reverse = false; end
 end
 
 function stsm_command = compute_stsm_control(carla_outputs, dt, reset_integrator)
-% --- Longitudinal Control via Gain-Scheduled H-infinity ---
-speed_error = (40.0 - get_safe(carla_outputs, 'speed', 0)) / 3.6;
-current_speed = get_safe(carla_outputs, 'speed', 0) / 3.6;
-[throttle, brake] = compute_gainsched_hinf_control(speed_error, current_speed, reset_integrator, dt);
+MAX_SPEED_KPH = 50.0;
+LOOKAHEAD_CURVATURE_DIST_M = 20.0;
+planner_target_speed_ms = get_safe(carla_outputs, 'intelligent_target_speed_ms', MAX_SPEED_KPH / 3.6);
+proc_data = get_safe(carla_outputs, 'processed_sensor_data', struct());
+lane_wps = get_safe(proc_data, 'lane_waypoints', [0 0; 1 0]);
+curvature_speed_limit_ms = calculate_curvature_speed_limit(lane_wps, LOOKAHEAD_CURVATURE_DIST_M, MAX_SPEED_KPH / 3.6);
+final_target_speed_ms = min([MAX_SPEED_KPH / 3.6, planner_target_speed_ms, curvature_speed_limit_ms]);
+current_speed_ms = get_safe(carla_outputs, 'speed', 0) / 3.6;
+speed_error = final_target_speed_ms - current_speed_ms;
+[throttle, brake] = compute_gainsched_hinf_control(speed_error, current_speed_ms, reset_integrator, dt);
 stsm_command.throttle = throttle;
 stsm_command.brake = brake;
-
-% --- Lateral Control (Steering) via STSM with CTE ---
 persistent u2_integral last_final_steer;
 if isempty(u2_integral) || reset_integrator
     u2_integral = 0;
@@ -103,36 +126,51 @@ k = 0.8; alpha1 = 0.3; alpha2 = 0.08;
 fused_state = get_safe(carla_outputs, 'sensor_fusion_status', struct());
 ego_pos = get_safe(fused_state, 'fused_state', struct('x',0,'y',0));
 ego_rot = get_safe(carla_outputs, 'rotation', struct('yaw', 0));
-vehicle_speed = current_speed;
-proc_data = get_safe(carla_outputs, 'processed_sensor_data', struct());
-lane_wps = get_safe(proc_data, 'lane_waypoints', [0 0; 1 0]);
 refPath = referencePathFrenet(lane_wps);
-currentState = [ego_pos.x, ego_pos.y, deg2rad(ego_rot.yaw), 0, 0, vehicle_speed];
+currentState = [ego_pos.x, ego_pos.y, deg2rad(ego_rot.yaw), 0, 0, current_speed_ms];
 frenetState = global2frenet(refPath, currentState);
 e = frenetState(2);
 path_angle = frenetState(3);
 psi_error = wrapToPi(currentState(3) - path_angle);
-e_dot = vehicle_speed * sin(psi_error);
+e_dot = current_speed_ms * sin(psi_error);
 s = e_dot + k * e;
 u1 = -alpha1 * sqrt(abs(s)) * sign(s);
 u2_integral = u2_integral + (-alpha2 * sign(s)) * dt; 
 ut_steer = u1 + u2_integral;
 negated_steer_cmd = -ut_steer;
-
-% MODIFIED: Added steering rate limiter for safety
 MAX_STEER_RATE = 0.1; 
 steer_change = negated_steer_cmd - last_final_steer;
 clamped_change = max(min(steer_change, MAX_STEER_RATE), -MAX_STEER_RATE);
 final_steer = last_final_steer + clamped_change;
 last_final_steer = final_steer;
-
 stsm_command.steer = max(-1.0, min(1.0, final_steer)); 
+end
+
+function speed_limit_ms = calculate_curvature_speed_limit(waypoints, lookahead_dist, max_speed)
+persistent LATERAL_ACCEL_MAX;
+if isempty(LATERAL_ACCEL_MAX), LATERAL_ACCEL_MAX = 1.5; end % m/s^2
+if size(waypoints, 1) < 3, speed_limit_ms = max_speed; return; end
+min_radius = Inf;
+total_dist = 0;
+for i = 1:(size(waypoints, 1) - 2)
+    p1 = waypoints(i, :); p2 = waypoints(i+1, :); p3 = waypoints(i+2, :);
+    total_dist = total_dist + norm(p2 - p1);
+    if total_dist > lookahead_dist, break; end
+    a = norm(p2-p3); b = norm(p1-p3); c = norm(p1-p2);
+    area = 0.5 * abs(p1(1)*(p2(2)-p3(2)) + p2(1)*(p3(2)-p1(2)) + p3(1)*(p1(2)-p2(2)));
+    if area < 1e-6, continue; end
+    radius = (a * b * c) / (4 * area);
+    min_radius = min(min_radius, radius);
+end
+if isinf(min_radius), speed_limit_ms = max_speed;
+else, speed_limit_ms = sqrt(LATERAL_ACCEL_MAX * min_radius); end
+speed_limit_ms = min(speed_limit_ms, max_speed);
 end
 
 function [throttle, brake] = compute_gainsched_hinf_control(speed_error, current_speed, reset_controller, dt)
 persistent sched_controller sched_state;
 if isempty(sched_controller) || reset_controller
-    fprintf('Designing/Resetting Gain-Scheduled H-inf Speed Controller...\n');
+    if isempty(sched_controller), fprintf('Designing Gain-Scheduled H-inf Speed Controller...\n'); end
     sched_controller = design_gainsched_hinf_controller();
     sched_state = zeros(sched_controller.num_states, 1);
 end

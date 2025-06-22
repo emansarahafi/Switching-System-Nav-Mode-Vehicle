@@ -113,7 +113,11 @@ function carla_udp_receiver(port)
             end
 
             % ModeController makes the final decision and generates control commands
-            [new_mode, vehicle_command] = ModeController(fuzzy_decision, matlab_control_mode, carla_outputs, dt);
+            if exist('ModeController.m', 'file')
+                [new_mode, vehicle_command] = ModeController(fuzzy_decision, matlab_control_mode, carla_outputs, dt);
+            else
+                new_mode = 'MANUAL'; vehicle_command = struct('steer',0,'throttle',0,'brake',1);
+            end
             matlab_control_mode = new_mode;
             send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
             
@@ -232,7 +236,7 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     if isfield(outputs, 'network_status'), uiHandles.latencyLabel.Text = sprintf('%.1f ms', outputs.network_status.latency * 1000); end
     if isfield(outputs, 'sensor_fusion_status'), uiHandles.healthLabel.Text = sprintf('%.0f%%', outputs.sensor_fusion_status.health_score * 100); end
     if isfield(outputs, 'fallback_initiation'), if outputs.fallback_initiation, uiHandles.fallbackLabel.Text = 'TRIGGERED'; uiHandles.fallbackLabel.FontColor = 'r'; else, uiHandles.fallbackLabel.Text = 'IDLE'; uiHandles.fallbackLabel.FontColor = 'g'; end; end
-    if isfield(outputs, 'system_confidence'), conf = outputs.system_confidence; uiHandles.confidenceLabel.Text = conf.status_text; if conf.score > 0.8, uiHandles.confidenceLabel.FontColor = [0.2 1 0.2]; elseif conf.score > 0.5, uiHandles.confidenceLabel.FontColor = [1 0.9 0]; else, uiHandles.confidenceLabel.FontColor = [1 0.2 0.2]; end; end
+    if isfield(outputs, 'system_confidence'), conf = outputs.system_confidence; uiHandles.confidenceLabel.Text = strrep(conf.status_text, '_', ' '); if conf.score > 0.8, uiHandles.confidenceLabel.FontColor = [0.2 1 0.2]; elseif conf.score > 0.5, uiHandles.confidenceLabel.FontColor = [1 0.9 0]; else, uiHandles.confidenceLabel.FontColor = [1 0.2 0.2]; end; end
     updateCamera(uiHandles.camFrontAx, data, 'image_front'); updateCamera(uiHandles.camRearAx, data, 'image_back'); updateCamera(uiHandles.camLeftAx, data, 'image_left'); updateCamera(uiHandles.camRightAx, data, 'image_right'); updateCamera(uiHandles.camInteriorAx, data, 'image_interior');
     if isfield(data, 'lidar_roof') && ~isempty(data.lidar_roof), try, points = typecast(base64decode(data.lidar_roof), 'single'); if mod(numel(points), 4) == 0, points = reshape(points, 4, [])'; xyz = points(1:20:end, 1:3); set(uiHandles.lidarPlot, 'XData', xyz(:,1), 'YData', xyz(:,2), 'ZData', xyz(:,3), 'CData', xyz(:,3)); end; catch; end; end
     obstacles = get_safe(data, 'Detected_Obstacles', []); if ~isempty(obstacles), num_obstacles = numel(obstacles); obs_x = nan(num_obstacles, 1); obs_y = nan(num_obstacles, 1); obs_z = nan(num_obstacles, 1); for i = 1:num_obstacles, obs_x(i) = obstacles(i).position.x; obs_y(i) = obstacles(i).position.y; obs_z(i) = obstacles(i).position.z; end; set(uiHandles.obstaclePlot, 'XData', obs_x, 'YData', obs_y, 'ZData', obs_z); else, set(uiHandles.obstaclePlot, 'XData', NaN, 'YData', NaN, 'ZData', NaN); end
@@ -252,36 +256,57 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency)
     global carla_outputs;
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
     if isempty(last_call_timer), time_since_last = 1/20; last_call_timer = tic; else, time_since_last = toc(last_call_timer); last_call_timer = tic; end
+    
+    % --- Core Data Extraction ---
     network_status = struct('latency', latency, 'data_rate', 1 / max(time_since_last, 0.001));
     [health_score, sensor_health_data] = computeSensorHealth(frame);
     covariance_trace = computeEkfUncertainty(frame);
     sensor_fusion_status = struct('fused_state', get_safe(frame, 'fused_state', struct()), 'position_uncertainty', covariance_trace, 'health_score', health_score, 'raw_health', sensor_health_data);
     processed_sensor_data = extractRawSensorData(frame);
-    processed_sensor_data.Weather_Severity = computeWeatherSeverity(frame);
-    processed_sensor_data.Obstacle_Density = computeObstacleDensity(frame);
+    
+    % --- Call Improved, Data-Driven Analysis Functions ---
+    weather_severity = computeWeatherSeverity(frame);
+    threat_level = computeThreatLevel(frame);
+    simple_density = computeSimpleObstacleDensity(frame); % Legacy for fuzzy_bbna
+    system_confidence = computeSystemConfidence(health_score, covariance_trace, threat_level, weather_severity);
+    
+    processed_sensor_data.Weather_Severity = weather_severity;
+    processed_sensor_data.Obstacle_Threat = threat_level;
+    processed_sensor_data.Obstacle_Density = simple_density; 
+    
+    % --- Event & State Change Detection ---
     rotation_data = get_safe(frame, 'rotation', struct('yaw', 0)); current_yaw = rotation_data.yaw; if isempty(last_yaw), last_yaw = current_yaw; end
     yaw_delta = current_yaw - last_yaw; if yaw_delta > 180, yaw_delta = yaw_delta - 360; end; if yaw_delta < -180, yaw_delta = yaw_delta + 360; end
     processed_sensor_data.yaw_rate = yaw_delta / max(time_since_last, 0.001); last_yaw = current_yaw;
+    
     current_collisions = get_safe(frame, 'collisions', 0); if isempty(last_collisions), last_collisions = current_collisions; end
     processed_sensor_data.is_collision_event = (current_collisions > last_collisions); last_collisions = current_collisions;
+    
     current_lane_invasions = get_safe(frame, 'lane_invasions', 0); if isempty(last_lane_invasions), last_lane_invasions = current_lane_invasions; end
-    processed_sensor_data.is_lane_invasion_event = (current_lane_invasions > last_lane_invasions); last_lane_invasions = current_lane_invasions;
+    is_lane_invasion = (current_lane_invasions > last_lane_invasions);
+    processed_sensor_data.is_lane_invasion_event = is_lane_invasion; last_lane_invasions = current_lane_invasions;
+
+    % --- Call Improved Driver State Functions ---
+    driver_attention = computeDriverAttention(frame, is_lane_invasion);
+    driver_readiness = computeDriverReadiness(frame, driver_attention, threat_level);
+
+    % --- Call Improved Path Planner ---
     ego_pos = get_safe(frame, 'fused_state', struct('x',0,'y',0));
     ego_rot = get_safe(frame, 'rotation', struct('yaw',0));
     ego_speed_ms = get_safe(frame, 'speed', 0) / 3.6;
-    % --- MODIFIED: Pass real lane data to path planner ---
-    % Assumes that the incoming 'frame' data may contain a 'lane_waypoints'
-    % field with a list of [X,Y] coordinates for the lane centerline.
     real_lane_data = get_safe(frame, 'lane_waypoints', []);
-    processed_sensor_data.lane_waypoints = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms, real_lane_data);
-    driver_attention = computeDriverAttention(frame);
-    driver_readiness = computeDriverReadiness(frame);
+    v2i_data = get_safe(frame, 'V2I_Data', struct());
+    [planned_waypoints, intelligent_target_speed] = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms, real_lane_data, v2i_data, threat_level);
+    processed_sensor_data.lane_waypoints = planned_waypoints;
+
+    % --- Store all outputs for global access ---
     carla_outputs.network_status = network_status;
     carla_outputs.sensor_fusion_status = sensor_fusion_status;
     carla_outputs.processed_sensor_data = processed_sensor_data;
     carla_outputs.driver_attention = driver_attention;
     carla_outputs.driver_readiness = driver_readiness;
-    carla_outputs.system_confidence = computeSystemConfidence(frame);
+    carla_outputs.system_confidence = system_confidence;
+    carla_outputs.intelligent_target_speed_ms = intelligent_target_speed; % Pass to ModeController
     carla_outputs.control = get_safe(frame, 'control', struct());
     carla_outputs.speed = get_safe(frame, 'speed', 0);
     carla_outputs.rotation = get_safe(frame, 'rotation', struct());
@@ -323,41 +348,212 @@ function updateCamera(ax, data, fieldName)
     end
 end
 
-function confidence = computeSystemConfidence(frame)
-    confidence.score = 1.0; confidence.status_text = 'NOMINAL';
-    min_dist_v2v = findClosestV2VThreat(frame);
-    min_dist_radar = inf; radar_data = get_safe(frame, 'radar_front', []);
-    if isstruct(radar_data), for i=1:numel(radar_data), if abs(radar_data(i).az) < 0.2 && radar_data(i).depth < min_dist_radar, min_dist_radar = radar_data(i).depth; end; end; end
-    if min_dist_v2v < 20 && min_dist_radar > 50, confidence.score = 0.2; confidence.status_text = 'V2V/Radar Mismatch (Radar Blind)'; return; end
-    if min_dist_radar < 20 && min_dist_v2v > 50, confidence.score = 0.4; confidence.status_text = 'V2V/Radar Mismatch (V2V Missing)'; return; end
+%% =======================================================================
+%                    IMPROVED ANALYSIS & PERCEPTION FUNCTIONS
+% ========================================================================
+
+function density = computeSimpleObstacleDensity(frame)
+% This is the original, simple logic required by fuzzy_bbna.m.
+% It counts the number of obstacles within a fixed 50m radius.
+    density = 0;
+    obstacles = get_safe(frame, 'Detected_Obstacles', []);
+    ego_pos = get_safe(frame, 'position', struct('x', 0, 'y', 0, 'z', 0));
+    if isempty(obstacles) || ~isfield(ego_pos, 'x'), return; end
+    
+    for i = 1:numel(obstacles)
+        dist = sqrt((obstacles(i).position.x - ego_pos.x)^2 + (obstacles(i).position.y - ego_pos.y)^2);
+        if dist < 50
+            density = density + 1;
+        end
+    end
 end
 
-function closest_dist = findClosestV2VThreat(frame)
-    closest_dist = inf; v2v_data = get_safe(frame, 'V2V_Data', []); ego_pos = get_safe(frame, 'position', []); ego_rot = get_safe(frame, 'rotation', []); if isempty(v2v_data) || isempty(ego_pos) || isempty(ego_rot), return; end
-    ego_yaw_rad = deg2rad(ego_rot.yaw); forward_vec = [cos(ego_yaw_rad), sin(ego_yaw_rad)];
-    for i = 1:numel(v2v_data), v = v2v_data(i); rel_pos_vec = [v.position.x - ego_pos.x, v.position.y - ego_pos.y]; dot_product = dot(rel_pos_vec, forward_vec); if dot_product > 0, dist = norm(rel_pos_vec); if dot_product / dist > 0.98, if dist < closest_dist, closest_dist = dist; end; end; end; end
+function threat = computeThreatLevel(frame)
+% Computes a weighted threat level based on detected obstacles.
+% Considers distance and whether the obstacle is directly in the path.
+    threat = 0;
+    obstacles = get_safe(frame, 'Detected_Obstacles', []);
+    ego_pos = get_safe(frame, 'fused_state', []); % Use fused state for better accuracy
+    ego_rot = get_safe(frame, 'rotation', []);
+
+    if isempty(obstacles) || isempty(ego_pos) || isempty(ego_rot), return; end
+
+    % Get the ego vehicle's forward vector
+    ego_yaw_rad = deg2rad(ego_rot.yaw);
+    forward_vec = [cos(ego_yaw_rad), sin(ego_yaw_rad)];
+
+    for i = 1:numel(obstacles)
+        obs = obstacles(i);
+        rel_pos_vec = [obs.position.x - ego_pos.x, obs.position.y - ego_pos.y];
+        dist = norm(rel_pos_vec);
+        
+        if dist > 50 || dist < 0.1 % Ignore very far or overlapping obstacles
+            continue;
+        end
+        
+        % Normalize the relative position vector to get the direction
+        rel_pos_dir = rel_pos_vec / dist;
+        
+        % Check alignment with the forward vector (dot product)
+        % A value of 1 means directly in front, 0 is perpendicular, -1 is behind.
+        alignment = dot(forward_vec, rel_pos_dir);
+        
+        if alignment > 0.5 % Consider only obstacles in the forward cone
+            % Threat is inversely proportional to distance and directly
+            % proportional to how "in-path" the obstacle is.
+            distance_threat = (1 / dist) * 10; % Scale factor
+            alignment_threat = alignment^2; % Square to weigh direct threats more
+            
+            threat = threat + (distance_threat * alignment_threat);
+        end
+    end
 end
 
-function score = computeDriverAttention(frame)
-    persistent time_of_last_input; if isempty(time_of_last_input), time_of_last_input = tic; end
-    score = 1.0; controls = get_safe(frame, 'control', struct('steer',0,'throttle',0,'brake',0));
-    if strcmp(get_safe(frame, 'mode', 'autopilot'), 'manual'), if abs(controls.steer) > 0.01 || controls.throttle > 0.01 || controls.brake > 0.01, time_of_last_input = tic; score = 1.0; else, score = max(0, min(1, 1.0 - (toc(time_of_last_input) / 5.0))); end; else, time_of_last_input = tic; score = 1.0; end
+function confidence = computeSystemConfidence(health_score, uncertainty, threat_level, weather_severity)
+% Calculates a holistic system confidence score.
+    score = health_score;
+    status_text = 'NOMINAL';
+
+    % 1. Penalize for high EKF uncertainty (unreliable position)
+    if uncertainty > 1.0 % Threshold for high uncertainty (trace of covariance)
+        score = score * 0.7;
+        status_text = 'HIGH_UNCERTAINTY';
+    end
+
+    % 2. Penalize for high environmental threat
+    if threat_level > 10.0 % Threshold for dangerous obstacle situation
+        score = score * (1 - min(threat_level / 50, 0.8)); % Penalize up to 80%
+        status_text = 'HIGH_THREAT_ENV';
+    end
+    
+    % 3. Penalize for severe weather
+    if weather_severity > 0.7 % e.g., HardRainNoon
+        score = score * 0.8;
+        if strcmp(status_text, 'NOMINAL') % Don't override a more severe status
+            status_text = 'POOR_WEATHER';
+        end
+    end
+
+    confidence.score = max(0, score); % Ensure score is not negative
+    confidence.status_text = status_text;
 end
 
-function score = computeDriverReadiness(frame)
-    score = 1.0; controls = get_safe(frame, 'control', struct('throttle',0,'brake',0,'hand_brake',false));
-    if controls.throttle > 0.1 && controls.brake > 0.1, score = 0.1; return; end
-    if controls.hand_brake && controls.throttle > 0.1, score = 0.3; return; end
+function score = computeDriverAttention(frame, is_lane_invasion)
+% Computes a more realistic driver attention score.
+% It uses a simulated gaze tracker (from interior camera) and penalizes for lane invasions.
+    persistent last_image_hash time_head_away;
+    if isempty(last_image_hash), last_image_hash = 0; time_head_away = tic; end
+    
+    score = 1.0;
+    
+    % --- 1. Simulated Gaze Tracking from Interior Camera ---
+    img_b64 = get_safe(frame, 'image_interior', '');
+    head_is_forward = true;
+    if ~isempty(img_b64)
+        try
+            % We create a simple "hash" of the image. A large change implies head movement.
+            img_bytes = base64decode(img_b64);
+            current_hash = sum(img_bytes(1:10:end)); % Simple checksum/hash
+            
+            % If the hash is significantly different, the view has changed.
+            if abs(current_hash - last_image_hash) > numel(img_bytes) * 0.1 && last_image_hash ~= 0
+                head_is_forward = false;
+            end
+            last_image_hash = current_hash;
+        catch
+            head_is_forward = true; % Failsafe
+        end
+    end
+    
+    if head_is_forward
+        time_head_away = tic; % Reset the timer if head is forward
+    else
+        % Penalize based on how long the driver has looked away.
+        score = score - min(1.0, toc(time_head_away) / 3.0);
+    end
+
+    % --- 2. Penalty for Lane Invasion ---
+    if is_lane_invasion
+        score = score * 0.2; % Major penalty for lane departure
+    end
+    
+    score = max(0, score); % Ensure score is within bounds [0, 1]
 end
+
+function score = computeDriverReadiness(frame, attention_score, threat_level)
+% Computes a more realistic driver readiness score.
+% Readiness depends on attention and appropriate reaction to the environment.
+    score = 1.0;
+    controls = get_safe(frame, 'control', struct('throttle',0,'brake',0,'hand_brake',false));
+    v2i_data = get_safe(frame, 'V2I_Data', struct());
+    
+    % 1. Check for Contradictory Inputs (Critical Error)
+    if controls.throttle > 0.1 && controls.brake > 0.1, score = 0.1; end
+    if controls.hand_brake && controls.throttle > 0.1, score = 0.3; end
+    
+    % 2. Check for Failure to React to Environment
+    traffic_light_state = get_safe(v2i_data, 'traffic_light_state', 'GREEN');
+    if strcmpi(traffic_light_state, 'RED') && controls.throttle > 0.1
+        score = min(score, 0.2); % Accelerating at red light
+    end
+    if threat_level > 10.0 && controls.brake < 0.1
+        score = min(score, 0.4); % High threat but no braking
+    end
+    
+    % 3. Readiness is Capped by Attention
+    score = min(score, attention_score);
+end
+
+function [waypoints, target_speed_ms] = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms, real_lane_waypoints, v2i_data, threat_level)
+% Generates a feasible trajectory that reacts to traffic lights and threats.
+% MODIFIED: Also returns the calculated intelligent target speed.
+    if ~isempty(real_lane_waypoints) && ismatrix(real_lane_waypoints) && size(real_lane_waypoints, 2) == 2 && size(real_lane_waypoints, 1) > 1
+        ref_wps = real_lane_waypoints;
+    else
+        ref_wps = [ ego_pos.x - 1, ego_pos.y; ego_pos.x + 100, ego_pos.y];
+    end
+    refPath = referencePathFrenet(ref_wps);
+    ego_state_global = [ego_pos.x, ego_pos.y, deg2rad(ego_rot.yaw), 0, 0, ego_speed_ms];
+    frenet_state_current = global2frenet(refPath, ego_state_global);
+    
+    % --- INTELLIGENT TARGET STATE LOGIC ---
+    target_speed_ms = ego_speed_ms; % Default: maintain current speed
+
+    % 1. React to Traffic Lights (V2I)
+    traffic_light_state = get_safe(v2i_data, 'traffic_light_state', 'GREEN');
+    if strcmpi(traffic_light_state, 'RED')
+        target_speed_ms = 0; % Plan to stop
+    end
+
+    % 2. React to Immediate Threats
+    if threat_level > 15.0 
+        target_speed_ms = 0; % Emergency stop for critical threat
+    elseif threat_level > 8.0
+        target_speed_ms = min(target_speed_ms, 5.0); % Slow for medium threat
+    end
+    
+    lookahead_dist = 20.0;
+    frenet_state_target = [frenet_state_current(1) + lookahead_dist, ...
+                           0, 0, target_speed_ms, 0, 0];
+
+    timeSpan = lookahead_dist / max(ego_speed_ms, 5); 
+    trajGen = trajectoryGeneratorFrenet(refPath);
+    [~, trajectory] = connect(trajGen, frenet_state_current, frenet_state_target, timeSpan);
+
+    if isempty(trajectory.Trajectory)
+        waypoints = ref_wps;
+    else
+        waypoints = trajectory.Trajectory(:, 1:2);
+    end
+end
+
+%% =======================================================================
+%                    ORIGINAL UTILITY FUNCTIONS (UNMODIFIED)
+% ========================================================================
 
 function severity = computeWeatherSeverity(frame)
     weather_str = get_safe(frame, 'weather', 'ClearNoon');
     switch weather_str, case 'ClearNoon', severity = 0.1; case 'CloudyNoon', severity = 0.3; case 'WetNoon', severity = 0.6; case 'HardRainNoon', severity = 0.9; otherwise, severity = 0.1; end
-end
-
-function density = computeObstacleDensity(frame)
-    density = 0; obstacles = get_safe(frame, 'Detected_Obstacles', []); ego_pos = get_safe(frame, 'position', struct('x', 0, 'y', 0, 'z', 0)); if isempty(obstacles), return; end
-    for i = 1:numel(obstacles), dist = sqrt((obstacles(i).position.x - ego_pos.x)^2 + (obstacles(i).position.y - ego_pos.y)^2); if dist < 50, density = density + 1; end; end
 end
 
 function [score, raw_health] = computeSensorHealth(frame)
@@ -378,55 +574,4 @@ function data_out = extractRawSensorData(frame)
         if ~copy && ismember(field, singles), copy = true; end; if copy, data_out.(field) = frame.(field); end; end
     data_out.speed = get_safe(frame, 'speed', 0); data_out.ultrasonic_front = get_safe(frame, 'ultrasonic_front', inf); data_out.ultrasonic_back = get_safe(frame, 'ultrasonic_back', inf);
     data_out.throttle_input = get_safe(control_data, 'throttle', 0); data_out.brake_input = get_safe(control_data, 'brake', 0); data_out.steering_input = get_safe(control_data, 'steer', 0);
-end
-
-function waypoints = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms, real_lane_waypoints)
-% Generates a feasible trajectory using real lane data or a fallback.
-% It uses trajectoryGeneratorFrenet from the Automated Driving Toolbox.
-% If real lane data is provided, it is used as the reference path. Otherwise,
-% a straight-line path is generated as a robust fallback.
-
-    % Check if valid "real" lane waypoints were provided from the simulation.
-    % The waypoints should be a Nx2 matrix of [X, Y] coordinates.
-    if ~isempty(real_lane_waypoints) && ismatrix(real_lane_waypoints) && size(real_lane_waypoints, 2) == 2 && size(real_lane_waypoints, 1) > 1
-        % Real data is available, use it as the reference path.
-        ref_wps = real_lane_waypoints;
-    else
-        % Fallback: No valid lane data, generate a simple straight path ahead.
-        ref_wps = [ ego_pos.x - 1, ego_pos.y; 
-                    ego_pos.x + 100, ego_pos.y];
-    end
-    
-    refPath = referencePathFrenet(ref_wps);
-
-    % Convert the car's current global state to Frenet coordinates
-    ego_state_global = [ego_pos.x, ego_pos.y, deg2rad(ego_rot.yaw), 0, 0, ego_speed_ms];
-    frenet_state_current = global2frenet(refPath, ego_state_global);
-
-    % Define a target state in Frenet coordinates
-    lookahead_dist = 20.0;
-    % Define the full 6-element target state for a smooth connection.
-    % We aim to be on the centerline (d=0) with 0 lateral velocity/acceleration.
-    frenet_state_target = [frenet_state_current(1) + lookahead_dist, ... % Target S (distance along path)
-                           0, ...   % Target d (lateral deviation from centerline)
-                           0, ...   % Target d_prime (lateral velocity relative to path)
-                           ego_speed_ms, ... % Target S_dot (speed along path)
-                           0, ...   % Target d_double_prime (lateral acceleration)
-                           0];      % Target S_double_prime (longitudinal acceleration)
-
-    % Calculate the time over which to generate the trajectory
-    timeSpan = lookahead_dist / max(ego_speed_ms, 5); % Avoid division by zero, min 5 m/s speed for calc
-
-    % Create a trajectory generator object and connect the states
-    trajGen = trajectoryGeneratorFrenet(refPath);
-    
-    [~, trajectory] = connect(trajGen, frenet_state_current, frenet_state_target, timeSpan);
-
-    if isempty(trajectory.Trajectory)
-        % Fallback in case of a trajectory generation error
-        waypoints = ref_wps;
-    else
-        % Return the generated path's X and Y coordinates
-        waypoints = trajectory.Trajectory(:, 1:2);
-    end
 end
