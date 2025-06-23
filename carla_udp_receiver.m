@@ -234,12 +234,13 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.logArea = uitextarea(log_grid, 'Value', {''}, 'Editable', 'off', 'FontName', 'Monospaced', 'BackgroundColor', [0.1 0.1 0.1], 'FontColor', [0.9 0.9 0.9]);
     
     p_kpi = uipanel(gl, 'Title', 'Key Performance Indicators (KPIs)', 'FontWeight', 'bold'); p_kpi.Layout.Row = 3; p_kpi.Layout.Column = [1 2];
+    % *** MODIFIED: Reverted grid layout to [6,2] and simplified Adaptability KPI ***
     g_kpi = uigridlayout(p_kpi, [6, 2], 'ColumnWidth', {'fit', '1x'}, 'Padding', [10 10 10 10]);
     uilabel(g_kpi, 'Text', 'Transition Speed (ms):', 'FontWeight', 'bold'); uiHandles.kpiSpeedLabel = uilabel(g_kpi, 'Text', 'N/A');
     uilabel(g_kpi, 'Text', 'Safety (Peak Lat Accel):', 'FontWeight', 'bold'); uiHandles.kpiSafetyLabel = uilabel(g_kpi, 'Text', 'N/A');
     uilabel(g_kpi, 'Text', 'Stability (Steer StDev):', 'FontWeight', 'bold'); uiHandles.kpiStabilityLabel = uilabel(g_kpi, 'Text', 'N/A');
     uilabel(g_kpi, 'Text', 'Precision (Pos Error m):', 'FontWeight', 'bold'); uiHandles.kpiPrecisionLabel = uilabel(g_kpi, 'Text', 'N/A');
-    uilabel(g_kpi, 'Text', 'Adaptability (React Time ms):', 'FontWeight', 'bold'); uiHandles.kpiAdaptabilityLabel = uilabel(g_kpi, 'Text', 'N/A');
+    uilabel(g_kpi, 'Text', 'Adaptability (Speed Error m/s):', 'FontWeight', 'bold'); uiHandles.kpiAdaptabilityLabel = uilabel(g_kpi, 'Text', 'N/A');
     uilabel(g_kpi, 'Text', 'Comp. Efficiency (Cycle ms):', 'FontWeight', 'bold'); uiHandles.kpiEfficiencyLabel = uilabel(g_kpi, 'Text', 'N/A');
 end
 
@@ -274,7 +275,8 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     if isfield(outputs, 'kpi_safety_lat_accel'), uiHandles.kpiSafetyLabel.Text = sprintf('%.3f', outputs.kpi_safety_lat_accel); end
     if isfield(outputs, 'kpi_stability_steer_std'), uiHandles.kpiStabilityLabel.Text = sprintf('%.4f', outputs.kpi_stability_steer_std); end
     if isfield(outputs, 'kpi_precision_error'), uiHandles.kpiPrecisionLabel.Text = sprintf('%.3f', outputs.kpi_precision_error); end
-    if isfield(outputs, 'kpi_adaptability_react_time'), uiHandles.kpiAdaptabilityLabel.Text = sprintf('%.1f', outputs.kpi_adaptability_react_time); end
+    % *** MODIFIED: Only one Adaptability KPI is now displayed ***
+    if isfield(outputs, 'kpi_adaptability_speed_error'), uiHandles.kpiAdaptabilityLabel.Text = sprintf('%.3f', outputs.kpi_adaptability_speed_error); end
     if isfield(outputs, 'kpi_efficiency_cycle_time'), uiHandles.kpiEfficiencyLabel.Text = sprintf('%.1f', outputs.kpi_efficiency_cycle_time); end
 end
 
@@ -295,6 +297,7 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
     if isempty(last_call_timer), time_since_last = 1/20; last_call_timer = tic; else, time_since_last = toc(last_call_timer); last_call_timer = tic; end
     
+    % --- Step 1: Perform initial analyses and data extraction ---
     network_status = struct('latency', latency, 'data_rate', 1 / max(time_since_last, 0.001));
     [health_score, sensor_health_data] = computeSensorHealth(frame);
     covariance_trace = computeEkfUncertainty(frame);
@@ -302,24 +305,29 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     processed_sensor_data = extractRawSensorData(frame);
     weather_severity = computeWeatherSeverity(frame);
     threat_level = computeThreatLevel(frame);
-    
-    persistent prev_threat_level threat_timer;
-    if isempty(prev_threat_level), prev_threat_level = 0; end
-    if threat_level > 5.0 && prev_threat_level <= 5.0 
-        threat_timer = tic;
-    elseif threat_level > 5.0 && get_safe(processed_sensor_data, 'brake_input', 0) > 0.5
-        if ~isempty(threat_timer)
-            carla_outputs.kpi_adaptability_react_time = toc(threat_timer) * 1000;
-            threat_timer = [];
-        end
-    end
-    prev_threat_level = threat_level;
-    
     simple_density = computeSimpleObstacleDensity(frame);
+    actual_speed_ms = get_safe(frame, 'speed', 0) / 3.6;
+    v2i_data = get_safe(frame, 'V2I_Data', struct());
+    
+    % --- Step 2: Calculate KPIs ---
+    
+    % KPI: Adaptability (Speed Adaptation Score as average m/s error)
+    SPEED_LIMIT_MS = 15; % ~54 km/h
+    weather_factor = 1.0 - (weather_severity * 0.7); % Max 70% speed reduction for weather
+    density_factor = 1.0 - (min(simple_density, 5) * 0.1); % 10% speed reduction per car, up to 5 cars
+    recommended_speed_ms = SPEED_LIMIT_MS * weather_factor * density_factor;
+    speed_error = abs(actual_speed_ms - recommended_speed_ms);
+    persistent speed_error_history;
+    if isempty(speed_error_history), speed_error_history = nan(1,100); end
+    speed_error_history = [speed_error_history(2:end), speed_error];
+    carla_outputs.kpi_adaptability_speed_error = mean(speed_error_history, 'omitnan');
+
+    % --- Step 3: Perform remaining analyses and populate outputs ---
     system_confidence = computeSystemConfidence(health_score, covariance_trace, threat_level, weather_severity);
     processed_sensor_data.Weather_Severity = weather_severity;
     processed_sensor_data.Obstacle_Threat = threat_level;
-    processed_sensor_data.Obstacle_Density = simple_density; 
+    processed_sensor_data.Obstacle_Density = simple_density;
+    
     rotation_data = get_safe(frame, 'rotation', struct('yaw', 0)); current_yaw = rotation_data.yaw; if isempty(last_yaw), last_yaw = current_yaw; end
     yaw_delta = current_yaw - last_yaw; if yaw_delta > 180, yaw_delta = yaw_delta - 360; end; if yaw_delta < -180, yaw_delta = yaw_delta + 360; end
     processed_sensor_data.yaw_rate = yaw_delta / max(time_since_last, 0.001); last_yaw = current_yaw;
@@ -332,10 +340,8 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     driver_readiness = computeDriverReadiness(frame, driver_attention, threat_level);
     ego_pos = get_safe(frame, 'fused_state', struct('x',0,'y',0));
     ego_rot = get_safe(frame, 'rotation', struct('yaw',0));
-    ego_speed_ms = get_safe(frame, 'speed', 0) / 3.6;
     real_lane_data = get_safe(frame, 'lane_waypoints', []);
-    v2i_data = get_safe(frame, 'V2I_Data', struct());
-    [planned_waypoints, intelligent_target_speed] = simulate_path_with_toolbox(ego_pos, ego_rot, ego_speed_ms, real_lane_data, v2i_data, threat_level);
+    [planned_waypoints, intelligent_target_speed] = simulate_path_with_toolbox(ego_pos, ego_rot, actual_speed_ms, real_lane_data, v2i_data, threat_level);
     processed_sensor_data.lane_waypoints = planned_waypoints;
     carla_outputs.network_status = network_status;
     carla_outputs.sensor_fusion_status = sensor_fusion_status;

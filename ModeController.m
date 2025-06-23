@@ -180,13 +180,3 @@ sched_controller.K_min = K_min; sched_controller.K_max = K_max;
 sched_controller.speed_range = speed_range;
 sched_controller.num_states = size(K_min.A, 1);
 end
-
-function is_stable = check_stability_conditions()
-b_min = 0.8; b_max = 1.5; alpha1 = 0.3; C0 = alpha1^2;
-lhs1 = (1/4) * C0 * (b_max^2 + C0); rhs1 = b_min^2 * (b_min^2 - C0);
-condition1 = lhs1 < rhs1; condition2 = 2 > (C0 / b_min);
-is_stable = condition1 && condition2;
-if ~is_stable
-    fprintf('[STABILITY CHECK FAILED] Condition 1: %.4f < %.4f (%s), Condition 2: 2 > %.4f (%s)\n', lhs1, rhs1, string(condition1), C0/b_min, string(condition2));
-end
-end
