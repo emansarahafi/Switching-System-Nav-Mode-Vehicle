@@ -243,8 +243,7 @@ class HUD:
             "L: Unlock Safe Mode", "Y: Confirm Remote Handover", "C: Next Weather (Shift+C: Prev)",
             "V: Next Map Layer (Shift+V: Prev)", "B: Load Layer (Shift+B: Unload)",
             "R: Toggle Image Recording", "Ctrl+R: Toggle Sim Recording",
-            "4: Switch to Town04", "0: Switch to Town10HD", "F1: Toggle HUD",
-            "H: Toggle Help", "ESC: Quit"
+            "F1: Toggle HUD", "H: Toggle Help", "ESC: Quit"
         ]
         s = pygame.Surface((360, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
         for i, text in enumerate(help_text):
@@ -283,8 +282,6 @@ class KeyboardController:
         elif key == K_b: self.simulation.toggle_current_map_layer(unload=is_shift)
         elif key == K_F1: self.simulation.toggle_hud()
         elif key == K_h: self.simulation.toggle_help()
-        elif key == K_4: self.simulation.change_map('Town04')
-        elif key == K_0: self.simulation.change_map('Town10HD')
         elif key == K_ESCAPE: self.simulation.running = False
 
 class SensorManager:
@@ -757,14 +754,6 @@ class CarlaSimulation:
         else: self.world.load_map_layer(MAP_LAYERS[self.current_layer_index])
     def toggle_hud(self): self.show_hud = not self.show_hud
     def toggle_help(self): self.hud.show_help = not self.hud.show_help
-    def change_map(self, map_name):
-        if self.world.get_map().name.endswith(map_name): return
-        if self.client and self.npc_vehicles: self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in self.npc_vehicles if x.is_alive], True); self.npc_vehicles.clear()
-        [s.destroy() for s_list in self.sensors.values() for s in s_list]; self.sensors.clear()
-        if self.vehicle: self.vehicle.destroy(); self.vehicle=None
-        self.world = self.client.load_world(map_name)
-        settings=self.world.get_settings(); settings.synchronous_mode=True; settings.fixed_delta_seconds=1.0/TICK_RATE
-        self.world.apply_settings(settings); self._setup_actors_and_sensors()
 
     def reset_safe_mode_lock(self):
         if self.safe_mode_locked:
