@@ -57,7 +57,7 @@ COMMAND_LISTEN_IP = '127.0.0.1'
 COMMAND_LISTEN_PORT = 10001
 MATLAB_DATA_IP = '127.0.0.1'
 MATLAB_DATA_PORT = 10000
-MATLAB_CONTROL_TIMEOUT = 0.3 
+MATLAB_CONTROL_TIMEOUT = 1.0
 API_KEY = "SECRET_CARLA_KEY_123"
 
 # ==============================================================================
@@ -491,7 +491,7 @@ class CarlaSimulation:
     def _tick_simulation(self):
         self.world.tick()
         snapshot = self.world.get_snapshot()
-        self._process_fdir_commands()
+        self._process_incoming_commands()
 
         if self.control_mode == 'MATLAB_CONTROL' and (time.time() - self.last_matlab_command_time > MATLAB_CONTROL_TIMEOUT):
             self._trigger_emergency_revert("MATLAB signal loss / timeout.")
@@ -520,7 +520,7 @@ class CarlaSimulation:
         if self.show_hud: self.hud.render(display, self._get_simulation_state(snapshot))
         pygame.display.flip()
 
-    def _process_fdir_commands(self):
+    def _process_incoming_commands(self):
         try:
             command = self.command_queue.get_nowait()
             if command.get('api_key') != API_KEY:
