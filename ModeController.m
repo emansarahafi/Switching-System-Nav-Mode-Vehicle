@@ -1,6 +1,6 @@
 function [final_mode, final_command] = ModeController(target_mode, current_mode, carla_outputs, dt)
-% ModeController - Manages control modes and implements advanced controllers.
-% ## RELAXED DEVELOPER VERSION ##
+% ModeController - Manages control mode transitions ONLY.
+% ## MODIFIED FOR TRANSITION-ONLY BEHAVIOR ##
 
 persistent state;
 if isempty(state)
@@ -9,24 +9,11 @@ if isempty(state)
     state.transition_start_time = 0;
     state.transition_duration = 1.5;
     state.target_mode = 'MANUAL';
-    fprintf('ModeController initialized. Defaulting to MANUAL.\n');
+    fprintf('ModeController (Transition-Only) initialized. Defaulting to MANUAL.\n');
 end
 
 % --- State Transition Logic ---
 if ~strcmp(target_mode, current_mode) && ~state.in_transition
-    
-    % ## MODIFIED ## The secondary stability check is commented out for testing.
-    % The fuzzy system's decision is now the only gatekeeper.
-    % if strcmp(target_mode, 'AUTOPILOT')
-    %     is_stable = check_stability_conditions();
-    %     if ~is_stable
-    %         fprintf('[FATAL ABORT] Transition to AUTOPILOT denied. Controller stability conditions not met.\n');
-    %         final_mode = 'MANUAL'; state.alpha = 1.0;
-    %         final_command = get_human_control(carla_outputs); 
-    %         return;
-    %     end
-    % end
-    
     state.in_transition = true; state.transition_start_time = tic; state.target_mode = target_mode;
     if strcmp(target_mode, 'MANUAL'), state.transition_duration = 0.2; else, state.transition_duration = 1.5; end
     fprintf('MODE_CONTROLLER: Starting transition from %s to %s (duration: %.2fs)\n', current_mode, target_mode, state.transition_duration);
@@ -43,22 +30,27 @@ if state.in_transition
         if strcmp(state.target_mode, 'AUTOPILOT'), state.alpha = 1.0 - progress; else, state.alpha = progress; end
         final_mode = current_mode;
     end
-else, final_mode = current_mode; 
+else, final_mode = current_mode;
 end
 
 % --- Explicit State-Based Control Generation ---
 alpha = max(0, min(1, state.alpha));
-reset_integrator = (alpha > 0.95); 
+reset_integrator = (alpha > 0.95);
 
 if alpha >= 1.0 % FULL MANUAL MODE
     final_command = get_human_control(carla_outputs);
-    compute_stsm_control(carla_outputs, dt, true);
-    
-elseif alpha <= 0.0 % FULL AUTOPILOT MODE
-    final_command = compute_stsm_control(carla_outputs, dt, false);
-    final_command.hand_brake = false;
-    final_command.reverse = false;
-    
+    compute_stsm_control(carla_outputs, dt, true); % Call to reset controller state
+
+elseif alpha <= 0.0 % POST-TRANSITION (YIELD CONTROL)
+    % =====================================================================
+    % === CHANGE: Instead of driving, return a neutral/zero command.   ===
+    % === This effectively stops this function from doing any further   ===
+    % === control after the transition is complete. Another system     ===
+    % === would be expected to provide the real commands.              ===
+    % =====================================================================
+    final_command = struct('steer', 0, 'throttle', 0, 'brake', 0, 'hand_brake', false, 'reverse', false);
+    % fprintf('[DEBUG] Transition complete. ModeController yielding control.\n'); % Optional debug line
+
 else % TRANSITIONING (BLENDING)
     sw_h = get_human_control(carla_outputs);
     sw_as = compute_stsm_control(carla_outputs, dt, reset_integrator);
@@ -78,6 +70,8 @@ end
 end
 
 %% --- Controller Helper Functions ---
+% Note: These functions are still required because they are used
+% during the blending/transition phase.
 
 function sw_h = get_human_control(carla_outputs)
 sw_h = get_safe(carla_outputs, 'control', struct());
@@ -89,6 +83,7 @@ if ~isfield(sw_h, 'reverse'), sw_h.reverse = false; end
 end
 
 function stsm_command = compute_stsm_control(carla_outputs, dt, reset_integrator)
+% --- Longitudinal Control (Speed) ---
 MAX_SPEED_KPH = 50.0;
 LOOKAHEAD_CURVATURE_DIST_M = 20.0;
 planner_target_speed_ms = get_safe(carla_outputs, 'intelligent_target_speed_ms', MAX_SPEED_KPH / 3.6);
@@ -101,6 +96,8 @@ speed_error = final_target_speed_ms - current_speed_ms;
 [throttle, brake] = compute_gainsched_hinf_control(speed_error, current_speed_ms, reset_integrator, dt);
 stsm_command.throttle = throttle;
 stsm_command.brake = brake;
+
+% --- Lateral Control (Steering) ---
 persistent u2_integral last_final_steer;
 if isempty(u2_integral) || reset_integrator
     u2_integral = 0;
