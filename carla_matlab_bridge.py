@@ -481,6 +481,10 @@ class CarlaSimulation:
         print(f"[EMERGENCY] Reverting to Local Control. Reason: {reason}")
         if self.emergency_alert_sound:
             self.emergency_alert_sound.play()
+        
+        # If we are leaving MATLAB_CONTROL, we must disable its autopilot
+        if self.control_mode == 'MATLAB_CONTROL' and self.vehicle and self.vehicle.is_alive:
+            self.vehicle.set_autopilot(False)
 
         self.control_mode = 'MANUAL'
         self.last_matlab_control = carla.VehicleControl() 
@@ -509,7 +513,9 @@ class CarlaSimulation:
         elif self.control_mode == 'USER_AUTOPILOT':
             pass
         elif self.control_mode == 'MATLAB_CONTROL':
-            self.vehicle.apply_control(self.last_matlab_control)
+            # Per requirements, CARLA's internal autopilot is enabled for this mode.
+            # No controls from MATLAB are applied. The autopilot is handled by CARLA's tick.
+            pass
         
         # --- Data Processing and Sending ---
         self._process_sensor_data(snapshot)
@@ -535,18 +541,14 @@ class CarlaSimulation:
                 control_data = command.get('control', None)
                 if control_data:
                     if self.control_mode != 'MATLAB_CONTROL':
-                         print("[INFO] MATLAB has taken control.")
+                         print("[INFO] MATLAB has taken control. Enabling CARLA Autopilot.")
                          self.control_mode = 'MATLAB_CONTROL'
+                         if self.vehicle and self.vehicle.is_alive:
+                             self.vehicle.set_autopilot(True)
                     
+                    # We still need to receive commands to prevent timeout, but we don't apply them.
+                    # The control values are ignored. We just update the timestamp.
                     self.last_matlab_command_time = time.time()
-                    
-                    self.last_matlab_control = carla.VehicleControl(
-                        throttle=float(control_data.get('throttle', 0.0)),
-                        steer=float(control_data.get('steer', 0.0)),
-                        brake=float(control_data.get('brake', 0.0)),
-                        hand_brake=bool(control_data.get('hand_brake', False)),
-                        reverse=bool(control_data.get('reverse', False))
-                    )
                     
                     command_id = command.get('command_id')
                     if command_id is not None:
@@ -575,6 +577,8 @@ class CarlaSimulation:
             elif cmd_type == 'DISENGAGED_AUTOPILOT':
                  if self.control_mode == 'MATLAB_CONTROL':
                      print("[INFO] MATLAB has disengaged autopilot. Reverting to local manual control.")
+                     if self.vehicle and self.vehicle.is_alive:
+                        self.vehicle.set_autopilot(False)
                      self.control_mode = 'MANUAL'
                      self.last_matlab_control = carla.VehicleControl()
 
