@@ -175,7 +175,7 @@ end
 
 
 %% =======================================================================
-%                      UI SETUP (MODIFIED FOR KPIs)
+%                      UI SETUP
 % ========================================================================
 function [uiHandles] = setupDashboard(historyLength, closeCallback)
     fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Position', [50 50, 1600, 950]);
@@ -289,7 +289,8 @@ end
 function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     global carla_outputs;
     
-    persistent kpi_efficiency_timer;
+    % ... (all the existing analysis code in this function) ...
+        persistent kpi_efficiency_timer;
     if isempty(kpi_efficiency_timer), kpi_efficiency_timer = tic; end
     carla_outputs.kpi_efficiency_cycle_time = toc(kpi_efficiency_timer) * 1000;
     kpi_efficiency_timer = tic;
@@ -363,9 +364,13 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     
     fused_pos = get_safe(sensor_fusion_status, 'fused_state', []);
     true_pos = get_safe(frame, 'position', []);
+    
     if ~isempty(fused_pos) && isfield(fused_pos, 'x') && ~isempty(true_pos)
         carla_outputs.kpi_precision_error = sqrt((fused_pos.x - true_pos.x)^2 + (fused_pos.y - true_pos.y)^2);
     end
+    
+    carla_outputs.sensor_health = get_safe(frame, 'sensor_health', struct());
+    carla_outputs.active_sensor_indices = get_safe(frame, 'active_sensor_indices', struct());
 end
 
 %% =======================================================================
