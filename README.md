@@ -44,7 +44,7 @@ The decision to switch between modes is handled by a fuzzy logic system ([`fuzzy
 
 ## Key Files
 
-*   [`carla_matlab_bridge.py`](carla_matlab_bridge.py): The main Python script that interfaces with CARLA and communicates with MATLAB.
+*   [`main.py`](main.py): The main Python script that interfaces with CARLA and communicates with MATLAB.
 *   [`carla_udp_receiver.m`](carla_udp_receiver.m): The main MATLAB script that runs the UI, processes data, and implements control logic.
 *   [`ModeController.m`](ModeController.m): Contains the state machine for managing transitions between `MANUAL`, `AUTOPILOT`, and `AWAITING_CONFIRMATION` states.
 *   [`fuzzy_bbna.m`](fuzzy_bbna.m): Implements the fuzzy logic system for decision-making.
