@@ -35,6 +35,7 @@ GRID_COLS, GRID_ROWS = 3, 2
 WINDOW_WIDTH, WINDOW_HEIGHT = IMAGE_WIDTH * GRID_COLS, IMAGE_HEIGHT * GRID_ROWS
 TICK_RATE = 20
 VEHICLE_MODEL = 'vehicle.tesla.model3'
+STARTING_TOWN = 'Town04' # This is the only town that will be used
 NUM_BACKUPS = 2
 NUM_NPC_VEHICLES = 20 # Number of NPCs for V2V
 DATA_DIR = 'data'
@@ -234,8 +235,8 @@ class HUD:
             "L: Unlock Safe Mode", "K: Kill Random Sensor (FDIR TEST)",
             "C: Next Weather (Shift+C: Prev)", "V: Next Map Layer (Shift+V: Prev)",
             "B: Load Layer (Shift+B: Unload)", "R: Toggle Image Recording",
-            "Ctrl+R: Toggle Sim Recording", "3: Switch to Town03",
-            "0: Switch to Town10HD", "F1: Toggle HUD", "H: Toggle Help", "ESC: Quit"
+            "Ctrl+R: Toggle Sim Recording", "F1: Toggle HUD",
+            "H: Toggle Help", "ESC: Quit"
         ]
         s = pygame.Surface((360, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
         for i, text in enumerate(help_text):
@@ -278,8 +279,6 @@ class KeyboardController:
         elif key == K_b: self.simulation.toggle_current_map_layer(unload=is_shift)
         elif key == K_F1: self.simulation.toggle_hud()
         elif key == K_h: self.simulation.toggle_help()
-        elif key == K_3: self.simulation.change_map('Town03')
-        elif key == K_0: self.simulation.change_map('Town10HD')
         elif key == K_ESCAPE: self.simulation.running = False
 
 class SensorManager:
@@ -388,7 +387,7 @@ class CarlaSimulation:
             self.emergency_alert_sound = None
 
         self.client=carla.Client('localhost',2000); self.client.set_timeout(20.0)
-        self.world=self.client.load_world('Town03')
+        self.world=self.client.load_world(STARTING_TOWN)
         settings=self.world.get_settings(); settings.synchronous_mode=True; settings.fixed_delta_seconds=1.0/TICK_RATE
         self.world.apply_settings(settings)
         self.display_manager=DisplayManager((GRID_COLS,GRID_ROWS)); self.hud=HUD(WINDOW_WIDTH,WINDOW_HEIGHT); self.controller=KeyboardController(self)
@@ -622,7 +621,7 @@ class CarlaSimulation:
         
         health_score = (ok_sensors / total_sensors) if total_sensors > 0 else 1.0
         
-        # MODIFIED: Create the data structure MATLAB is expecting
+        # Create the data structure MATLAB is expecting
         sensor_fusion_status_data = {
             'health_score': health_score
         }
@@ -635,9 +634,9 @@ class CarlaSimulation:
             'control':self.controller.get_control_state(), 'fused_state':self.fused_state,
             'ekf_covariance':self.kalman_filter.kf.P.tolist() if self.kalman_filter else None,
             'sensor_health': health_data, 'collisions': self.collision_count, 'lane_invasions': self.lane_invasion_count,
+            'active_sensor_indices': self.active_sensor_indices, # <<< FIX: This line is required
             'Detected_Obstacles': self.detected_obstacles, 'V2V_Data': self._gather_v2v_data(), 'V2I_Data': self._gather_v2i_data(),
             'lane_waypoints': self._gather_lane_waypoints(),
-            # MODIFIED: Add the new health score data to the packet
             'sensor_fusion_status': sensor_fusion_status_data,
         }
         for name, sensor_list in self.sensors.items():
@@ -718,14 +717,6 @@ class CarlaSimulation:
         else: self.world.load_map_layer(MAP_LAYERS[self.current_layer_index])
     def toggle_hud(self): self.show_hud = not self.show_hud
     def toggle_help(self): self.hud.show_help = not self.hud.show_help
-    def change_map(self, map_name):
-        if self.world.get_map().name.endswith(map_name): return
-        if self.client and self.npc_vehicles: self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in self.npc_vehicles if x.is_alive], True); self.npc_vehicles.clear()
-        [s.destroy() for s_list in self.sensors.values() for s in s_list]; self.sensors.clear()
-        if self.vehicle: self.vehicle.destroy(); self.vehicle=None
-        self.world = self.client.load_world(map_name)
-        settings=self.world.get_settings(); settings.synchronous_mode=True; settings.fixed_delta_seconds=1.0/TICK_RATE
-        self.world.apply_settings(settings); self._setup_actors_and_sensors()
 
     # ADDED: New method to test the FDIR system by killing sensors
     def kill_random_sensor(self):
