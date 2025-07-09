@@ -6,7 +6,7 @@ This project implements a sophisticated switching system for a teleoperated vehi
 
 The system consists of two primary components:
 
-1.  **CARLA Python Bridge (`main.py`):** This script connects to a running CARLA server. It spawns the ego vehicle, attaches a suite of sensors (cameras, LiDAR, IMU, GNSS), collects and packages sensor data, and sends it to the MATLAB application via UDP. It also listens for control commands from MATLAB to drive the vehicle in autonomous mode.
+1.  **CARLA Python Bridge (`carla_matlab_bridge.py`):** This script connects to a running CARLA server. It spawns the ego vehicle, attaches a suite of sensors (cameras, LiDAR, IMU, GNSS), collects and packages sensor data, and sends it to the MATLAB application via UDP. It also listens for control commands from MATLAB to drive the vehicle in autonomous mode.
 
 2.  **MATLAB Diagnostics & Control (`carla_udp_receiver.m`):** This MATLAB application provides a comprehensive dashboard for real-time monitoring. It receives and decodes the data stream from CARLA, visualizes sensor feeds, runs the core decision-making logic, and sends control commands back to the Python bridge.
 
@@ -44,7 +44,7 @@ The decision to switch between modes is handled by a fuzzy logic system ([`fuzzy
 
 ## Key Files
 
-*   [`main.py`](main.py): The main Python script that interfaces with CARLA and communicates with MATLAB.
+*   [`carla_matlab_bridge.py`](carla_matlab_bridge.py): The main Python script that interfaces with CARLA and communicates with MATLAB.
 *   [`carla_udp_receiver.m`](carla_udp_receiver.m): The main MATLAB script that runs the UI, processes data, and implements control logic.
 *   [`ModeController.m`](ModeController.m): Contains the state machine for managing transitions between `MANUAL`, `AUTOPILOT`, and `AWAITING_CONFIRMATION` states.
 *   [`fuzzy_bbna.m`](fuzzy_bbna.m): Implements the fuzzy logic system for decision-making.
