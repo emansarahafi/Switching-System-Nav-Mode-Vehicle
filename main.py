@@ -35,9 +35,8 @@ GRID_COLS, GRID_ROWS = 3, 2
 WINDOW_WIDTH, WINDOW_HEIGHT = IMAGE_WIDTH * GRID_COLS, IMAGE_HEIGHT * GRID_ROWS
 TICK_RATE = 20
 VEHICLE_MODEL = 'vehicle.tesla.model3'
-STARTING_TOWN = 'Town04' # This is the only town that will be used
 NUM_BACKUPS = 2
-NUM_NPC_VEHICLES = 20 # Number of NPCs for V2V
+NUM_NPC_VEHICLES = 20
 DATA_DIR = 'data'
 LOG_DIR = os.path.join(DATA_DIR, 'logs')
 CAMERA_DIRS = {
@@ -52,18 +51,19 @@ WEATHER_PRESETS = {
     'HardRainNoon': carla.WeatherParameters.HardRainNoon
 }
 MAP_LAYERS = [carla.MapLayer.NONE, carla.MapLayer.Buildings, carla.MapLayer.Decals, carla.MapLayer.Foliage, carla.MapLayer.Ground, carla.MapLayer.ParkedVehicles, carla.MapLayer.Particles, carla.MapLayer.Props, carla.MapLayer.StreetLights, carla.MapLayer.Walls, carla.MapLayer.All]
+
+# Network and Security Settings
 COMMAND_LISTEN_IP = '127.0.0.1'
 COMMAND_LISTEN_PORT = 10001
-MATLAB_CONTROL_TIMEOUT = 0.2 # Seconds to wait for a new command before reverting to manual
-
+MATLAB_DATA_IP = '127.0.0.1'
+MATLAB_DATA_PORT = 10000
+MATLAB_CONTROL_TIMEOUT = 1.0
+API_KEY = "SECRET_CARLA_KEY_123"
 
 # ==============================================================================
 # -- Helper Classes ------------------------------------------------------------
 # ==============================================================================
 class CommandReceiver(threading.Thread):
-    """
-    A thread that listens for UDP commands from the FDIR system in MATLAB.
-    """
     def __init__(self, command_queue: Queue, ip: str, port: int):
         super().__init__()
         self.daemon = True
@@ -72,7 +72,7 @@ class CommandReceiver(threading.Thread):
         self.port = port
         self.running = True
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(1.0) # Timeout to allow checking self.running
+        self.sock.settimeout(1.0)
         print(f"Command receiver thread will listen on {ip}:{port}")
 
     def run(self):
@@ -91,18 +91,17 @@ class CommandReceiver(threading.Thread):
                     command_str = data.decode('utf-8')
                     try:
                         command_obj = json.loads(command_str)
-                        # Don't print control commands to avoid flooding the console
                         if command_obj.get('command') != 'SET_VEHICLE_CONTROL':
                              print(f"[CMD RECEIVED]: {command_obj}")
                         self.queue.put(command_obj)
                     except json.JSONDecodeError:
                         print(f"[WARN] Received invalid JSON command: {command_str}")
             except socket.timeout:
-                continue # Allows the loop to check self.running status
+                continue
             except Exception as e:
-                if self.running: # Don't print error if we are intentionally stopping
+                if self.running:
                     print(f"Error in command receiver thread: {e}")
-                    time.sleep(1) # Avoid spamming errors
+                    time.sleep(1)
 
     def stop(self):
         print("Stopping command receiver thread...")
@@ -167,6 +166,7 @@ class HUD:
     def __init__(self, width: int, height: int):
         self.dim = (width, height); self.font = pygame.font.SysFont('Arial', 14); self.help_font = pygame.font.SysFont('Monospace', 14)
         self.large_font = pygame.font.SysFont('Arial', 48, bold=True)
+        self.xl_font = pygame.font.SysFont('Arial', 72, bold=True)
         self.show_help = False
         self.HEALTH_COLORS = {"OK": (0, 255, 0), "NO_DATA": (255, 255, 0), "DEAD": (255, 0, 0)}
 
@@ -175,16 +175,14 @@ class HUD:
         self._render_hud_info(display, sim_state)
         self._render_sensor_health(display, sim_state.get('sensor_health', {}), sim_state.get('active_sensors', {}))
         if sim_state.get('safe_mode_locked', False): self._render_safe_mode_warning(display)
+        if sim_state.get('control_mode') == 'AWAITING_HANDOVER': self._render_handover_request(display)
         if self.show_help: self._render_help_text(display)
 
     def _render_hud_info(self, display: pygame.Surface, sim_state: Dict[str, Any]):
-        mode_text = 'MANUAL' # Default
-        if sim_state.get('is_matlab_actively_controlling'):
-            mode_text = 'MATLAB CONTROL'
-        elif sim_state.get('control_mode') == 'USER_AUTOPILOT':
-            mode_text = 'USER AUTOPILOT'
+        mode_text = sim_state.get('control_mode', 'MANUAL').replace('_', ' ')
         if sim_state.get('safe_mode_locked', False):
-            mode_text = 'LOCKED'
+            mode_text = 'SAFE MODE LOCKED'
+
         matlab_link_status = 'ENABLED' if sim_state.get('accept_matlab_commands') else 'DISABLED'
         matlab_link_color = (0, 255, 0) if sim_state.get('accept_matlab_commands') else (255, 165, 0)
         info_text = [
@@ -228,17 +226,26 @@ class HUD:
         sub_text_rect = sub_text_surf.get_rect(center=(WINDOW_WIDTH/2, WINDOW_HEIGHT/2 + 30))
         display.blit(sub_text_surf, sub_text_rect)
 
+    def _render_handover_request(self, display: pygame.Surface):
+        s = pygame.Surface((WINDOW_WIDTH, 120)); s.set_alpha(220); s.fill((0, 100, 255))
+        display.blit(s, (0, (WINDOW_HEIGHT / 2) - 60))
+        text_surf = self.xl_font.render('REMOTE HANDOVER REQUEST', True, (255, 255, 255))
+        text_rect = text_surf.get_rect(center=(WINDOW_WIDTH/2, WINDOW_HEIGHT/2 - 20))
+        display.blit(text_surf, text_rect)
+        sub_text_surf = self.large_font.render("Press 'Y' to Confirm", True, (255, 255, 0))
+        sub_text_rect = sub_text_surf.get_rect(center=(WINDOW_WIDTH/2, WINDOW_HEIGHT/2 + 35))
+        display.blit(sub_text_surf, sub_text_rect)
+
     def _render_help_text(self, display: pygame.Surface):
         help_text = [
             "W/S: Throttle/Brake", "A/D: Steer Left/Right", "Q: Toggle Reverse",
             "Space: Hand Brake", "P: Toggle User Autopilot", "M: Toggle MATLAB Control Link",
-            "L: Unlock Safe Mode", "K: Kill Random Sensor (FDIR TEST)",
+            "Y: Confirm Remote Handover", "L: Unlock Safe Mode", "K: Kill Random Sensor (FDIR TEST)",
             "C: Next Weather (Shift+C: Prev)", "V: Next Map Layer (Shift+V: Prev)",
             "B: Load Layer (Shift+B: Unload)", "R: Toggle Image Recording",
-            "Ctrl+R: Toggle Sim Recording", "F1: Toggle HUD",
-            "H: Toggle Help", "ESC: Quit"
+            "Ctrl+R: Toggle Sim Recording", "F1: Toggle HUD", "H: Toggle Help", "ESC: Quit"
         ]
-        s = pygame.Surface((360, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
+        s = pygame.Surface((400, len(help_text) * 22 + 20)); s.set_alpha(200); s.fill((0, 0, 0)); display.blit(s, (50, 50))
         for i, text in enumerate(help_text):
             display.blit(self.help_font.render(text, True, (255, 255, 255)), (60, 60 + i * 22))
 
@@ -252,10 +259,9 @@ class KeyboardController:
             elif event.type in (pygame.KEYDOWN, pygame.KEYUP): self._parse_key_event(event)
         return True
     def get_control_state(self): return self._control_state
-
     def _parse_key_event(self, event):
         is_keydown = (event.type == pygame.KEYDOWN); key = event.key
-        if not self.simulation.is_matlab_actively_controlling and self.simulation.control_mode == 'MANUAL' and not self.simulation.safe_mode_locked:
+        if self.simulation.control_mode == 'MANUAL' and not self.simulation.safe_mode_locked:
             if key == K_w: self._control_state['throttle'] = 1.0 if is_keydown else 0.0
             elif key == K_s: self._control_state['brake'] = 1.0 if is_keydown else 0.0
             elif key == K_a: self._control_state['steer'] = -0.7 if is_keydown else 0.0
@@ -265,8 +271,8 @@ class KeyboardController:
         if not is_keydown: return
         mods = pygame.key.get_mods()
         is_ctrl = (mods & pygame.KMOD_CTRL); is_shift = (mods & pygame.KMOD_SHIFT)
-
-        if key == K_k: self.simulation.kill_random_sensor()
+        if key == K_y: self.simulation.confirm_handover()
+        elif key == K_k: self.simulation.kill_random_sensor()
         elif key == K_p: self.simulation.toggle_user_autopilot()
         elif key == K_m: self.simulation.toggle_matlab_link()
         elif key == K_l: self.simulation.reset_safe_mode_lock()
@@ -343,11 +349,11 @@ class CarlaSimulation:
         self.emergency_alert_sound = None
 
         # --- Control State Machine ---
-        self.control_mode = 'MANUAL'
+        self.control_mode = 'MANUAL' # States: MANUAL, USER_AUTOPILOT, AWAITING_HANDOVER, MATLAB_CONTROL
         self.accept_matlab_commands = False
-        self.is_matlab_actively_controlling = False
         self.safe_mode_locked = False
         self.last_matlab_command_time = 0.0
+        self.handover_confirmation_sender = None
 
         self.recording_images=False; self.recording_sim=False; self.show_hud=True; self.collision_count=0; self.lane_invasion_count=0
         self.weather_names = list(WEATHER_PRESETS.keys()); self.current_weather_index = 0; self.current_layer_index = 0
@@ -372,7 +378,6 @@ class CarlaSimulation:
         pygame.init(); pygame.font.init(); self._setup_logging()
         try:
             pygame.mixer.init()
-            # User must provide a sound file named 'emergency_alert.wav' in the same directory.
             alert_path = 'emergency_alert.wav'
             if os.path.exists(alert_path):
                 self.emergency_alert_sound = pygame.mixer.Sound(alert_path)
@@ -385,13 +390,17 @@ class CarlaSimulation:
             self.emergency_alert_sound = None
 
         self.client=carla.Client('localhost',2000); self.client.set_timeout(20.0)
-        self.world=self.client.load_world(STARTING_TOWN)
+        self.world=self.client.load_world('Town04')
         settings=self.world.get_settings(); settings.synchronous_mode=True; settings.fixed_delta_seconds=1.0/TICK_RATE
         self.world.apply_settings(settings)
         self.display_manager=DisplayManager((GRID_COLS,GRID_ROWS)); self.hud=HUD(WINDOW_WIDTH,WINDOW_HEIGHT); self.controller=KeyboardController(self)
-        self.udp_sender=UDPDataSender(); self.image_saver=ImageSaver(); self.image_saver.start()
+        self.udp_sender=UDPDataSender(MATLAB_DATA_IP, MATLAB_DATA_PORT); self.image_saver=ImageSaver(); self.image_saver.start()
         self.command_receiver = CommandReceiver(self.command_queue, COMMAND_LISTEN_IP, COMMAND_LISTEN_PORT)
         self.command_receiver.start()
+
+        self.handover_confirmation_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        print(f"Handover/ACK sender initialized.")
+
         self._setup_actors_and_sensors()
         self.kalman_filter=KalmanFilterSystem(1.0/TICK_RATE)
         self.object_tracker = ObjectTracker()
@@ -401,7 +410,12 @@ class CarlaSimulation:
         log_paths={'collision':os.path.join(LOG_DIR,'collision_log.csv'), 'lane':os.path.join(LOG_DIR,'lane_invasion_log.csv')}
         headers={'collision':['ts','frame','intensity','actor_type'], 'lane':['ts','frame','lane_types']}
         for name, path in log_paths.items():
-            self.log_files[name]=open(path, 'w', newline=''); self.csv_writers[name]=csv.writer(self.log_files[name]); self.csv_writers[name].writerow(headers[name])
+            file_exists = os.path.isfile(path) and os.path.getsize(path) > 0
+            self.log_files[name]=open(path, 'a', newline='')
+            self.csv_writers[name]=csv.writer(self.log_files[name])
+            if not file_exists:
+                self.csv_writers[name].writerow(headers[name])
+
 
     def _spawn_sensor_with_backups(self, name, s_type, transform, attributes=None, display_pos=None, camera_name=''):
         sensor_list = []
@@ -423,7 +437,7 @@ class CarlaSimulation:
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
 
         self._spawn_sensor_with_backups('cam_front', 'RGB', carla.Transform(carla.Location(x=1.5,z=2.4)), display_pos=(1,0), camera_name='front')
-        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(0,1), camera_name='back') # Grid pos changed for better layout
+        self._spawn_sensor_with_backups('cam_back', 'RGB', carla.Transform(carla.Location(x=-2.0,z=0.8),carla.Rotation(yaw=180)), display_pos=(1,2), camera_name='back')
         self._spawn_sensor_with_backups('cam_left', 'RGB', carla.Transform(carla.Location(x=1.3,y=-0.9,z=1.2),carla.Rotation(yaw=-110)), display_pos=(0,0), camera_name='left')
         self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right')
         self._spawn_sensor_with_backups('cam_interior', 'RGB', carla.Transform(carla.Location(x=0.5,y=-0.3,z=1.4),carla.Rotation(pitch=-15,yaw=180)), display_pos=(1,1), camera_name='interior')
@@ -436,10 +450,6 @@ class CarlaSimulation:
         self._spawn_sensor_with_backups('radar_back', 'RADAR', carla.Transform(carla.Location(x=-2.5,z=0.7), carla.Rotation(yaw=180)), {'range':'150'})
         self._spawn_sensor_with_backups('ultrasonic_front', 'ULTRASONIC', carla.Transform(carla.Location(x=2.2,z=0.5)))
         self._spawn_sensor_with_backups('ultrasonic_back', 'ULTRASONIC', carla.Transform(carla.Location(x=-2.2,z=0.5), carla.Rotation(yaw=180)))
-        self._spawn_sensor_with_backups('radar_front_left', 'RADAR', carla.Transform(carla.Location(x=2.0, y=-0.9, z=0.7), carla.Rotation(yaw=-45)), {'range':'75'})
-        self._spawn_sensor_with_backups('radar_front_right', 'RADAR', carla.Transform(carla.Location(x=2.0, y=0.9, z=0.7), carla.Rotation(yaw=45)), {'range':'75'})
-        self._spawn_sensor_with_backups('radar_rear_left', 'RADAR', carla.Transform(carla.Location(x=-2.0, y=-0.9, z=0.7), carla.Rotation(yaw=-135)), {'range':'75'})
-        self._spawn_sensor_with_backups('radar_rear_right', 'RADAR', carla.Transform(carla.Location(x=-2.0, y=0.9, z=0.7), carla.Rotation(yaw=135)), {'range':'75'})
         self._spawn_sensor_with_backups('collision', 'COLLISION', carla.Transform())
         self._spawn_sensor_with_backups('lane_invasion', 'LANE_INVASION', carla.Transform())
         print("All ego sensors spawned.")
@@ -462,15 +472,17 @@ class CarlaSimulation:
         print(f"  - Spawned {len(self.npc_vehicles)} NPC vehicles for V2V.")
 
     def _trigger_emergency_revert(self, reason: str):
-        """Centralized function to handle emergency reversion to local control."""
-        if not self.is_matlab_actively_controlling and not self.safe_mode_locked:
+        if self.control_mode != 'MATLAB_CONTROL' and not self.safe_mode_locked:
             return
 
         print(f"[EMERGENCY] Reverting to Local Control. Reason: {reason}")
         if self.emergency_alert_sound:
             self.emergency_alert_sound.play()
 
-        self.is_matlab_actively_controlling = False
+        if self.control_mode == 'MATLAB_CONTROL' and self.vehicle and self.vehicle.is_alive:
+            self.vehicle.set_autopilot(False)
+
+        self.control_mode = 'MANUAL'
 
         if self.vehicle and self.vehicle.is_alive:
             self.vehicle.apply_control(carla.VehicleControl(steer=0.0, brake=0.2, hand_brake=False))
@@ -478,20 +490,22 @@ class CarlaSimulation:
     def _tick_simulation(self):
         self.world.tick()
         snapshot = self.world.get_snapshot()
-        self._process_fdir_commands()
+        self._process_incoming_commands()
 
-        if self.is_matlab_actively_controlling and (time.time() - self.last_matlab_command_time > MATLAB_CONTROL_TIMEOUT):
+        if self.control_mode == 'MATLAB_CONTROL' and (time.time() - self.last_matlab_command_time > MATLAB_CONTROL_TIMEOUT):
             self._trigger_emergency_revert("MATLAB signal loss / timeout.")
 
+        # --- Control Application Logic ---
         if self.safe_mode_locked:
             v = self.vehicle.get_velocity()
             speed_ms = np.linalg.norm([v.x, v.y, v.z])
             if speed_ms > 0.1:
-                self.vehicle.apply_control(carla.VehicleControl(brake=1.0))
+                self.vehicle.apply_control(carla.VehicleControl(brake=1.0, hand_brake=False))
             else:
-                self.vehicle.apply_control(carla.VehicleControl(hand_brake=True))
-        elif not self.is_matlab_actively_controlling and self.control_mode == 'MANUAL':
+                self.vehicle.apply_control(carla.VehicleControl(brake=0.0, hand_brake=True))
+        elif self.control_mode == 'MANUAL':
             self.apply_vehicle_control(self.controller.get_control_state())
+        # In USER_AUTOPILOT or MATLAB_CONTROL, CARLA's internal autopilot handles control.
 
         self._process_sensor_data(snapshot)
         self._run_sensor_fusion()
@@ -501,43 +515,61 @@ class CarlaSimulation:
         if self.show_hud: self.hud.render(display, self._get_simulation_state(snapshot))
         pygame.display.flip()
 
-    def _process_fdir_commands(self):
+    def _process_incoming_commands(self):
         try:
             command = self.command_queue.get_nowait()
+            if command.get('api_key') != API_KEY:
+                print(f"[SECURITY-WARN] Received command with invalid API key. Discarding. CMD: {command}")
+                return
+
             cmd_type = command.get('command')
 
             if cmd_type == 'SET_VEHICLE_CONTROL':
                 if not self.accept_matlab_commands or self.safe_mode_locked:
                     return
-                control_data = command.get('control', None)
-                if control_data:
-                    if not self.is_matlab_actively_controlling:
-                        print("[INFO] MATLAB has taken control (Link Enabled).")
-                    self.is_matlab_actively_controlling = True
-                    self.last_matlab_command_time = time.time()
-                    if self.control_mode == 'USER_AUTOPILOT':
-                        self.vehicle.set_autopilot(False)
-                        self.control_mode = 'MANUAL'
-                    self.apply_vehicle_control(control_data)
+                # This command's primary purpose is to signal that MATLAB is in control
+                # and to serve as a keep-alive heartbeat.
+                if self.control_mode != 'MATLAB_CONTROL':
+                     print("[INFO] MATLAB has taken control. Enabling CARLA Autopilot.")
+                     if self.control_mode == 'USER_AUTOPILOT':
+                         self.vehicle.set_autopilot(False) # Turn off user autopilot first
+                     self.control_mode = 'MATLAB_CONTROL'
+                     if self.vehicle and self.vehicle.is_alive:
+                         self.vehicle.set_autopilot(True)
+                self.last_matlab_command_time = time.time()
+                command_id = command.get('command_id')
+                if command_id is not None:
+                    ack_packet = {'type': 'ack', 'acked_id': command_id}
+                    self.handover_confirmation_sender.sendto(json.dumps(ack_packet).encode('utf-8'), (COMMAND_LISTEN_IP, COMMAND_LISTEN_PORT))
+
+            elif cmd_type == 'REQUEST_REMOTE_HANDOVER':
+                if self.accept_matlab_commands and self.control_mode == 'MANUAL':
+                    print(f"[INFO] Received remote handover request. Reason: {command.get('reason')}. Awaiting user confirmation.")
+                    self.control_mode = 'AWAITING_HANDOVER'
 
             elif cmd_type == 'ACTIVATE_BACKUP':
                 sensor_group = command.get('sensor_group'); backup_index = command.get('backup_index')
                 if sensor_group in self.active_sensor_indices:
-                    num_backups_for_sensor = len(self.sensors.get(sensor_group, []))
-                    if 0 <= backup_index < num_backups_for_sensor:
+                    num_available_sensors = len(self.sensors.get(sensor_group, []))
+                    if 0 <= backup_index < num_available_sensors:
                         self.active_sensor_indices[sensor_group] = backup_index
                         print(f"Activated backup #{backup_index} for sensor '{sensor_group}'")
                     else:
-                        print(f"[WARN] Invalid backup index {backup_index} for sensor '{sensor_group}'. Max index is {num_backups_for_sensor - 1}.")
+                        print(f"[WARN] Invalid backup index {backup_index} for sensor '{sensor_group}'. Max index: {num_available_sensors-1}")
 
             elif cmd_type == 'ENTER_SAFE_MODE':
                 reason = command.get('reason', 'No reason specified')
                 if self.control_mode == 'USER_AUTOPILOT':
                     self.vehicle.set_autopilot(False)
                 self._trigger_emergency_revert(f"FDIR Command: {reason}")
-                self.control_mode = 'MANUAL'
                 self.accept_matlab_commands = False
                 self.safe_mode_locked = True
+
+            elif cmd_type == 'DISENGAGED_AUTOPILOT':
+                 if self.control_mode == 'MATLAB_CONTROL':
+                     print("[INFO] MATLAB has disengaged autopilot. Reverting to local manual control.")
+                     self._trigger_emergency_revert("MATLAB commanded disengage.")
+
         except Empty:
             return
 
@@ -607,29 +639,14 @@ class CarlaSimulation:
     def _send_udp_data(self, snapshot):
         t=self.vehicle.get_transform(); v=self.vehicle.get_velocity()
         health_data = {name: [s.get_health_status(snapshot.frame) for s in s_list] for name, s_list in self.sensors.items()}
-        current_mode_str = 'MANUAL'
-        if self.safe_mode_locked: current_mode_str = 'SAFE_MODE_LOCKED'
-        elif self.is_matlab_actively_controlling: current_mode_str = 'MATLAB_CONTROL'
-        elif self.control_mode == 'USER_AUTOPILOT': current_mode_str = 'USER_AUTOPILOT'
 
-        # Calculate the overall system health score for FDIR
-        total_sensors = 0
-        ok_sensors = 0
-        for statuses in health_data.values():
-            for status in statuses:
-                total_sensors += 1
-                if status == "OK":
-                    ok_sensors += 1
+        total_sensors = sum(len(s_list) for s_list in self.sensors.values())
+        ok_sensors = sum(1 for s_list in self.sensors.values() for s in s_list if s.get_health_status(snapshot.frame) == "OK")
         health_score = (ok_sensors / total_sensors) if total_sensors > 0 else 1.0
-        
-        # Create the data structure for FDIR status
-        sensor_fusion_status_data = {
-            'health_score': health_score
-        }
 
         data_packet = {
             'timestamp':snapshot.timestamp.elapsed_seconds, 'frame':snapshot.frame,
-            'mode': current_mode_str, 'map': self.world.get_map().name.split('/')[-1],
+            'mode': self.control_mode, 'map': self.world.get_map().name.split('/')[-1],
             'weather': self.weather_names[self.current_weather_index], 'speed':np.linalg.norm([v.x,v.y,v.z])*3.6,
             'position':{'x':t.location.x,'y':t.location.y,'z':t.location.z}, 'rotation':{'pitch':t.rotation.pitch,'yaw':t.rotation.yaw,'roll':t.rotation.roll},
             'control':self.controller.get_control_state(), 'fused_state':self.fused_state,
@@ -638,7 +655,7 @@ class CarlaSimulation:
             'active_sensor_indices': self.active_sensor_indices,
             'Detected_Obstacles': self.detected_obstacles, 'V2V_Data': self._gather_v2v_data(), 'V2I_Data': self._gather_v2i_data(),
             'lane_waypoints': self._gather_lane_waypoints(),
-            'sensor_fusion_status': sensor_fusion_status_data,
+            'sensor_fusion_status': {'health_score': health_score},
         }
         for name, sensor_list in self.sensors.items():
             active_sensor = sensor_list[self.active_sensor_indices.get(name, 0)]
@@ -658,6 +675,7 @@ class CarlaSimulation:
         if self.command_receiver: self.command_receiver.stop(); self.command_receiver.join()
         if self.image_saver: self.image_saver.stop()
         if self.udp_sender: self.udp_sender.close()
+        if self.handover_confirmation_sender: self.handover_confirmation_sender.close()
         for f in self.log_files.values(): f.close()
         if self.world:
             settings = self.world.get_settings(); settings.synchronous_mode = False; settings.fixed_delta_seconds = None
@@ -682,22 +700,39 @@ class CarlaSimulation:
                 reverse=bool(control.get('reverse', self.controller.get_control_state().get('reverse', False)))
             ))
 
+    def confirm_handover(self):
+        if self.control_mode == 'AWAITING_HANDOVER':
+            print("[INFO] User confirmed remote handover. Sending confirmation to MATLAB.")
+            # Revert to manual to await the first SET_VEHICLE_CONTROL command, which will trigger the mode switch.
+            self.control_mode = 'MANUAL'
+            confirmation_packet = {
+                'command': 'CONFIRM_REMOTE_HANDOVER',
+                'api_key': API_KEY,
+                'timestamp': time.time()
+            }
+            self.handover_confirmation_sender.sendto(json.dumps(confirmation_packet).encode('utf-8'), (MATLAB_DATA_IP, MATLAB_DATA_PORT))
+        else:
+            print("[INFO] No handover request is currently pending.")
+
     def toggle_matlab_link(self):
         if self.safe_mode_locked:
             print("[WARN] Cannot change MATLAB link status while in locked safe mode.")
             return
         self.accept_matlab_commands = not self.accept_matlab_commands
-        if self.accept_matlab_commands:
-            print("[INFO] MATLAB Control Link: ENABLED. Awaiting commands.")
-        else:
+        if not self.accept_matlab_commands:
             print("[INFO] MATLAB Control Link: DISABLED. Ignoring commands.")
-            if self.is_matlab_actively_controlling:
+            if self.control_mode == 'MATLAB_CONTROL':
                 self._trigger_emergency_revert("User manual override (M key).")
+            elif self.control_mode == 'AWAITING_HANDOVER':
+                print("[INFO] Handover request cancelled by user.")
+                self.control_mode = 'MANUAL'
+        else:
+            print("[INFO] MATLAB Control Link: ENABLED. Awaiting commands.")
 
     def toggle_user_autopilot(self):
         if not self.vehicle or not self.vehicle.is_alive or self.safe_mode_locked: return
-        if self.is_matlab_actively_controlling:
-            print("[WARN] Cannot engage User Autopilot while MATLAB is actively controlling. Disable MATLAB link (M) first.")
+        if self.control_mode in ['MATLAB_CONTROL', 'AWAITING_HANDOVER']:
+            print("[WARN] Cannot engage User Autopilot while MATLAB is active or a handover is pending.")
             return
         if self.control_mode == 'MANUAL':
             self.vehicle.set_autopilot(True); self.control_mode = 'USER_AUTOPILOT'; print("[INFO] User Autopilot engaged.")
@@ -720,29 +755,23 @@ class CarlaSimulation:
     def toggle_help(self): self.hud.show_help = not self.hud.show_help
 
     def kill_random_sensor(self):
-        """
-        Manually destroys a random, living sensor instance to test FDIR.
-        """
         if not self.sensors:
             print("[FDIR TEST] No sensors to kill.")
             return
-
-        # Create a flat list of all living sensor instances we can destroy
         living_sensors = []
         for group_name, sensor_list in self.sensors.items():
+            # Exclude non-killable sensor types if necessary
+            if group_name in ['collision', 'lane_invasion']:
+                continue
             for i, sensor in enumerate(sensor_list):
                 if sensor.sensor and sensor.sensor.is_alive:
                     living_sensors.append((group_name, i, sensor))
-
         if not living_sensors:
-            print("[FDIR TEST] All sensors are already dead.")
+            print("[FDIR TEST] All killable sensors are already dead.")
             return
-
-        # Pick one at random and destroy its CARLA actor
         group_name, index, sensor_to_kill = random.choice(living_sensors)
         sensor_to_kill.destroy()
         print(f"[FDIR TEST] Manually killed sensor: '{group_name}' (Instance #{index})")
-
 
     def reset_safe_mode_lock(self):
         if self.safe_mode_locked:
@@ -760,7 +789,6 @@ class CarlaSimulation:
             'collision_count':self.collision_count, 'lane_invasion_count':self.lane_invasion_count,
             'control':self.controller.get_control_state(),
             'control_mode': self.control_mode, 'accept_matlab_commands': self.accept_matlab_commands,
-            'is_matlab_actively_controlling': self.is_matlab_actively_controlling,
             'recording_images':self.recording_images, 'recording_sim':self.recording_sim,
             'fused_pos':f"({self.fused_state['x']:.1f},{self.fused_state['y']:.1f})" if self.fused_state else "N/A",
             'sensor_health': health_data, 'safe_mode_locked': self.safe_mode_locked,
