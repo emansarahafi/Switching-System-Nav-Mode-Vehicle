@@ -288,6 +288,7 @@ class KeyboardController:
 class SensorManager:
     def __init__(self, world, display_manager, sensor_type, transform, attached_vehicle, attributes=None, display_pos=None, camera_name=''):
         self.stype=sensor_type; self.cname=camera_name; self.surface=None; self.data=None; self.event_list=[]; self.lock=threading.Lock(); self.last_updated_frame=0
+        self.display_pos = display_pos # Store the grid position for this sensor if it's a primary one
         bp_map={'RGB':'sensor.camera.rgb','LIDAR':'sensor.lidar.ray_cast','IMU':'sensor.other.imu','GNSS':'sensor.other.gnss','RADAR':'sensor.other.radar','ULTRASONIC':'sensor.other.obstacle','COLLISION':'sensor.other.collision','LANE_INVASION':'sensor.other.lane_invasion'}
         bp = world.get_blueprint_library().find(bp_map[sensor_type])
         if sensor_type == 'RGB': bp.set_attribute('image_size_x', str(IMAGE_WIDTH)); bp.set_attribute('image_size_y', str(IMAGE_HEIGHT))
@@ -297,7 +298,9 @@ class SensorManager:
         self.sensor = world.spawn_actor(bp, transform, attach_to=attached_vehicle)
         callbacks = {'RGB':self._parse_image, 'COLLISION':self._parse_event, 'LANE_INVASION':self._parse_event}
         self.sensor.listen(callbacks.get(sensor_type, self._update_data))
-        if display_manager and display_pos: display_manager.attach_sensor(self, display_pos)
+        if display_manager and self.display_pos:
+            display_manager.add_display_slot(self.cname, self.display_pos)
+
     def get_health_status(self, current_frame):
         if not self.sensor or not self.sensor.is_alive: return "DEAD"
         if self.stype in ['COLLISION', 'LANE_INVASION']: return "OK"
@@ -315,15 +318,47 @@ class SensorManager:
 
 class DisplayManager:
     def __init__(self, grid_size):
-        self.display=pygame.display.set_mode((grid_size[0]*IMAGE_WIDTH, grid_size[1]*IMAGE_HEIGHT), pygame.RESIZABLE)
-        self.sensors=[]
-    def attach_sensor(self, sensor, pos):
-        self.sensors.append((sensor, pos))
-    def render(self):
-        self.display.fill((0,0,0))
-        for sensor, pos in self.sensors:
-            if sensor.surface: self.display.blit(sensor.surface, (pos[0]*IMAGE_WIDTH, pos[1]*IMAGE_HEIGHT))
+        self.display = pygame.display.set_mode((grid_size[0] * IMAGE_WIDTH, grid_size[1] * IMAGE_HEIGHT), pygame.RESIZABLE)
+        self.grid_size = grid_size
+        self.display_slots = {}  # Maps a camera name (e.g., 'front') to a grid position
+        self.dead_font = pygame.font.SysFont('Arial', 40, bold=True)
+
+    def add_display_slot(self, name: str, pos: Tuple[int, int]):
+        """Registers a camera name to a position on the display grid."""
+        if name:
+            self.display_slots[name] = pos
+
+    def render(self, all_sensors: Dict[str, List[SensorManager]], active_indices: Dict[str, int], frame: int):
+        """Renders the display by looking up the active sensor for each slot."""
+        self.display.fill((0, 0, 0))
+
+        for name, pos in self.display_slots.items():
+            sensor_group_name = f"cam_{name}"
+            sensor_list = all_sensors.get(sensor_group_name)
+            if not sensor_list:
+                continue
+
+            active_idx = active_indices.get(sensor_group_name, 0)
+            active_sensor = sensor_list[active_idx]
+
+            if active_sensor.surface:
+                self.display.blit(active_sensor.surface, (pos[0] * IMAGE_WIDTH, pos[1] * IMAGE_HEIGHT))
+
+            # If the active sensor for this display slot is dead, show an overlay.
+            if active_sensor.get_health_status(frame) == 'DEAD':
+                self._render_dead_overlay(pos)
+        
         return self.display
+
+    def _render_dead_overlay(self, pos: Tuple[int, int]):
+        """Renders a 'DEAD' text over a specific grid slot."""
+        overlay = pygame.Surface((IMAGE_WIDTH, IMAGE_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((128, 0, 0, 150)) # Semi-transparent red
+        text_surf = self.dead_font.render('DEAD', True, (255, 255, 255))
+        text_rect = text_surf.get_rect(center=(IMAGE_WIDTH / 2, IMAGE_HEIGHT / 2))
+        overlay.blit(text_surf, text_rect)
+        self.display.blit(overlay, (pos[0] * IMAGE_WIDTH, pos[1] * IMAGE_HEIGHT))
+
 
 class UDPDataSender:
     def __init__(self, ip='127.0.0.1', port=10000, chunk_size=4096):
@@ -419,13 +454,17 @@ class CarlaSimulation:
 
     def _spawn_sensor_with_backups(self, name, s_type, transform, attributes=None, display_pos=None, camera_name=''):
         sensor_list = []
+        # The primary sensor is the only one associated with a display position
         primary_sensor = SensorManager(self.world, self.display_manager, s_type, transform, self.vehicle, attributes, display_pos, camera_name)
         sensor_list.append(primary_sensor)
+        
+        # Backups have no display position of their own
         for i in range(NUM_BACKUPS):
             loc = transform.location; offset = (i + 1) * 0.05
             perturbed_transform = carla.Transform(carla.Location(loc.x+offset, loc.y+offset, loc.z), transform.rotation)
-            backup_sensor = SensorManager(self.world, None, s_type, perturbed_transform, self.vehicle, attributes)
+            backup_sensor = SensorManager(self.world, None, s_type, perturbed_transform, self.vehicle, attributes, camera_name=camera_name)
             sensor_list.append(backup_sensor)
+            
         self.sensors[name] = sensor_list
         self.active_sensor_indices[name] = 0
         print(f"  - Spawned {name} with {NUM_BACKUPS} backups.")
@@ -441,6 +480,8 @@ class CarlaSimulation:
         self._spawn_sensor_with_backups('cam_left', 'RGB', carla.Transform(carla.Location(x=1.3,y=-0.9,z=1.2),carla.Rotation(yaw=-110)), display_pos=(0,0), camera_name='left')
         self._spawn_sensor_with_backups('cam_right', 'RGB', carla.Transform(carla.Location(x=1.3,y=0.9,z=1.2),carla.Rotation(yaw=110)), display_pos=(2,0), camera_name='right')
         self._spawn_sensor_with_backups('cam_interior', 'RGB', carla.Transform(carla.Location(x=0.5,y=-0.3,z=1.4),carla.Rotation(pitch=-15,yaw=180)), display_pos=(1,1), camera_name='interior')
+        
+        # Non-camera sensors (no display position)
         self._spawn_sensor_with_backups('gnss', 'GNSS', carla.Transform(carla.Location(z=2.6)))
         self._spawn_sensor_with_backups('imu', 'IMU', carla.Transform(carla.Location(x=0,z=0.5)))
         self._spawn_sensor_with_backups('lidar_roof', 'LIDAR', carla.Transform(carla.Location(z=2.5)), {'range':'100', 'points_per_second':'100000'})
@@ -511,7 +552,10 @@ class CarlaSimulation:
         self._run_sensor_fusion()
         self._run_object_detection()
         self._send_udp_data(snapshot)
-        display = self.display_manager.render()
+        
+        # MODIFICATION: Pass all necessary info to the dynamic display manager
+        display = self.display_manager.render(self.sensors, self.active_sensor_indices, snapshot.frame)
+        
         if self.show_hud: self.hud.render(display, self._get_simulation_state(snapshot))
         pygame.display.flip()
 
@@ -703,7 +747,6 @@ class CarlaSimulation:
     def confirm_handover(self):
         if self.control_mode == 'AWAITING_HANDOVER':
             print("[INFO] User confirmed remote handover. Sending confirmation to MATLAB.")
-            # Revert to manual to await the first SET_VEHICLE_CONTROL command, which will trigger the mode switch.
             self.control_mode = 'MANUAL'
             confirmation_packet = {
                 'command': 'CONFIRM_REMOTE_HANDOVER',
@@ -760,7 +803,6 @@ class CarlaSimulation:
             return
         living_sensors = []
         for group_name, sensor_list in self.sensors.items():
-            # Exclude non-killable sensor types if necessary
             if group_name in ['collision', 'lane_invasion']:
                 continue
             for i, sensor in enumerate(sensor_list):
