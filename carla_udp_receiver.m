@@ -7,12 +7,12 @@ function carla_udp_receiver(port)
     end
     COMMAND_PORT = 10001;
     HISTORY_LENGTH = 100;
-    FDIR_RATE_HZ = 20;     
-    
+    FDIR_RATE_HZ = 20;
+
     % --- Global Outputs and State ---
     global carla_outputs;
-    carla_outputs = struct(); 
-    
+    carla_outputs = struct();
+
     persistent matlab_control_mode handover_requested_time handoff_confirmed;
     if isempty(matlab_control_mode)
         matlab_control_mode = 'MANUAL'; % States: MANUAL, AWAITING_CONFIRMATION, AUTOPILOT
@@ -27,17 +27,17 @@ function carla_udp_receiver(port)
     % --- Setup UI and UDP ---
     [uiHandles] = setupDashboard(HISTORY_LENGTH, @onCloseRequest);
     logToDashboard(uiHandles, 'Dashboard initialized. Starting UDP receiver...');
-    
+
     try
         u = udpport("IPV4", "LocalPort", port, "Timeout", 1, "EnablePortSharing", true);
         u.InputBufferSize = 2000000;
         logToDashboard(uiHandles, sprintf('UDP Receiver started on port %d.', port));
-        
+
         command_sender_udp = udpport("datagram");
         logToDashboard(uiHandles, sprintf('UDP Command Sender targeting 127.0.0.1:%d.', COMMAND_PORT));
     catch ME
         logToDashboard(uiHandles, sprintf('[FATAL] UDP setup failed: %s', ME.message));
-        is_running = false; 
+        is_running = false;
     end
 
     % --- SETUP FDIR SYSTEM (TIMER) ---
@@ -55,21 +55,21 @@ function carla_udp_receiver(port)
         logToDashboard(uiHandles, sprintf('[FATAL] FDIR Timer setup failed: %s', ME.message));
         is_running = false;
     end
-    
+
     % --- Data Storage and Initialization ---
     trajectory = nan(HISTORY_LENGTH * 5, 2);
     gnss_track = nan(HISTORY_LENGTH * 5, 2);
     imu_history = struct('x', nan(1, HISTORY_LENGTH), 'y', nan(1, HISTORY_LENGTH), 'z', nan(1, HISTORY_LENGTH));
     buffer = '';
     last_message_time = tic;
-    
+
     % --- Main Loop ---
     logToDashboard(uiHandles, 'Waiting for data from CARLA...');
     while is_running
-        if ~ishandle(uiHandles.fig) 
+        if ~ishandle(uiHandles.fig)
             break;
         end
-        
+
         latest_frame_to_render = [];
         if u.NumBytesAvailable > 0
             byteData = read(u, u.NumBytesAvailable, "uint8");
@@ -80,19 +80,19 @@ function carla_udp_receiver(port)
             delimiter = '|||JSON_DELIMITER|||';
             sanitizedBuffer = strrep(buffer, '}{', ['}' delimiter '{']);
             jsonObjects = strsplit(sanitizedBuffer, delimiter);
-            
+
             if ~endsWith(jsonObjects{end}, '}')
                 buffer = jsonObjects{end};
                 jsonObjects = jsonObjects(1:end-1);
             else, buffer = ''; end
-            
+
             for i = 1:numel(jsonObjects)
                 jsonStr = jsonObjects{i};
                 if isempty(jsonStr), continue; end
                 try
                     [packet, handoff_confirmed] = jsondecode_wrapper(jsonStr, handoff_confirmed);
-                    if isempty(packet), continue; end 
-                    processed_frame = processPacket(packet); 
+                    if isempty(packet), continue; end
+                    processed_frame = processPacket(packet);
                     if ~isempty(processed_frame)
                         latest_frame_to_render = processed_frame;
                     end
@@ -101,13 +101,13 @@ function carla_udp_receiver(port)
                 end
             end
         end
-        
+
         if ~isempty(latest_frame_to_render)
             frame_data = latest_frame_to_render;
             [trajectory, gnss_track, imu_history] = updateDataHistories(frame_data, trajectory, gnss_track, imu_history);
-            
+
             dt = processAndAnalyzeFrame(frame_data, toc(last_message_time), imu_history);
-            
+
             if exist('fuzzy_bbna.m', 'file')
                 [fuzzy_decision, score] = fuzzy_bbna(carla_outputs, matlab_control_mode);
             else, fuzzy_decision = 'MANUAL'; score = 0; end
@@ -124,7 +124,7 @@ function carla_udp_receiver(port)
                         handover_requested_time = tic;
                         send_simple_command_to_carla(command_sender_udp, 'REQUEST_REMOTE_HANDOVER', 'All checks passed', COMMAND_PORT);
                     end
-                
+
                 case 'AWAITING_CONFIRMATION'
                     if handoff_confirmed
                         logToDashboard(uiHandles, '[STATE] Handover confirmed by driver! Engaging AUTOPILOT.');
@@ -146,20 +146,20 @@ function carla_udp_receiver(port)
                         send_simple_command_to_carla(command_sender_udp, 'DISENGAGED_AUTOPILOT', 'Reverting to manual due to safety/logic.', COMMAND_PORT);
                     end
             end
-            
+
             if strcmp(matlab_control_mode, 'AUTOPILOT')
                 send_control_to_carla(command_sender_udp, vehicle_command, COMMAND_PORT);
             end
-            
+
             carla_outputs.fuzzy_decision = fuzzy_decision;
             carla_outputs.fuzzy_desirability_score = score;
             carla_outputs.matlab_commanded_mode = matlab_control_mode;
 
             updateDashboard(uiHandles, frame_data, trajectory, gnss_track, imu_history, carla_outputs);
         end
-        pause(0.01); 
+        pause(0.01);
     end
-    
+
     % --- CLEANUP ---
     logToDashboard(uiHandles, 'Shutdown sequence initiated...');
     if ~isempty(fdirTimer) && isvalid(fdirTimer), stop(fdirTimer); delete(fdirTimer); end
@@ -174,9 +174,103 @@ function carla_udp_receiver(port)
 end
 
 
-%% =======================================================================
-%                      UI SETUP
+% =======================================================================
+%                      UI & FDIR
 % ========================================================================
+
+function run_fdir_cycle(command_sender)
+% RUN_FDIR_CYCLE - Performs fault detection, isolation, and RECOVERY.
+% This version only considers 'DEAD' as a hard fault requiring recovery.
+
+    % --- Configuration ---
+    CRITICAL_SENSORS = {'gnss', 'imu', 'lidar_roof', 'lidar_front', 'lidar_back','cam_front', 'cam_back', 'cam_left', 'cam_right', 'cam_interior', 'radar_front', 'radar_back', 'ultrasonic_front', 'ultrasonic_back', 'collision', 'lane_invasion'};
+
+    global carla_outputs;
+
+    % Guard clause
+    if ~isstruct(carla_outputs) || ~isfield(carla_outputs, 'sensor_health') || ...
+       ~isfield(carla_outputs, 'active_sensor_indices') || ...
+       isempty(fieldnames(carla_outputs.sensor_health))
+        return;
+    end
+
+    carla_outputs.fallback_initiation = false;
+
+    health_data = carla_outputs.sensor_health;
+    active_indices = carla_outputs.active_sensor_indices;
+    sensor_groups = fieldnames(health_data);
+
+    for i = 1:numel(sensor_groups)
+        group_name = sensor_groups{i};
+
+        statuses = health_data.(group_name);
+        active_idx = active_indices.(group_name) + 1;
+
+        % =======================  THE FIX IS HERE =======================
+        % Check if the currently active sensor is explicitly 'DEAD'.
+        % This will now ignore 'NO_DATA' and only react to hard failures.
+        if active_idx <= numel(statuses) && strcmp(statuses{active_idx}, 'DEAD')
+        % ===============================================================
+
+            fprintf('[FDIR] Hard Fault Detected in active sensor %s #%d (Status: DEAD)\n', ...
+                    group_name, active_idx - 1);
+
+            % --- ISOLATION & RECOVERY ---
+            new_active_idx = find(strcmp(statuses, 'OK'), 1, 'first');
+
+            if ~isempty(new_active_idx)
+                fprintf('[FDIR] RECOVERY: Activating backup for %s. New index: %d\n', ...
+                        group_name, new_active_idx - 1);
+
+                command_activate_backup(command_sender, group_name, new_active_idx - 1);
+                return;
+            end
+
+            % --- NO RECOVERY POSSIBLE ---
+            if isempty(new_active_idx)
+                fprintf('[FDIR] RECOVERY FAILED for %s. No healthy backups available.\n', group_name);
+
+                if ismember(group_name, CRITICAL_SENSORS)
+                    carla_outputs.fallback_initiation = true;
+                    reason = sprintf('Critical sensor failure: %s. No backups available.', group_name);
+                    command_switch_to_safe_mode(command_sender, reason);
+                    return;
+                else
+                    fprintf('[FDIR] Warning: Non-critical sensor %s has failed permanently.\n', group_name);
+                end
+            end
+        end
+    end
+end
+
+function command_activate_backup(udp_sender, sensor_group, backup_index)
+    persistent last_command_time;
+    if isempty(last_command_time), last_command_time = containers.Map('KeyType', 'char', 'ValueType', 'any'); end
+    if isKey(last_command_time, sensor_group) && toc(last_command_time(sensor_group)) < 2.0, return; end
+    if ~isempty(udp_sender) && isvalid(udp_sender)
+        command = struct('command', 'ACTIVATE_BACKUP', 'sensor_group', sensor_group, 'backup_index', backup_index, 'api_key', "SECRET_CARLA_KEY_123");
+        json_cmd = jsonencode(command);
+        write(udp_sender, json_cmd, "char", "127.0.0.1", 10001);
+        last_command_time(sensor_group) = tic;
+    end
+end
+
+function command_switch_to_safe_mode(udp_sender, reason)
+    persistent last_command_time;
+    if ~isempty(last_command_time) && toc(last_command_time) < 2.0, return; end
+    fprintf('\n====================================================\n');
+    fprintf('!!! FDIR CRITICAL FAULT: SWITCH TO SAFE MODE !!!\n');
+    fprintf('!!! REASON: %s\n', reason);
+    fprintf('====================================================\n');
+    beep; pause(0.1); beep;
+    if ~isempty(udp_sender) && isvalid(udp_sender)
+        command = struct('command', 'ENTER_SAFE_MODE', 'reason', reason, 'api_key', "SECRET_CARLA_KEY_123");
+        json_cmd = jsonencode(command);
+        write(udp_sender, json_cmd, "char", "127.0.0.1", 10001);
+        last_command_time = tic;
+    end
+end
+
 function [uiHandles] = setupDashboard(historyLength, closeCallback)
     fig = uifigure('Name', 'CARLA Final Diagnostics Dashboard', 'Position', [50 50, 1600, 950]);
     fig.CloseRequestFcn = closeCallback;
@@ -184,7 +278,6 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     gl = uigridlayout(fig, [3, 4]);
     gl.RowHeight = {250, '2x', 200}; gl.ColumnWidth = {'1x', '1x', '1x', '1x'};
     
-    % --- Top Row Panels ---
     p_speed = uipanel(gl, 'Title', 'Speed (km/h)', 'FontWeight', 'bold'); p_speed.Layout.Row = 1; p_speed.Layout.Column = 1;
     speed_grid = uigridlayout(p_speed, [1 1]);
     uiHandles.speedGauge = uigauge(speed_grid, 'ScaleColors', {[0 .8 .4], [.9 .8 0], [1 .2 .2]}, 'ScaleColorLimits', [0 60; 60 100; 100 160]);
@@ -215,7 +308,6 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uilabel(g_diag_metrics, 'Text', 'Sys. Conf:', 'FontSize', 10); uiHandles.confidenceLabel = uilabel(g_diag_metrics, 'Text', 'NOMINAL', 'FontWeight', 'bold', 'FontSize', 10);
     uilabel(g_diag_metrics, 'Text', 'Fuzzy Desire:', 'FontWeight', 'bold', 'FontSize', 10); uiHandles.fuzzyDecisionLabel = uilabel(g_diag_metrics, 'Text', 'STARTING...', 'FontWeight', 'bold', 'FontSize', 10);
     
-    % --- Middle Row Panels ---
     p_cameras = uipanel(gl, 'Title', 'Camera Feeds', 'FontWeight', 'bold'); p_cameras.Layout.Row = 2; p_cameras.Layout.Column = [1 2];
     g_cameras = uigridlayout(p_cameras, [2 3]);
     uiHandles.camLeftAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camLeftAx, 'Left'); uiHandles.camFrontAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camFrontAx, 'Front'); uiHandles.camRightAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camRightAx, 'Right'); uiHandles.camInteriorAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camInteriorAx, 'Interior'); uiHandles.camRearAx = uiaxes(g_cameras, 'XTick', [], 'YTick', []); title(uiHandles.camRearAx, 'Back');
@@ -228,13 +320,11 @@ function [uiHandles] = setupDashboard(historyLength, closeCallback)
     uiHandles.lidarAx = uiaxes(p_lidar); hold(uiHandles.lidarAx, 'on'); grid(uiHandles.lidarAx, 'on'); axis(uiHandles.lidarAx, 'equal'); xlabel(uiHandles.lidarAx, 'X (m)'); ylabel(uiHandles.lidarAx, 'Y (m)'); zlabel(uiHandles.lidarAx, 'Z (m)'); view(uiHandles.lidarAx, -45, 30);
     uiHandles.lidarPlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 10, NaN, 'filled', 'DisplayName', 'LiDAR Points'); uiHandles.obstaclePlot = scatter3(uiHandles.lidarAx, NaN, NaN, NaN, 100, 'bo', 'filled', 'MarkerFaceAlpha', 0.6, 'DisplayName', 'Obstacles'); legend(uiHandles.lidarAx);
     
-    % --- Bottom Row Panels ---
     p_log = uipanel(gl, 'Title', 'System Log', 'FontWeight', 'bold'); p_log.Layout.Row = 3; p_log.Layout.Column = [3 4];
     log_grid = uigridlayout(p_log, [1 1]);
     uiHandles.logArea = uitextarea(log_grid, 'Value', {''}, 'Editable', 'off', 'FontName', 'Monospaced', 'BackgroundColor', [0.1 0.1 0.1], 'FontColor', [0.9 0.9 0.9]);
     
     p_kpi = uipanel(gl, 'Title', 'Key Performance Indicators (KPIs)', 'FontWeight', 'bold'); p_kpi.Layout.Row = 3; p_kpi.Layout.Column = [1 2];
-    % *** MODIFIED: Reverted grid layout to [6,2] and simplified Adaptability KPI ***
     g_kpi = uigridlayout(p_kpi, [6, 2], 'ColumnWidth', {'fit', '1x'}, 'Padding', [10 10 10 10]);
     uilabel(g_kpi, 'Text', 'Transition Speed (ms):', 'FontWeight', 'bold'); uiHandles.kpiSpeedLabel = uilabel(g_kpi, 'Text', 'N/A');
     uilabel(g_kpi, 'Text', 'Safety (Peak Lat Accel):', 'FontWeight', 'bold'); uiHandles.kpiSafetyLabel = uilabel(g_kpi, 'Text', 'N/A');
@@ -249,7 +339,6 @@ end
 % ========================================================================
 function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, outputs)
     if ~isvalid(uiHandles.fig), return; end
-    % --- Update Standard Panels ---
     if isfield(data, 'speed'), uiHandles.speedGauge.Value = data.speed; end
     set(uiHandles.accelXPlot, 'YData', imu_history.x); set(uiHandles.accelYPlot, 'YData', imu_history.y); set(uiHandles.accelZPlot, 'YData', imu_history.z);
     set(uiHandles.gnssPlot, 'XData', gnss_track(:,2), 'YData', gnss_track(:,1));
@@ -269,13 +358,10 @@ function updateDashboard(uiHandles, data, trajectory, gnss_track, imu_history, o
     v2i_data = get_safe(data, 'V2I_Data', struct()); if isfield(v2i_data, 'traffic_light_state') && ~isempty(v2i_data.traffic_light_state), state = v2i_data.traffic_light_state; uiHandles.trafficLightLabel.Text = state; switch upper(state), case 'RED', uiHandles.trafficLightLabel.FontColor = [1, 0.2, 0.2]; case 'YELLOW', uiHandles.trafficLightLabel.FontColor = [1, 0.9, 0]; case 'GREEN', uiHandles.trafficLightLabel.FontColor = [0.2, 1, 0.2]; otherwise, uiHandles.trafficLightLabel.FontColor = [0.8, 0.8, 0.8]; end; else, uiHandles.trafficLightLabel.Text = 'N/A'; uiHandles.trafficLightLabel.FontColor = [0.9, 0.9, 0.9]; end
     if isfield(outputs, 'fuzzy_decision'), decision_text = sprintf('%s (%.1f)', outputs.fuzzy_decision, outputs.fuzzy_desirability_score); uiHandles.fuzzyDecisionLabel.Text = strrep(decision_text, '_', ' '); switch outputs.fuzzy_decision, case 'AUTOPILOT', uiHandles.fuzzyDecisionLabel.FontColor = [0.2, 1, 0.2]; case 'MANUAL', uiHandles.fuzzyDecisionLabel.FontColor = [1, 0.2, 0.2]; otherwise, uiHandles.fuzzyDecisionLabel.FontColor = [0.9, 0.9, 0.9]; end; end
     if isfield(outputs, 'matlab_commanded_mode'), mode_text = outputs.matlab_commanded_mode; uiHandles.matlabModeLabel.Text = strrep(mode_text, '_', ' '); switch mode_text, case 'AUTOPILOT', uiHandles.matlabModeLabel.FontColor = [0.2, 1, 0.2]; case 'MANUAL', uiHandles.matlabModeLabel.FontColor = [1, 0.9, 0]; case 'AWAITING_CONFIRMATION', uiHandles.matlabModeLabel.FontColor = [0.2, 0.8, 1]; otherwise, uiHandles.matlabModeLabel.FontColor = [0.9, 0.9, 0.9]; end; end
-
-    % --- Update KPI Panel ---
     if isfield(outputs, 'kpi_transition_speed'), uiHandles.kpiSpeedLabel.Text = sprintf('%.1f', outputs.kpi_transition_speed); end
     if isfield(outputs, 'kpi_safety_lat_accel'), uiHandles.kpiSafetyLabel.Text = sprintf('%.3f', outputs.kpi_safety_lat_accel); end
     if isfield(outputs, 'kpi_stability_steer_std'), uiHandles.kpiStabilityLabel.Text = sprintf('%.4f', outputs.kpi_stability_steer_std); end
     if isfield(outputs, 'kpi_precision_error'), uiHandles.kpiPrecisionLabel.Text = sprintf('%.3f', outputs.kpi_precision_error); end
-    % *** MODIFIED: Only one Adaptability KPI is now displayed ***
     if isfield(outputs, 'kpi_adaptability_speed_error'), uiHandles.kpiAdaptabilityLabel.Text = sprintf('%.3f', outputs.kpi_adaptability_speed_error); end
     if isfield(outputs, 'kpi_efficiency_cycle_time'), uiHandles.kpiEfficiencyLabel.Text = sprintf('%.1f', outputs.kpi_efficiency_cycle_time); end
 end
@@ -288,17 +374,12 @@ end
 
 function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     global carla_outputs;
-    
-    % ... (all the existing analysis code in this function) ...
-        persistent kpi_efficiency_timer;
+    persistent kpi_efficiency_timer;
     if isempty(kpi_efficiency_timer), kpi_efficiency_timer = tic; end
     carla_outputs.kpi_efficiency_cycle_time = toc(kpi_efficiency_timer) * 1000;
     kpi_efficiency_timer = tic;
-
     persistent last_call_timer last_yaw last_collisions last_lane_invasions;
     if isempty(last_call_timer), time_since_last = 1/20; last_call_timer = tic; else, time_since_last = toc(last_call_timer); last_call_timer = tic; end
-    
-    % --- Step 1: Perform initial analyses and data extraction ---
     network_status = struct('latency', latency, 'data_rate', 1 / max(time_since_last, 0.001));
     [health_score, sensor_health_data] = computeSensorHealth(frame);
     covariance_trace = computeEkfUncertainty(frame);
@@ -309,26 +390,19 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     simple_density = computeSimpleObstacleDensity(frame);
     actual_speed_ms = get_safe(frame, 'speed', 0) / 3.6;
     v2i_data = get_safe(frame, 'V2I_Data', struct());
-    
-    % --- Step 2: Calculate KPIs ---
-    
-    % KPI: Adaptability (Speed Adaptation Score as average m/s error)
-    SPEED_LIMIT_MS = 15; % ~54 km/h
-    weather_factor = 1.0 - (weather_severity * 0.7); % Max 70% speed reduction for weather
-    density_factor = 1.0 - (min(simple_density, 5) * 0.1); % 10% speed reduction per car, up to 5 cars
+    SPEED_LIMIT_MS = 15;
+    weather_factor = 1.0 - (weather_severity * 0.7);
+    density_factor = 1.0 - (min(simple_density, 5) * 0.1);
     recommended_speed_ms = SPEED_LIMIT_MS * weather_factor * density_factor;
     speed_error = abs(actual_speed_ms - recommended_speed_ms);
     persistent speed_error_history;
     if isempty(speed_error_history), speed_error_history = nan(1,100); end
     speed_error_history = [speed_error_history(2:end), speed_error];
     carla_outputs.kpi_adaptability_speed_error = mean(speed_error_history, 'omitnan');
-
-    % --- Step 3: Perform remaining analyses and populate outputs ---
     system_confidence = computeSystemConfidence(health_score, covariance_trace, threat_level, weather_severity);
     processed_sensor_data.Weather_Severity = weather_severity;
     processed_sensor_data.Obstacle_Threat = threat_level;
     processed_sensor_data.Obstacle_Density = simple_density;
-    
     rotation_data = get_safe(frame, 'rotation', struct('yaw', 0)); current_yaw = rotation_data.yaw; if isempty(last_yaw), last_yaw = current_yaw; end
     yaw_delta = current_yaw - last_yaw; if yaw_delta > 180, yaw_delta = yaw_delta - 360; end; if yaw_delta < -180, yaw_delta = yaw_delta + 360; end
     processed_sensor_data.yaw_rate = yaw_delta / max(time_since_last, 0.001); last_yaw = current_yaw;
@@ -354,21 +428,14 @@ function [time_since_last] = processAndAnalyzeFrame(frame, latency, imu_history)
     carla_outputs.control = get_safe(frame, 'control', struct());
     carla_outputs.speed = get_safe(frame, 'speed', 0);
     carla_outputs.rotation = get_safe(frame, 'rotation', struct());
-    
     carla_outputs.kpi_safety_lat_accel = max(abs(imu_history.y));
-
     persistent steer_history;
     if isempty(steer_history), steer_history = nan(1, 50); end
     steer_history = [steer_history(2:end), get_safe(processed_sensor_data, 'steering_input', 0)];
     carla_outputs.kpi_stability_steer_std = std(steer_history, 'omitnan');
-    
     fused_pos = get_safe(sensor_fusion_status, 'fused_state', []);
     true_pos = get_safe(frame, 'position', []);
-    
-    if ~isempty(fused_pos) && isfield(fused_pos, 'x') && ~isempty(true_pos)
-        carla_outputs.kpi_precision_error = sqrt((fused_pos.x - true_pos.x)^2 + (fused_pos.y - true_pos.y)^2);
-    end
-    
+    if ~isempty(fused_pos) && isfield(fused_pos, 'x') && ~isempty(true_pos), carla_outputs.kpi_precision_error = sqrt((fused_pos.x - true_pos.x)^2 + (fused_pos.y - true_pos.y)^2); end
     carla_outputs.sensor_health = get_safe(frame, 'sensor_health', struct());
     carla_outputs.active_sensor_indices = get_safe(frame, 'active_sensor_indices', struct());
 end
@@ -442,6 +509,10 @@ function updateCamera(ax, data, fieldName)
     if isfield(data, fieldName) && ~isempty(data.(fieldName))
         try, img_bytes = base64decode(data.(fieldName)); temp_file = [tempname '.jpg']; fid = fopen(temp_file, 'wb'); fwrite(fid, img_bytes, 'uint8'); fclose(fid); img = imread(temp_file); imshow(img, 'Parent', ax); delete(temp_file); catch; end
     end
+end
+
+function val = get_safe(s, field, default)
+    if isfield(s, field) && ~isempty(s.(field)), val = s.(field); else, val = default; end
 end
 
 %% =======================================================================
